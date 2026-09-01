@@ -24,6 +24,9 @@
 - **시뮬과 실물은 다르다(sim2real gap).** 이 프로젝트 규칙의 상당수가 이것 때문에 존재한다.
 - **물리는 스케일에 따라 다르게 지배한다.** 800 g 로봇에서는 액추에이터 특성이
   사람 크기 로봇보다 훨씬 크게 작용한다.
+- **인식(perception)과 제어(control)는 분리돼 있다.** 이 로봇의 정책은 카메라를 보지 않는다.
+  61차원 관측에 시각 정보가 없고, 공차기 정책조차 공을 못 본다(ball-blind).
+  왜 그렇게 설계했는지가 Physical AI의 중요한 질문이다 — 지연, 학습 난이도, 실패 모드.
 
 ## 다루는 영역 지도
 
@@ -44,6 +47,11 @@
 | sim2real | `ENABLE_*` 플래그, 도메인 랜덤화 | system identification, randomization, 관측 정규화 |
 | 신경망 | 정책 MLP, `rsl_rl` | 레이어, 활성함수, 정규화, 과적합 |
 | 모델 배포 | `scripts/export.py`, ONNX | 그래프 표현, 추론 런타임, 임베디드 제약 |
+| 컴퓨터 비전 | `runtime/duck-detect/` (ONNX + RKNN) | 객체 검출, NPU vs CPU 추론, 양자화 |
+| 오디오 인식 | `runtime/pet-detect/` (쓰다듬김 감지) | log-mel, 소형 CNN, 스트리밍 추론, hysteresis |
+| 깊이 센싱 | `runtime/tof/` (VL53L5CX 8×8) | ToF 원리, I²C, 저해상도 depth의 쓸모 |
+| 상태 추정 | `runtime/odometry/` | contact-based odometry, FK, IMU 적분, 드리프트 |
+| 미디어 스트리밍 | `runtime/mediad/` (WebRTC) | 인코딩, 지연 vs 화질, 대역폭 |
 | 실시간 시스템 | `runtime/robotd/` 50 Hz 루프 | 데드라인, 지터, 스케줄링, 실패 시 안전 동작 |
 | 시스템 소프트웨어 | `runtime/` 데몬들, JSON-RPC/Unix socket | IPC, 프로세스 분리, 헬스체크, 롤백 |
 
@@ -123,3 +131,13 @@
 | backlash (기어 유격) | 기어가 맞물릴 때 생기는 헛도는 각도 | ±1°, `tasks/backlash.py` |
 | BAM | Dynamixel 서보의 물리 모델 (전압 제어 법칙까지) | `actuator/friction_dr_bam.py` |
 | projected gravity | 중력 방향을 로봇 몸통 좌표계로 투영한 3벡터 | 관측에서 자세를 나타내는 값 |
+
+### 인식 / 센싱
+| 용어 | 뜻 | 이 프로젝트에서 |
+|---|---|---|
+| ToF (Time of Flight) | 빛의 왕복 시간으로 거리를 재는 방식 | 머리의 8×8 거리 행렬, `runtime/tof/` |
+| NPU / RKNN | 임베디드 신경망 가속기와 그 모델 포맷 | `duck_detect.rknn`은 NPU, `.onnx`는 CPU |
+| log-mel | 사람 귀의 주파수 민감도를 흉내 낸 오디오 특징 | 40밴드, 쓰다듬김 감지 입력 |
+| hysteresis (이력 현상) | 켜지는 문턱과 꺼지는 문턱을 다르게 두는 것 | 경계값에서 on/off가 떠는 것을 막음 |
+| train/infer parity | 학습과 추론이 같은 전처리를 쓰도록 보장하는 것 | 학습 스크립트가 로봇과 동일한 특징 추출 바이너리를 호출 |
+| odometry (주행거리계) | 자기 움직임만으로 위치를 추정하는 것 | 발 접촉점 + IMU. 절대 기준이 없어 드리프트가 쌓인다 |
