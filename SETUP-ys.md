@@ -182,6 +182,30 @@ runtime repo를 고치거나 빌드할 필요 없음. 로봇에서 돌고 있는
 - 로봇 소프트웨어 자체를 고치는 경우(새 동작을 패드 버튼에 붙이기 등)에만 runtime을
   건드리고 Rust 크로스컴파일 + 배포가 따라온다.
 
+## 에이전트 학습 하네스
+
+`LEARNING-ys.md` — Claude Code가 이 폴더에서 작업할 때 RL 개념을 함께 설명하도록
+지시하는 파일. 용어집도 여기 누적된다.
+
+자동 로딩 경로:
+
+```
+~/YS/personal/microduck/CLAUDE.md          ← 한 줄: @microduck_rl/LEARNING-ys.md
+                                              (git 추적 안 됨. 아래 명령으로 재생성)
+└─ microduck_rl/LEARNING-ys.md             ← 하네스 본문 (git 추적됨)
+```
+
+Claude Code는 작업 디렉토리와 **상위 폴더들**의 `CLAUDE.md`를 자동으로 읽는다.
+부모 폴더에 둔 이유는 두 repo(`microduck_rl`, `runtime`) 모두에 적용하면서
+업스트림의 `CLAUDE.md`(내용은 `@AGENTS.md` 한 줄)를 건드리지 않기 위해서 —
+건드리면 업스트림 머지 때 충돌한다.
+
+컴퓨터를 새로 세팅하면 이 한 줄만 다시 만들면 된다:
+
+```bash
+echo '@microduck_rl/LEARNING-ys.md' > ~/YS/personal/microduck/CLAUDE.md
+```
+
 ## 계정 전환 세팅 (컴퓨터 전체 설정)
 
 회사 계정(`ys-kim92` / `ys.kim@roai.im`)과 개인 계정(`ys-kim-robotics`)을 한 컴퓨터에서
