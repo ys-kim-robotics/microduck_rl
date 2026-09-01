@@ -4,17 +4,31 @@
 
 ## 폴더 구조
 
+폴더 하나에 repo 둘. 둘 다 내 포크. 성격이 달라서(Python/GPU/학습 vs Rust/로봇/배포)
+합치지 않고 나란히 둔다 — 합치면 각각의 업스트림 업데이트를 못 받는다.
+
 ```
-~/YS/personal/microduck/
-├── microduck_rl/   ← 이 repo (내 포크). RL 학습 환경
-└── runtime/        ← pollen-robotics/microduck 클론. 로봇 온보드 Rust 런타임
-                      학습된 ONNX 정책 9개가 runtime/policies/ 에 들어있음
+~/YS/personal/microduck/          ← git repo 아님. 그냥 작업 폴더
+├── microduck_rl/                 ← 내 포크. RL 학습 환경 (Python, GPU)
+│                                    기본 브랜치: develop
+└── runtime/                      ← 내 포크. 로봇 온보드 런타임 (Rust)
+                                     폴더명은 runtime, repo명은 microduck
+                                     기본 브랜치: main
+                                     학습된 ONNX 정책 9개가 policies/ 에 있음
 ```
 
-`runtime/`은 참고용이라 git 추적 안 함. 다시 받으려면:
+폴더명과 repo명이 달라도 상관없다. git은 폴더 이름을 안 보고 `origin` 주소만 본다.
+
+다시 세팅하려면:
 
 ```bash
-git clone https://github.com/pollen-robotics/microduck.git ~/YS/personal/microduck/runtime
+mkdir -p ~/YS/personal/microduck && cd ~/YS/personal/microduck
+git clone git@github-personal:ys-kim-robotics/microduck_rl.git microduck_rl
+git clone git@github-personal:ys-kim-robotics/microduck.git    runtime
+# 각각 업스트림 추가
+git -C microduck_rl remote add upstream https://github.com/pollen-robotics/microduck_rl.git
+git -C runtime      remote add upstream https://github.com/pollen-robotics/microduck.git
+cd microduck_rl && uv sync
 ```
 
 ## 환경
@@ -54,12 +68,41 @@ uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 4096
 
 ## git remote
 
-| 이름 | 위치 | 용도 |
-|---|---|---|
-| `origin` | `git@github-personal:ys-kim-robotics/microduck_rl.git` | 내 포크. push |
-| `upstream` | `https://github.com/pollen-robotics/microduck_rl.git` | 원본. 업데이트 당길 때만 |
+두 repo 모두 같은 규칙: `origin` = 내 포크(push), `upstream` = 원본(읽기만).
 
-업스트림 업데이트 받기: `git fetch upstream && git merge upstream/develop`
+| repo | origin (내 포크) | upstream (원본) | 기본 브랜치 |
+|---|---|---|---|
+| `microduck_rl/` | `github-personal:ys-kim-robotics/microduck_rl.git` | `pollen-robotics/microduck_rl` | `develop` |
+| `runtime/` | `github-personal:ys-kim-robotics/microduck.git` | `pollen-robotics/microduck` | `main` |
+
+업스트림 업데이트 받기 (브랜치 이름이 서로 다르니 주의):
+
+```bash
+git -C microduck_rl fetch upstream && git -C microduck_rl merge upstream/develop
+git -C runtime      fetch upstream && git -C runtime      merge upstream/main
+```
+
+## 학습 결과를 실물 로봇에 넣기 (아직 미검증 — 로봇 없이 문서만 보고 정리)
+
+runtime repo를 고치거나 빌드할 필요 없음. 로봇에서 돌고 있는 `robotd`가 설정 파일에
+적힌 경로의 ONNX를 읽어가는 구조라, 파일 복사 + 설정 한 줄이면 끝.
+
+```
+내 PC:  uv run train ...                 → 체크포인트 .pt
+        uv run scripts/export.py ...     → my_walk.onnx (약 800KB)
+          ↓ scp
+로봇:   /home/radxa/my_walk.onnx 에 두고
+        robotd.toml 에  [policy] walk = "/home/radxa/my_walk.onnx"
+        sudo systemctl restart robotd
+```
+
+주의:
+- 반드시 `scripts/export.py`로 뽑을 것. 이 스크립트가 관측값 정규화를 ONNX 그래프에
+  구워 넣는다. 체크포인트를 직접 변환하면 정책이 정규화 안 된 값을 보고 이상하게 움직인다.
+- 관측 61차원이어야 한다. 아니면 로딩 단계에서 거부하고 로그에 이유를 찍는다
+  (`observation width is 51, expected 61`).
+- 로봇 소프트웨어 자체를 고치는 경우(새 동작을 패드 버튼에 붙이기 등)에만 runtime을
+  건드리고 Rust 크로스컴파일 + 배포가 따라온다.
 
 ## 계정 전환 세팅 (컴퓨터 전체 설정)
 
