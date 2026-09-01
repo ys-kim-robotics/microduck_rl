@@ -50,11 +50,8 @@ uv run list-envs
 # 테스트 (154 passed)
 uv run --with pytest pytest tests/ -q
 
-# 학습된 정책을 CPU MuJoCo로 구경 (GPU 불필요, 학습 안 해도 됨)
-uv run scripts/infer_policy.py \
-    --walking ../runtime/policies/alpha_walking.onnx \
-    --standing ../runtime/policies/alpha_stand.onnx \
-    --new-cmd-obs
+# 학습된 정책 구경 (GPU 불필요) — 아래 "정책 구경하기" 섹션 참고
+uv run scripts/infer_policy.py --walking ../runtime/policies/alpha_walking.onnx --new-cmd-obs
 
 # 학습 스모크 테스트 (wandb 로그인 없이)
 uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 512 \
@@ -65,6 +62,87 @@ uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 4096
 ```
 
 기본 로거가 wandb라 `wandb login` 안 했으면 `--agent.logger tensorboard` 필요.
+
+## 정책 구경하기 (infer_policy.py)
+
+학습 안 해도 됨. `runtime/policies/`의 학습 완료 ONNX를 CPU MuJoCo로 돌린다.
+실물 로봇의 정책 교체 방식(상황에 따라 다른 신경망을 바꿔 끼우는 것)을 그대로 흉내 낸다.
+
+### 전체 모드 (모든 기능 활성화)
+
+```bash
+cd ~/YS/personal/microduck/microduck_rl
+P=../runtime/policies
+uv run scripts/infer_policy.py \
+    --walking $P/alpha_walking.onnx \
+    --standing $P/alpha_stand.onnx \
+    --sitstand $P/alpha_sitstand.onnx \
+    --ground-pick $P/alpha_ground_pick.onnx \
+    --roulade $P/roulade.onnx \
+    --kick-left $P/ball_kick_left.onnx \
+    --kick-right $P/ball_kick_right.onnx \
+    --new-cmd-obs
+```
+
+**정책 하나가 모든 걸 하는 게 아니다.** 걷기/서기/앉기/킥/구르기가 전부 따로 훈련된
+별개 신경망이라, 넘겨주지 않은 정책의 기능은 아예 존재하지 않는다. 키를 눌러도
+`kick_left unavailable: no --kick-left policy loaded` 같은 메시지만 나온다.
+
+`--kick-left/right`를 주면 공이 있는 씬으로 바뀐다.
+`--new-cmd-obs`는 61차원 관측 포맷 지정 — 이 정책들은 전부 61차원이라 필수.
+
+### 조작법
+
+**키는 MuJoCo 창이 아니라 명령을 입력한 터미널에 친다.** 창을 클릭하고 누르면 무반응.
+
+| 키 | 동작 | 필요 옵션 |
+|---|---|---|
+| `↑` / `↓` | 전진 속도 증가 / 감소 (음수면 후진) | |
+| `←` / `→` | 옆으로 이동 (strafe) | |
+| `A` / `E` | 좌회전 / 우회전 | |
+| `SPACE` | 정지 (모든 명령 0) | |
+| `T` | 정책 on/off (끄면 마지막 자세 유지) | |
+| `P` | 랜덤 방향 밀치기 (1.0 m/s) — 외란 버티기 테스트 | |
+| `Q` | 종료 | |
+| `G` | 바닥 물건 집기 | `--ground-pick` |
+| `Y` | 앉기 ↔ 서기 | `--sitstand` |
+| `K` / `L` | 왼발 / 오른발 킥 | `--kick-left` / `--kick-right` |
+| `R` | 앞구르기 | `--roulade` |
+| `B` | 몸통 자세 모드 토글 | |
+| `H` | 머리 모드 토글 | |
+
+`B`(몸통) / `H`(머리) 모드를 켜면 같은 방향키가 다른 의미가 된다:
+
+| | `↑`/`↓` | `←`/`→` | `A`/`E` | `Z`/`S` |
+|---|---|---|---|---|
+| 몸통 모드 | 높이 ±10mm | 피치 ±10° | 롤 ±10° | 요 ±10° |
+| 머리 모드 | head_pitch | head_yaw | head_roll | neck_pitch |
+
+몸통 자세 제어는 **서 있는 정책(`alpha_stand`)의 기능**이라, 걷는 중에는 반응이 거의 없다.
+`SPACE`로 세운 뒤 눌러야 한다.
+
+### 넘어진 뒤 일어나기
+
+**전용 버튼이 없다. 속도 명령을 주면 된다.**
+
+`infer_policy.py`는 속도 명령 크기로 정책을 자동 교체한다 (`scripts/infer_policy.py:448`):
+
+| 속도 명령 | 활성 정책 | 넘어졌을 때 |
+|---|---|---|
+| ≤ 0.05 (정지) | `alpha_stand` — 서 있기 + 자세 제어 | 못 일어남 (배운 적 없음) |
+| > 0.05 | `alpha_walking` — 실제로는 **VelStand** = 걷기 + 넘어짐 복구 | 일어남 |
+
+즉 `P`로 넘어뜨린 뒤 **`↑`를 누르면** walking 정책으로 바뀌면서 일어난다.
+정지 상태에서도 항상 복구되게 하려면 `--standing`을 빼고 실행한다.
+
+문턱값은 `--switch-threshold`로 조정 가능.
+
+> RL 포인트: "일어나기"를 코딩한 사람은 없다. VelStand 훈련 때 에피소드 시작 자세에
+> 엎어진/뒤집힌 상태를 섞고 보상은 "명령한 속도로 이동해라"만 줬을 뿐이다. 넘어진 채로는
+> 속도를 못 내니 보상을 받으려면 일어날 수밖에 없었던 것. 동작을 지시하는 게 아니라
+> 그 동작이 나올 수밖에 없는 상황과 보상을 만드는 것 — 이게 RL 설계의 핵심.
+
+전용 일어서기 태스크(`Mjlab-StandUp-*`)도 있지만 학습된 ONNX가 없다. 직접 훈련해볼 첫 후보.
 
 ## git remote
 
