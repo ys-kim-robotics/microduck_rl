@@ -23,6 +23,7 @@ from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
 sys.path.insert(0, str(Path(__file__).parent))
 from ys_eval import fix_command, make_policy  # noqa: E402
 from ys_head_circle import set_head_circle  # noqa: E402
+from mjlab_microduck.tasks.ys_head_circle_env_cfg import apply_tip_force  # noqa: E402
 
 # (label, azimuth, elevation). MuJoCo azimuth 0 = camera placed at -x looking +x (sees the face).
 VIEWS = [("front", 0, -15), ("side", 90, -15), ("back-3/4", 135, -25), ("top", 90, -89)]
@@ -39,6 +40,7 @@ def main():
   p.add_argument("--cmd", type=float, nargs=3, help="hold this vx vy wz (default: the task's random commands)")
   p.add_argument("--head-circle", type=float, nargs="+", metavar="A F [BOOST LEAD_DEG]",
                  help="drive head_yaw/pitch on a circle (needs --cmd)")
+  p.add_argument("--tip-force", type=float, nargs=3, metavar=("FX", "FR", "FZ"), help="rope-tension stand-in at mouth_tip (N)")
   p.add_argument("--views", nargs="+", help="subset of view labels (1, 2 or 4)")
   a = p.parse_args()
   views = [v for v in VIEWS if not a.views or v[0] in a.views]
@@ -69,6 +71,9 @@ def main():
       if a.head_circle:
         A, F, boost, lead = (list(a.head_circle) + [1.0, 0.0])[:4]
         set_head_circle(env, (k + 1) * env.step_dt, A * boost, F, math.radians(lead))
+      if a.tip_force:
+        rb = env.scene["robot"]
+        apply_tip_force(rb, rb.find_bodies("jaw_soft")[0][0], rb.find_sites("mouth_tip")[0][0], *a.tip_force)
       obs, *_ = venv.step(act)
       tiles = []
       for label, az, el in views:
