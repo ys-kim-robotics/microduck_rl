@@ -59,7 +59,7 @@ def run(task, path, combos, reps, warmup, window, direct=False, boost=1.0, lead_
   aid = [act_names.index(j) for j in ("head_yaw", "head_pitch")]  # action = target - HOME (scale 1)
   sid = robot.find_sites("mouth_tip")[0][0]
   dt = env.step_dt
-  ts, yaw, pitch, tip, trunk, tipe = [], [], [], [], [], []
+  ts, yaw, pitch, tip, trunk, tipe, tipb = [], [], [], [], [], [], []
   fell = torch.zeros(n, dtype=torch.bool, device=dev)
   obs = venv.get_observations()
   steps = int((warmup + window) / dt)
@@ -89,6 +89,7 @@ def run(task, path, combos, reps, warmup, window, direct=False, boost=1.0, lead_
         ey = tb[:, 1] - (TIP_CENTER_B[1] + TIP_M_PER_RAD * amp * torch.sin(w))
         ez = tb[:, 2] - (TIP_CENTER_B[2] - TIP_M_PER_RAD * amp * torch.cos(w))
         tipe.append(torch.sqrt(ey**2 + ez**2))
+        tipb.append(tb[:, 1:].clone())
   env.close()
   t = torch.tensor(ts, device=dev, dtype=torch.float64)
   f = freq.double()
@@ -110,7 +111,8 @@ def run(task, path, combos, reps, warmup, window, direct=False, boost=1.0, lead_
     "Ay": ay, "Az": az, "round": torch.minimum(ay, az) / torch.maximum(ay, az), "sway": sway,
   }
   rows = []
-  paths = [(1000 * tip_y[:, i * reps].cpu().numpy(), 1000 * tip_z[:, i * reps].cpu().numpy()) for i in range(len(combos))]
+  tipb = 1000 * torch.stack(tipb).cpu().numpy()  # (T, n, 2) trunk-frame y, z in mm
+  paths = [(tipb[:, i * reps, 0], tipb[:, i * reps, 1]) for i in range(len(combos))]
   for i, (a, fr) in enumerate(combos):
     sl = slice(i * reps, (i + 1) * reps)
     ok = ~fell[sl]
@@ -159,12 +161,16 @@ def main():
     for k, (name, r) in enumerate(allrows):
       ax = axes[k // len(combos)][k % len(combos)]
       y, z = r["path"]
-      ax.plot(y - y.mean(), z - z.mean(), lw=0.8)
-      ax.set_title(f"{name[-22:]}\nA={r['A']} f={r['f']}Hz g={r['gain_yaw']:.2f} lag={r['lag_yaw']:.0f}°", fontsize=7)
+      R = 1000 * TIP_M_PER_RAD * r["A"]
+      th = np.linspace(0, 2 * np.pi, 100)
+      cy, cz = 1000 * TIP_CENTER_B[1], 1000 * TIP_CENTER_B[2]
+      ax.plot(cy + R * np.sin(th), cz - R * np.cos(th), "k--", lw=0.8)
+      ax.plot(y, z, lw=0.8)
+      ax.set_title(f"{name[-24:]}\nA={r['A']} f={r['f']}Hz round={r['round']:.2f} tipE={r['tipE']:.1f}mm", fontsize=7)
       ax.set_aspect("equal")
       ax.grid(alpha=0.3)
-    fig.supxlabel("mouth_tip lateral y (mm)")
-    fig.supylabel("mouth_tip vertical z (mm)")
+    fig.supxlabel("mouth_tip y, trunk frame (mm)   - - target circle (4b-3)")
+    fig.supylabel("mouth_tip z, trunk frame (mm)")
     fig.tight_layout()
     fig.savefig(a.plot, dpi=120)
     print("saved", a.plot)
