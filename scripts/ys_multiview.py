@@ -1,0 +1,77 @@
+"""Record a trained checkpoint as a synchronized 2x2 multi-view MP4 (ys personal tool).
+
+One rollout, four cameras per frame (front / side / back-3/4 / top), so the views
+stay in sync. Mirrors mjlab's play.py env/policy setup.
+
+  uv run scripts/ys_multiview.py Mjlab-Velocity-Flat-MicroDuck path/to/model_499.pt --seconds 20
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import imageio
+import numpy as np
+import torch
+
+import mjlab_microduck.tasks  # noqa: F401  (registers tasks)
+from mjlab.envs import ManagerBasedRlEnv
+from mjlab.rl import RslRlVecEnvWrapper
+from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
+
+sys.path.insert(0, str(Path(__file__).parent))
+from ys_eval import fix_command, make_policy  # noqa: E402
+
+# (label, azimuth, elevation). MuJoCo azimuth 0 = camera placed at -x looking +x (sees the face).
+VIEWS = [("front", 0, -15), ("side", 90, -15), ("back-3/4", 135, -25), ("top", 90, -89)]
+
+
+def main():
+  p = argparse.ArgumentParser()
+  p.add_argument("task")
+  p.add_argument("checkpoint")
+  p.add_argument("--seconds", type=float, default=20.0)
+  p.add_argument("--size", type=int, default=480, help="height of each view (px)")
+  p.add_argument("--distance", type=float, default=0.8, help="camera distance (m)")
+  p.add_argument("--out", default=None)
+  p.add_argument("--cmd", type=float, nargs=3, help="hold this vx vy wz (default: the task's random commands)")
+  p.add_argument("--views", nargs="+", help="subset of view labels (1, 2 or 4)")
+  a = p.parse_args()
+  views = [v for v in VIEWS if not a.views or v[0] in a.views]
+
+  env_cfg = load_env_cfg(a.task, play=True)
+  agent_cfg = load_rl_cfg(a.task)
+  env_cfg.scene.num_envs = 1
+  env_cfg.seed = 0  # same command sequence for every checkpoint -> videos are comparable
+  torch.manual_seed(0)
+  if a.cmd:
+    fix_command(env_cfg, tuple(a.cmd))
+  env_cfg.viewer.height, env_cfg.viewer.width = a.size, a.size * 4 // 3
+  env_cfg.viewer.distance = a.distance
+  env_cfg.viewer.max_extra_envs = 0
+  env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda:0", render_mode="rgb_array")
+  venv = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+  policy = make_policy(a.task, a.checkpoint, venv)  # .pt or .onnx
+
+  r = env._offline_renderer
+  fps = round(1.0 / env.step_dt)
+  out = Path(a.out or Path(a.checkpoint).with_name(f"{Path(a.checkpoint).stem}_multiview.mp4"))
+  writer = imageio.get_writer(out, fps=fps, codec="libx264", quality=7, macro_block_size=8)
+
+  obs = venv.get_observations()
+  with torch.inference_mode():
+    for _ in range(int(a.seconds * fps)):
+      obs, *_ = venv.step(policy(obs))
+      tiles = []
+      for label, az, el in views:
+        r._cam.azimuth, r._cam.elevation = az, el
+        r.update(env.sim.data)
+        tiles.append(r.render().copy())
+      grid = np.vstack([np.hstack(tiles[:2]), np.hstack(tiles[2:])]) if len(tiles) == 4 else np.hstack(tiles)
+      writer.append_data(grid)
+  writer.close()
+  print(f"saved {out}  ({a.seconds:.0f}s @ {fps}fps, views: {', '.join(v[0] for v in views)})")
+
+
+if __name__ == "__main__":
+  main()

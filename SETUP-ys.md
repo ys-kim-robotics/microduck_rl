@@ -14,7 +14,7 @@
 └── runtime/                      ← 내 포크. 로봇 온보드 런타임 (Rust)
                                      폴더명은 runtime, repo명은 microduck
                                      기본 브랜치: main
-                                     학습된 ONNX 정책 9개가 policies/ 에 있음
+                                     (정책 ONNX는 2026-10 이후 repo에서 빠짐 → ../policies)
 ```
 
 폴더명과 repo명이 달라도 상관없다. git은 폴더 이름을 안 보고 `origin` 주소만 본다.
@@ -47,11 +47,11 @@ cd ~/YS/personal/microduck/microduck_rl
 # 태스크 목록 (45개)
 uv run list-envs
 
-# 테스트 (154 passed)
+# 테스트 (274 passed, 2026-11-02 기준)
 uv run --with pytest pytest tests/ -q
 
 # 학습된 정책 구경 (GPU 불필요) — 아래 "정책 구경하기" 섹션 참고
-uv run scripts/infer_policy.py --walking ../runtime/policies/alpha_walking.onnx --new-cmd-obs
+uv run scripts/infer_policy.py --walking ../policies/alpha_walking.onnx --new-cmd-obs
 
 # 학습 스모크 테스트 (wandb 로그인 없이)
 uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 512 \
@@ -65,14 +65,14 @@ uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 4096
 
 ## 정책 구경하기 (infer_policy.py)
 
-학습 안 해도 됨. `runtime/policies/`의 학습 완료 ONNX를 CPU MuJoCo로 돌린다.
+학습 안 해도 됨. `../policies/`(HF Hub `pollen-robotics/microduck-policies`에서 받음: `uv run hf download pollen-robotics/microduck-policies --local-dir ../policies`)의 학습 완료 ONNX를 CPU MuJoCo로 돌린다.
 실물 로봇의 정책 교체 방식(상황에 따라 다른 신경망을 바꿔 끼우는 것)을 그대로 흉내 낸다.
 
 ### 전체 모드 (모든 기능 활성화)
 
 ```bash
 cd ~/YS/personal/microduck/microduck_rl
-P=../runtime/policies
+P=../policies
 uv run scripts/infer_policy.py \
     --walking $P/alpha_walking.onnx \
     --standing $P/alpha_stand.onnx \
