@@ -73,3 +73,19 @@ v8도 거의 같음 (1 Hz gain 0.92, 지연 64°).
 ### 4b로 넘기는 것
 - 진짜 남은 문제: (a) 부리 끝 기준의 **둥근 원**(task space), (b) 지연 0을 **명령 쪽 보정 없이** 정책 스스로 (위상을 알면 미래를 안다), (c) 5단계 줄 장력을 견딜 바탕 태스크.
 - 결과물: `logs/rsl_rl/stage4/4a_*.mp4`, `4a_tip_paths.png`
+
+## 4b. 새 태스크 `Mjlab-YsHeadCircle-Flat-MicroDuck` (학습)
+
+파일: `src/mjlab_microduck/tasks/ys_head_circle_env_cfg.py` (+ `tasks/__init__.py` 등록 한 블록).
+- 걷기 레시피 위에 만든다 → 관측 61D/행동 14D 그대로, `full2500`에서 `--init-checkpoint`로 이어 학습(plain resume: 커리큘럼은 최종 단계 유지).
+- 모든 환경이 서 있음(twist 0). `head_pose` 명령이 원을 따라 움직인다: yaw=A·sin φ, pitch=A·cos φ, **φ는 1.5 Hz 고정 방향**, A∈[0.2, 0.7], 10%는 머리 정지.
+- 위상이 한 방향·한 속도로만 돌기 때문에 "지금 명령"만 보면 "다음 명령"을 알 수 있다 → 정책이 앞당겨 움직이는 것(feedforward)을 스스로 배울 수 있다.
+- `head_pose_tracking`에 `fine_std=0.1` 추가: 4a의 80° 지연(A=0.4에서 약 0.5 rad 오차)이 공짜가 아니게 한다.
+
+### 4b-1 예측 (1.5 Hz, A=0.4, ys_head_circle 기준)
+| | 4a (학습 전) | 예측 |
+|---|---|---|
+| gain | 0.70 | > 0.9 |
+| 지연 | 85° | < 20° |
+| 몸 흔들림 | 0.5 mm | 늘어날 수 있음 (머리가 질량의 38%) |
+| 넘어짐 | 0% | 0% |

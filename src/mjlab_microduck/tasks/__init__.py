@@ -281,3 +281,14 @@ for _task_id, _make_cfg, _kw, _rl_cfg, _robot_cfg in _BACKLASH_TASKS:
         rl_cfg=_rl_cfg,
         runner_cls=MicroduckOnPolicyRunner,
     )
+
+# ys personal: stage 4b head circle (STAGES-ys.md)
+from .ys_head_circle_env_cfg import YsHeadCircleRlCfg, make_ys_head_circle_env_cfg
+
+register_mjlab_task(
+    task_id="Mjlab-YsHeadCircle-Flat-MicroDuck",
+    env_cfg=make_ys_head_circle_env_cfg(),
+    play_env_cfg=make_ys_head_circle_env_cfg(play=True),
+    rl_cfg=YsHeadCircleRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
