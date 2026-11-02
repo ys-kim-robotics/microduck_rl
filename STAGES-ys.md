@@ -10,7 +10,7 @@
 | 1 | 스모크 학습, TensorBoard 읽기 | 완료 |
 | 2 | 본 학습 2500 iter, 공식 정책과 비교 | 완료 |
 | 3 | 보상/seed/backlash/DR 실험 | 완료 |
-| 4 | 머리로 원 그리기 (4a 기존 정책, 4b 새 태스크) | 진행 중 |
+| 4 | 머리로 원 그리기 (4a 기존 정책, 4b 새 태스크) | 완료 (2026-11-03) |
 | 5 | 줄 달기 | |
 | 6 | 두 마리 | |
 | 7 | 실물 고려 | |
@@ -160,3 +160,16 @@ A=0.4 / 0.7, 1.5 Hz, 16대 평균. 칸 = 넘어짐 % · 몸 흔들림 mm · tipE
 - 학습 범위 끝(1 N)에선 넘어지진 않지만 15~43 mm 끌려간다. 체크포인트별로 이 값이 15~57 mm로 갈려 6000 채택(나머지 지표는 동일).
 - 교훈: 정책은 **본 적 없는 외력에 무력하다**(0.6 N에 절반이 넘어짐). 실물의 줄 장력을 모르니 넓게 무작위화 = domain randomization을 "외력"에 적용한 것. 대가: 무하중 흔들림이 조금 늘었다.
 - 결과물: `logs/rsl_rl/stage4/4b4_load_compare.mp4`
+
+## 4단계 정리
+- 최종 정책: `logs/rsl_rl/ys_head_circle/2026-11-03_00-07-27_hc4_load/model_6000.pt`, ONNX `logs/rsl_rl/stage4/ys_head_circle_hc4_6000.onnx`(평가로 .pt와 동일 확인). 태스크 `Mjlab-YsHeadCircleTipLoad-Flat-MicroDuck`.
+- 계보: full2500 (걷기) → hc1 위상 원 + fine_std 0.1 → hc2 fine_std 0.3 → hc3 부리 끝 보상 → hc4 부리 끝 하중. 모두 plain resume.
+- 사용법: 서 있는 상태에서 head_pose 명령 = [0, A·cos φ, A·sin φ, 0], φ는 1.5 Hz로 증가, A ∈ [0.2, 0.7] → 부리 끝 반지름 50 mm/rad × A.
+- 한계: 1.5 Hz 고정 · 서 있기 전용(걷기는 평가 안 함) · 런타임 manifest에 이 인코딩이 없음 · 실물 검증 없음.
+
+## 5단계 사전 조사 (코드로 확인)
+- **MuJoCo `cable` 플러그인은 못 쓴다**: mujoco_warp `io.py`가 body plugin이 있으면 `NotImplementedError("Body plugins not supported.")`. → 줄은 **캡슐 여러 개를 ball joint로 이은 사슬**로 만든다(일반 body라 지원됨).
+- **장면에 엔티티 여러 개는 된다**: BallKick이 로봇 + 공 두 엔티티를 쓴다.
+- **equality CONNECT는 MJWarp가 지원**(`EqType.CONNECT`). 다만 mjlab 엔티티 API에서 엔티티 사이 equality를 거는 방법은 못 찾음 → 가장 쉬운 길: 줄 사슬을 로봇 MJCF의 `jaw_soft` 자식으로 붙이고, 반대 끝은 world에 고정된 점에 connect.
+- 6단계(두 마리): 관측/행동 매니저가 엔티티 이름 "robot" 하나를 전제한다 → 두 로봇을 한 정책으로 돌리려면 커스텀 환경이 필요. 미확인.
+- 4b-4의 "앞으로 당기는 0.3 N이 위험"이 5단계 첫 실험의 기준이 된다: 실제 사슬 줄의 장력이 학습한 0~1 N 안에 드는지부터 잰다.
