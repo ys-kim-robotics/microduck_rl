@@ -10,7 +10,11 @@ What changes vs the walking task (stage 4a, STAGES-ys.md, is the motivation):
     CIRCLE_FREQ_HZ. The command keeps its meaning (head joint deltas from HOME), so the warm-started
     policy tracks it from iteration 0 — with the 4a lag. Because φ advances at ONE fixed rate and
     direction, the current command determines the future one: the policy can learn to lead it.
-  - head_pose_tracking gets a narrow fine_std so a lag of tens of degrees is no longer cheap.
+  - head_pose_tracking gets a fine_std so a lag of tens of degrees is no longer cheap
+    (4b-1: 0.1 left the pitch error in the flat tail -> 0.3, 4b-2).
+  - tip_space=True (4b-3): the head command is only a phase/amplitude ENCODING; the reward is the
+    mouth_tip position on a round circle in the trunk y-z plane. A circle in joint space is an
+    ellipse at the tip (forward kinematics, round ~0.7 in 4a/4b-2) -> score the tip itself.
 """
 
 import math
@@ -18,6 +22,8 @@ from dataclasses import dataclass, replace
 
 import torch
 from mjlab.envs import ManagerBasedRlEnv
+from mjlab.managers import RewardTermCfg
+from mjlab.utils.lab_api.math import quat_apply_inverse
 
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import MicroduckRlCfg, make_microduck_velocity_env_cfg
@@ -25,7 +31,12 @@ from mjlab_microduck.tasks.microduck_velocity_env_cfg import MicroduckRlCfg, mak
 CIRCLE_FREQ_HZ = 1.5  # 4a: servo+policy gain 0.7 / lag ~80° here, feedforward fixed it -> learnable
 AMP_RANGE = (0.2, 0.7)  # rad on head_yaw/head_pitch; 0.7 ≈ 4 cm mouth_tip swing (4a)
 ZERO_PROB = 0.1  # still-head bucket: holding HOME stays trained
-TRACK_FINE_STD = 0.1  # rad; a 80° lag at A=0.4 is ~0.5 rad error -> priced, not free
+TRACK_FINE_STD = 0.3  # rad; 0.1 (4b-1) had no gradient at the 0.2-0.34 rad pitch error
+# 4b-3 tip-space target, trunk frame. Measured with full2500 standing (scratch tipcal, 2026-11-02):
+# HOME tip at (83.8, -0.1, 88.8) mm; yaw=A·sin -> y ≈ +54 mm/rad·A·sin, pitch=A·cos -> z ≈ -44 mm/rad·A·cos.
+TIP_CENTER_B = (0.0838, 0.0, 0.0888)
+TIP_M_PER_RAD = 0.05  # target radius R = 0.05·A -> 10-35 mm
+TIP_STD, TIP_FINE_STD = 0.02, 0.005  # m
 HEAD_PITCH, HEAD_YAW = 1, 2  # head_pose order: neck_pitch, head_pitch, head_yaw, head_roll
 
 
@@ -67,7 +78,21 @@ class HeadCircleCommandCfg(microduck_mdp.UniformPoseCommandCfg):
     return HeadCircleCommand(self, env)
 
 
-def make_ys_head_circle_env_cfg(play: bool = False):
+def mouth_circle_tracking(env: ManagerBasedRlEnv, command_name: str, std: float, fine_std: float) -> torch.Tensor:
+  """exp-Gaussian (wide + fine, 50/50) on the mouth_tip y-z error to the circle target, trunk frame.
+  x is free: pitching the head unavoidably moves the tip fore-aft a few mm, and the rope only sees y-z."""
+  cmd = env.command_manager.get_term(command_name)
+  d = env.scene["robot"].data
+  sid = env.scene["robot"].find_sites("mouth_tip")[0][0]
+  tip = quat_apply_inverse(d.root_link_quat_w, d.site_pos_w[:, sid] - d.root_link_pos_w)
+  r = TIP_M_PER_RAD * cmd.amp
+  ty = TIP_CENTER_B[1] + r * torch.sin(cmd.phase)
+  tz = TIP_CENTER_B[2] - r * torch.cos(cmd.phase)
+  err2 = (tip[:, 1] - ty) ** 2 + (tip[:, 2] - tz) ** 2
+  return 0.5 * torch.exp(-err2 / std**2) + 0.5 * torch.exp(-err2 / fine_std**2)
+
+
+def make_ys_head_circle_env_cfg(play: bool = False, tip_space: bool = False):
   cfg = make_microduck_velocity_env_cfg(play=play)
 
   twist = cfg.commands["twist"]
@@ -82,6 +107,15 @@ def make_ys_head_circle_env_cfg(play: bool = False):
     zero_command_prob=ZERO_PROB,
   )
   cfg.rewards["head_pose_tracking"].params["fine_std"] = TRACK_FINE_STD
+  if tip_space:  # joint targets no longer the goal: free the head joints, score the tip
+    cfg.rewards["head_pose_tracking"].weight = 0.0
+    cfg.curriculum.pop("head_pose_bias_weight")
+    cfg.rewards["head_pose_bias"].weight = 0.0
+    cfg.rewards["mouth_circle"] = RewardTermCfg(
+      func=mouth_circle_tracking,
+      weight=2.0,  # same budget head_pose_tracking had
+      params={"command_name": "head_pose", "std": TIP_STD, "fine_std": TIP_FINE_STD},
+    )
   return cfg
 
 

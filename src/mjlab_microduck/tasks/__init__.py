@@ -292,3 +292,11 @@ register_mjlab_task(
     rl_cfg=YsHeadCircleRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+register_mjlab_task(
+    task_id="Mjlab-YsHeadCircleTip-Flat-MicroDuck",
+    env_cfg=make_ys_head_circle_env_cfg(tip_space=True),
+    play_env_cfg=make_ys_head_circle_env_cfg(play=True, tip_space=True),
+    rl_cfg=YsHeadCircleRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)

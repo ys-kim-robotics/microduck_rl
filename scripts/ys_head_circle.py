@@ -7,6 +7,8 @@ Measured on the first harmonic (Fourier coefficient at f) over a whole number of
   joint gain / lag   actual head joint vs command
   tip Ay / Az (mm)   mouth_tip lateral / vertical amplitude in the robot's start frame
   round              min(Ay, Az) / max(Ay, Az), 1 = circle
+  tipE (mm)          mean y-z distance of mouth_tip (trunk frame) to the 4b-3 tip target
+                     (centre TIP_CENTER_B, radius 0.05·A, y=+R·sin, z=−R·cos; same phase as the command)
   sway (mm)          trunk horizontal std,  fall %
 
   uv run scripts/ys_head_circle.py Mjlab-Velocity-Flat-MicroDuck ../policies/velstand.onnx model.pt
@@ -23,6 +25,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from ys_eval import make_env, make_policy  # noqa: E402
+from mjlab.utils.lab_api.math import quat_apply_inverse  # noqa: E402
+from mjlab_microduck.tasks.ys_head_circle_env_cfg import TIP_CENTER_B, TIP_M_PER_RAD  # noqa: E402
 
 HEAD_PITCH, HEAD_YAW = 1, 2  # head_pose command order: neck_pitch, head_pitch, head_yaw, head_roll
 
@@ -55,7 +59,7 @@ def run(task, path, combos, reps, warmup, window, direct=False, boost=1.0, lead_
   aid = [act_names.index(j) for j in ("head_yaw", "head_pitch")]  # action = target - HOME (scale 1)
   sid = robot.find_sites("mouth_tip")[0][0]
   dt = env.step_dt
-  ts, yaw, pitch, tip, trunk = [], [], [], [], []
+  ts, yaw, pitch, tip, trunk, tipe = [], [], [], [], [], []
   fell = torch.zeros(n, dtype=torch.bool, device=dev)
   obs = venv.get_observations()
   steps = int((warmup + window) / dt)
@@ -79,6 +83,12 @@ def run(task, path, combos, reps, warmup, window, direct=False, boost=1.0, lead_
         pitch.append(q[:, jid[1]].clone())
         tip.append(robot.data.site_pos_w[:, sid].clone() - p0)
         trunk.append(robot.data.root_link_pos_w[:, :2].clone() - p0[:, :2])
+        d = robot.data
+        tb = quat_apply_inverse(d.root_link_quat_w, d.site_pos_w[:, sid] - d.root_link_pos_w)
+        w = 2 * math.pi * freq * t
+        ey = tb[:, 1] - (TIP_CENTER_B[1] + TIP_M_PER_RAD * amp * torch.sin(w))
+        ez = tb[:, 2] - (TIP_CENTER_B[2] - TIP_M_PER_RAD * amp * torch.cos(w))
+        tipe.append(torch.sqrt(ey**2 + ez**2))
   env.close()
   t = torch.tensor(ts, device=dev, dtype=torch.float64)
   f = freq.double()
@@ -96,6 +106,7 @@ def run(task, path, combos, reps, warmup, window, direct=False, boost=1.0, lead_
     "lag_yaw": torch.rad2deg(torch.angle(ref_yaw / h_yaw)),
     "gain_pitch": (h_pitch.abs() / ref_pitch.abs()),
     "lag_pitch": torch.rad2deg(torch.angle(ref_pitch / h_pitch)),
+    "tipE": 1000 * torch.stack(tipe).double().mean(0),
     "Ay": ay, "Az": az, "round": torch.minimum(ay, az) / torch.maximum(ay, az), "sway": sway,
   }
   rows = []
@@ -126,7 +137,7 @@ def main():
   p.add_argument("--direct", action="store_true", help="write the head joint targets straight to the servos")
   a = p.parse_args()
   combos = list(itertools.product(a.amps, a.freqs))
-  hdr = f"{'policy':34s} {'A':>4s} {'f':>5s} {'gYaw':>5s} {'lagY':>5s} {'gPit':>5s} {'lagP':>5s} {'Ay':>6s} {'Az':>6s} {'round':>5s} {'sway':>5s} {'fall%':>5s}"
+  hdr = f"{'policy':34s} {'A':>4s} {'f':>5s} {'gYaw':>5s} {'lagY':>5s} {'gPit':>5s} {'lagP':>5s} {'Ay':>6s} {'Az':>6s} {'round':>5s} {'tipE':>5s} {'sway':>5s} {'fall%':>5s}"
   out = [hdr]
   allrows = []
   for path in a.policies:
@@ -135,7 +146,7 @@ def main():
       allrows.append((name, r))
       out.append(
         f"{name:34s} {r['A']:4.2f} {r['f']:5.2f} {r['gain_yaw']:5.2f} {r['lag_yaw']:5.0f} {r['gain_pitch']:5.2f} "
-        f"{r['lag_pitch']:5.0f} {r['Ay']:6.1f} {r['Az']:6.1f} {r['round']:5.2f} {r['sway']:5.1f} {r['fall%']:5.0f}"
+        f"{r['lag_pitch']:5.0f} {r['Ay']:6.1f} {r['Az']:6.1f} {r['round']:5.2f} {r['tipE']:5.1f} {r['sway']:5.1f} {r['fall%']:5.0f}"
       )
   print("\n" + "\n".join(out))
   if a.plot:
