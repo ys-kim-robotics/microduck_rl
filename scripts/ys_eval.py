@@ -59,6 +59,7 @@ def fix_command(cfg, cmd):
       setattr(t, k, 0.0)
   for k in ("head_pose", "body_pose"):
     cfg.commands[k].ranges = tuple((0.0, 0.0) for _ in cfg.commands[k].ranges)
+    cfg.commands[k].resampling_time_range = (1e9, 1e9)  # never overwrite a command a script writes
 
 
 def make_policy(task, path, venv):
