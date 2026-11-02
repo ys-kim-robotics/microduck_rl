@@ -26,7 +26,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 from ys_eval import make_env, make_policy  # noqa: E402
 from mjlab.utils.lab_api.math import quat_apply_inverse  # noqa: E402
-from mjlab_microduck.tasks.ys_head_circle_env_cfg import TIP_CENTER_B, TIP_M_PER_RAD  # noqa: E402
+from mjlab_microduck.tasks.ys_head_circle_env_cfg import TIP_CENTER_B, TIP_M_PER_RAD, apply_tip_force  # noqa: E402
 
 HEAD_PITCH, HEAD_YAW = 1, 2  # head_pose command order: neck_pitch, head_pitch, head_yaw, head_roll
 
@@ -46,7 +46,7 @@ def harmonic(x, t, f):
   return 2 * (x * torch.exp(-1j * 2 * math.pi * f * t[:, None])).mean(0)
 
 
-def run(task, path, combos, reps, warmup, window, direct=False, boost=1.0, lead_deg=0.0):
+def run(task, path, combos, reps, warmup, window, direct=False, boost=1.0, lead_deg=0.0, tip_force=None):
   n = len(combos) * reps
   env, venv = make_env(task, (0.0, 0.0, 0.0), n)
   policy = make_policy(task, path, venv)
@@ -58,6 +58,7 @@ def run(task, path, combos, reps, warmup, window, direct=False, boost=1.0, lead_
   act_names = env.action_manager.get_term("joint_pos")._target_names
   aid = [act_names.index(j) for j in ("head_yaw", "head_pitch")]  # action = target - HOME (scale 1)
   sid = robot.find_sites("mouth_tip")[0][0]
+  bid = robot.find_bodies("jaw_soft")[0][0]
   dt = env.step_dt
   ts, yaw, pitch, tip, trunk, tipe, tipb = [], [], [], [], [], [], []
   fell = torch.zeros(n, dtype=torch.bool, device=dev)
@@ -71,6 +72,8 @@ def run(task, path, combos, reps, warmup, window, direct=False, boost=1.0, lead_
       if direct:  # bypass the policy for the two head joints: servo-only bandwidth
         w = 2 * math.pi * freq * t
         act[:, aid[0]], act[:, aid[1]] = amp * torch.sin(w), amp * torch.cos(w)
+      if tip_force:
+        apply_tip_force(robot, bid, sid, *tip_force)
       obs, _, dones, extras = venv.step(act)
       fell |= dones.bool() & ~extras["time_outs"].bool()
       if k == 0:
@@ -136,6 +139,8 @@ def main():
   p.add_argument("--plot", help="save mouth_tip y-z paths (first rep of each combo) to this png")
   p.add_argument("--boost", type=float, default=1.0, help="feedforward: command amplitude x this")
   p.add_argument("--lead", type=float, default=0.0, help="feedforward: command phase advance (deg)")
+  p.add_argument("--tip-force", type=float, nargs=3, metavar=("FX", "FR", "FZ"),
+                 help="rope-tension stand-in at mouth_tip, N (see apply_tip_force)")
   p.add_argument("--direct", action="store_true", help="write the head joint targets straight to the servos")
   a = p.parse_args()
   combos = list(itertools.product(a.amps, a.freqs))
@@ -144,7 +149,7 @@ def main():
   allrows = []
   for path in a.policies:
     name = (("DIRECT " if a.direct else "") + "/".join(Path(path).parts[-2:]))[-34:]
-    for r in run(a.task, path, combos, a.reps, a.warmup, a.window, a.direct, a.boost, a.lead):
+    for r in run(a.task, path, combos, a.reps, a.warmup, a.window, a.direct, a.boost, a.lead, a.tip_force):
       allrows.append((name, r))
       out.append(
         f"{name:34s} {r['A']:4.2f} {r['f']:5.2f} {r['gain_yaw']:5.2f} {r['lag_yaw']:5.0f} {r['gain_pitch']:5.2f} "

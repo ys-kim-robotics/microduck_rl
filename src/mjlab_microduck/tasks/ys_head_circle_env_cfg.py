@@ -15,6 +15,10 @@ What changes vs the walking task (stage 4a, STAGES-ys.md, is the motivation):
   - tip_space=True (4b-3): the head command is only a phase/amplitude ENCODING; the reward is the
     mouth_tip position on a round circle in the trunk y-z plane. A circle in joint space is an
     ellipse at the tip (forward kinematics, round ~0.7 in 4a/4b-2) -> score the tip itself.
+  - tip_load=True (4b-4): a rope-tension stand-in force at mouth_tip, resampled with the command.
+    4b-3 survived radial/down 0.3 N but a 0.3 N pull toward the partner (+x) made it step (sway
+    63 mm), 1 N felled all. Applied from the command term's per-step update, NOT a weight-0 reward
+    hook: mjlab's RewardManager skips weight-0 terms, so such a hook never runs.
 """
 
 import math
@@ -23,7 +27,7 @@ from dataclasses import dataclass, replace
 import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.managers import RewardTermCfg
-from mjlab.utils.lab_api.math import quat_apply_inverse
+from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse
 
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import MicroduckRlCfg, make_microduck_velocity_env_cfg
@@ -40,6 +44,29 @@ TIP_STD, TIP_FINE_STD = 0.02, 0.005  # m
 HEAD_PITCH, HEAD_YAW = 1, 2  # head_pose order: neck_pitch, head_pitch, head_yaw, head_roll
 
 
+TIP_FX_RANGE = (0.0, 1.0)  # N toward the partner (trunk +x)
+TIP_FR_RANGE = (0.0, 0.3)  # N outward along the tip radius (y-z)
+TIP_FZ_RANGE = (-0.3, 0.0)  # N world vertical (rope weight)
+TIP_LOAD_ZERO_PROB = 0.2  # unloaded bucket
+
+
+def apply_tip_force(robot, bid, sid, fx, fr, fz):
+  """Rope-tension stand-in at mouth_tip (N; floats or (n,) tensors): fx toward the partner (trunk +x),
+  fr outward along the tip's radius in the trunk y-z plane, fz world vertical (negative = down).
+  Applied as a wrench on the tip's body (force + lever torque) so the neck feels the right moment."""
+  d = robot.data
+  tb = quat_apply_inverse(d.root_link_quat_w, d.site_pos_w[:, sid] - d.root_link_pos_w)
+  rad = torch.zeros_like(tb)
+  rad[:, 1] = tb[:, 1] - TIP_CENTER_B[1]
+  rad[:, 2] = tb[:, 2] - TIP_CENTER_B[2]
+  fb = torch.as_tensor(fr, device=tb.device).reshape(-1, 1) * rad / rad.norm(dim=-1, keepdim=True).clamp_min(1e-3)
+  fb[:, 0] += torch.as_tensor(fx, device=tb.device)
+  f = quat_apply(d.root_link_quat_w, fb)
+  f[:, 2] += torch.as_tensor(fz, device=tb.device)
+  tau = torch.cross(d.site_pos_w[:, sid] - d.body_com_pos_w[:, bid], f, dim=-1)
+  robot.write_external_wrench_to_sim(forces=f.unsqueeze(1), torques=tau.unsqueeze(1), body_ids=[bid])
+
+
 class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
   """head_pose on a circle in (head_yaw, head_pitch); amplitude and start phase resampled."""
 
@@ -49,6 +76,10 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
     super().__init__(cfg, env)
     self.amp = torch.zeros(self.num_envs, device=self.device)
     self.phase = torch.zeros(self.num_envs, device=self.device)
+    self.tip_force = torch.zeros(self.num_envs, 3, device=self.device)  # fx, fr, fz
+    if cfg.tip_load:
+      robot = env.scene["robot"]
+      self._robot, self._sid, self._bid = robot, robot.find_sites("mouth_tip")[0][0], robot.find_bodies("jaw_soft")[0][0]
 
   def _resample_command(self, env_ids: torch.Tensor) -> None:
     n = len(env_ids)
@@ -57,11 +88,17 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
     self.amp[env_ids] = torch.empty(n, device=self.device).uniform_(*self.cfg.amp_range)
     self.amp[env_ids[torch.rand(n, device=self.device) < self.cfg.zero_command_prob]] = 0.0
     self.phase[env_ids] = torch.empty(n, device=self.device).uniform_(0.0, 2 * math.pi)
+    if self.cfg.tip_load:
+      for i, rng in enumerate((TIP_FX_RANGE, TIP_FR_RANGE, TIP_FZ_RANGE)):
+        self.tip_force[env_ids, i] = torch.empty(n, device=self.device).uniform_(*rng)
+      self.tip_force[env_ids[torch.rand(n, device=self.device) < TIP_LOAD_ZERO_PROB]] = 0.0
     self._write()
 
   def _update_command(self) -> None:
     self.phase += 2 * math.pi * self.cfg.freq_hz * self._env.step_dt
     self._write()
+    if self.cfg.tip_load:  # every step: the radial direction follows the tip
+      apply_tip_force(self._robot, self._bid, self._sid, *self.tip_force.unbind(1))
 
   def _write(self) -> None:
     self._command.zero_()
@@ -73,6 +110,7 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
 class HeadCircleCommandCfg(microduck_mdp.UniformPoseCommandCfg):
   freq_hz: float = CIRCLE_FREQ_HZ
   amp_range: tuple[float, float] = AMP_RANGE
+  tip_load: bool = False
 
   def build(self, env: ManagerBasedRlEnv) -> HeadCircleCommand:
     return HeadCircleCommand(self, env)
@@ -92,7 +130,7 @@ def mouth_circle_tracking(env: ManagerBasedRlEnv, command_name: str, std: float,
   return 0.5 * torch.exp(-err2 / std**2) + 0.5 * torch.exp(-err2 / fine_std**2)
 
 
-def make_ys_head_circle_env_cfg(play: bool = False, tip_space: bool = False):
+def make_ys_head_circle_env_cfg(play: bool = False, tip_space: bool = False, tip_load: bool = False):
   cfg = make_microduck_velocity_env_cfg(play=play)
 
   twist = cfg.commands["twist"]
@@ -105,6 +143,7 @@ def make_ys_head_circle_env_cfg(play: bool = False, tip_space: bool = False):
     resampling_time_range=(4.0, 8.0),
     ranges=((0.0, 0.0),) * 4,  # unused; keeps the 4D layout
     zero_command_prob=ZERO_PROB,
+    tip_load=tip_load,
   )
   cfg.rewards["head_pose_tracking"].params["fine_std"] = TRACK_FINE_STD
   if tip_space:  # joint targets no longer the goal: free the head joints, score the tip
