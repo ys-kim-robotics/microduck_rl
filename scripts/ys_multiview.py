@@ -37,6 +37,7 @@ def main():
   p.add_argument("--size", type=int, default=480, help="height of each view (px)")
   p.add_argument("--distance", type=float, default=0.8, help="camera distance (m)")
   p.add_argument("--out", default=None)
+  p.add_argument("--lookat", type=float, nargs=3, help="fixed world point to look at (default: follow the robot)")
   p.add_argument("--cmd", type=float, nargs=3, help="hold this vx vy wz (default: the task's random commands)")
   p.add_argument("--head-circle", type=float, nargs="+", metavar="A F [BOOST LEAD_DEG]",
                  help="drive head_yaw/pitch on a circle (needs --cmd)")
@@ -57,6 +58,8 @@ def main():
   env_cfg.viewer.height, env_cfg.viewer.width = a.size, a.size * 4 // 3
   env_cfg.viewer.distance = a.distance
   env_cfg.viewer.max_extra_envs = 0
+  if a.lookat:  # e.g. the rope's middle, so the far end stays in frame
+    env_cfg.viewer.origin_type, env_cfg.viewer.lookat = env_cfg.viewer.OriginType.WORLD, tuple(a.lookat)
   env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda:0", render_mode="rgb_array")
   venv = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
   policy = make_policy(a.task, a.checkpoint, venv)  # .pt or .onnx

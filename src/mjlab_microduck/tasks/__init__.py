@@ -326,3 +326,97 @@ register_mjlab_task(
     rl_cfg=YsRopeRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+from mjlab_microduck.tasks.ys_rope_env_cfg import make_ys_rope_bob_env_cfg  # noqa: E402
+
+register_mjlab_task(
+    task_id="Mjlab-YsRopeBob-Flat-MicroDuck",
+    env_cfg=make_ys_rope_bob_env_cfg(),
+    play_env_cfg=make_ys_rope_bob_env_cfg(play=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-YsRopeLoop-Flat-MicroDuck",
+    env_cfg=make_ys_rope_bob_env_cfg(loop=True),
+    play_env_cfg=make_ys_rope_bob_env_cfg(play=True, loop=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-YsRopeStay-Flat-MicroDuck",
+    env_cfg=make_ys_rope_bob_env_cfg(stay=True),
+    play_env_cfg=make_ys_rope_bob_env_cfg(play=True, stay=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-YsRopeBoth-Flat-MicroDuck",
+    env_cfg=make_ys_rope_bob_env_cfg(stay=True, reverse=True),
+    play_env_cfg=make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+from mjlab_microduck.tasks.ys_rope_env_cfg import make_ys_rope_partner_env_cfg  # noqa: E402
+
+register_mjlab_task(
+    task_id="Mjlab-YsRopePartner-Flat-MicroDuck",
+    env_cfg=make_ys_rope_partner_env_cfg(),
+    play_env_cfg=make_ys_rope_partner_env_cfg(play=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+from mjlab_microduck.tasks.ys_rope_env_cfg import make_ys_rope_lock_env_cfg  # noqa: E402
+
+register_mjlab_task(
+    task_id="Mjlab-YsRopeLock-Flat-MicroDuck",
+    env_cfg=make_ys_rope_lock_env_cfg(),
+    play_env_cfg=make_ys_rope_lock_env_cfg(play=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+from mjlab_microduck.tasks.ys_rope_env_cfg import make_ys_rope_soft_env_cfg  # noqa: E402
+
+register_mjlab_task(
+    task_id="Mjlab-YsRopeSoft-Flat-MicroDuck",
+    env_cfg=make_ys_rope_soft_env_cfg(),
+    play_env_cfg=make_ys_rope_soft_env_cfg(play=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+from mjlab_microduck.tasks.ys_rope_env_cfg import make_ys_rope_slack_env_cfg  # noqa: E402
+
+register_mjlab_task(
+    task_id="Mjlab-YsRopeSlack-Flat-MicroDuck",
+    env_cfg=make_ys_rope_slack_env_cfg(),
+    play_env_cfg=make_ys_rope_slack_env_cfg(play=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+from mjlab_microduck.tasks.ys_rope_duo_env_cfg import make_ys_rope_duo_env_cfg  # noqa: E402
+
+register_mjlab_task(
+    task_id="Mjlab-YsRopeDuo-Flat-MicroDuck",
+    env_cfg=make_ys_rope_duo_env_cfg(),
+    play_env_cfg=make_ys_rope_duo_env_cfg(play=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+from mjlab_microduck.tasks.ys_rope_duo_env_cfg import YsSelfPlayRunner  # noqa: E402
+
+register_mjlab_task(
+    task_id="Mjlab-YsRopeSelf-Flat-MicroDuck",
+    env_cfg=make_ys_rope_duo_env_cfg(),
+    play_env_cfg=make_ys_rope_duo_env_cfg(play=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=YsSelfPlayRunner,
+)

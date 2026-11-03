@@ -48,6 +48,8 @@ def run(task, path, radii, reps, warmup, window, freq=None, stems=()):
   jb = robot.find_bodies("jaw_soft")[0][0]
   nid = [robot.actuator_names.index(j) for j in ("neck_pitch", "head_pitch", "head_yaw", "head_roll")]
   stem_pts = {L: [] for L in stems}
+  rope = env.scene["rope"] if "rope" in env.scene.entities else None  # 5c+: rope mid height (m) and turn rate
+  mid_z, turn = [], []
   fell = torch.zeros(n, dtype=torch.bool, device=env.device)
   obs = venv.get_observations()
   with torch.inference_mode():
@@ -75,6 +77,11 @@ def run(task, path, radii, reps, warmup, window, freq=None, stems=()):
           off_j = torch.tensor(STEM_BASE_J, device=env.device) + torch.tensor([0.0, 0.0, -L], device=env.device)
           pw = robot.data.body_link_pos_w[:, jb] + quat_apply(tq, off_j.expand(n, 3))
           stem_pts[L].append((rt @ (pw - o).unsqueeze(-1)).squeeze(-1))
+        if rope is not None:
+          from mjlab_microduck.tasks.ys_rope import ROPE_LINKS
+          from mjlab_microduck.tasks.ys_rope_env_cfg import rope_turn
+          mid_z.append(rope.data.body_link_pos_w[:, ROPE_LINKS // 2, 2])
+          turn.append(rope_turn(env))
         ts.append(k * dt)
   env.close()
   t = torch.tensor(ts, device=env.device, dtype=torch.float64)
@@ -85,6 +92,10 @@ def run(task, path, radii, reps, warmup, window, freq=None, stems=()):
        "trY": amp(trunk[..., 1]), "trZ": amp(trunk[..., 2]), "off%": 100 * torch.stack(off).double().mean(0),
        "score": torch.stack(score).double().mean(0),
        "neckRMS": torch.stack(neck).double().square().mean(0).sqrt(), "neck99": torch.stack(neck).double().quantile(0.99, dim=0)}
+  if mid_z:  # zlo/zhi: per-env 5th / 95th percentile of the mid link's height (mm); turn: mean rope_turn
+    z = 1000 * torch.stack(mid_z).double()
+    m["zlo"], m["zhi"] = z.quantile(0.05, dim=0), z.quantile(0.95, dim=0)
+    m["turn"] = torch.stack(turn).double().mean(0)
   for L, pts in stem_pts.items():
     pts = torch.stack(pts).double()
     m[f"S{100 * L:.0f}y"], m[f"S{100 * L:.0f}z"] = amp(pts[..., 1]), amp(pts[..., 2])
@@ -112,11 +123,13 @@ def main():
   a = p.parse_args()
   keys = ["R", "Ay", "Az", "tipE", "score", "trY", "trZ", "neckRMS", "neck99", "off%", "fall%"]
   keys += [f"S{100 * L:.0f}{c}" for L in a.stem for c in "yz"]
+  if "Rope" in a.task:
+    keys += ["zlo", "zhi", "turn"]
   out = [f"{'policy':34s} " + " ".join(f"{k:>6s}" for k in keys)]
   for path in a.policies:
     name = "/".join(Path(path).parts[-2:])[-34:]
     for r in run(a.task, path, a.radii, a.reps, a.warmup, a.window, a.freq, a.stem):
-      out.append(f"{name:34s} " + " ".join(f"{r[k]:6.2f}" if k in ("score", "neckRMS", "neck99") else f"{r[k]:6.1f}" for k in keys))
+      out.append(f"{name:34s} " + " ".join(f"{r[k]:6.2f}" if k in ("score", "neckRMS", "neck99", "turn") else f"{r[k]:6.1f}" for k in keys))
   print("\n" + "\n".join(out))
 
 

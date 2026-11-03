@@ -49,7 +49,7 @@ TRACK_FINE_STD = 0.3  # rad; 0.1 (4b-1) had no gradient at the 0.2-0.34 rad pitc
 TIP_CENTER_B = (0.0838, 0.0, 0.0888)
 TIP_M_PER_RAD = 0.05  # target radius R = 0.05·A -> 10-35 mm
 TIP_STD, TIP_FINE_STD = 0.02, 0.005  # m
-NECK_PITCH, HEAD_PITCH, HEAD_YAW = 0, 1, 2  # head_pose order: neck_pitch, head_pitch, head_yaw, head_roll
+NECK_PITCH, HEAD_PITCH, HEAD_YAW, HEAD_ROLL = 0, 1, 2, 3  # head_pose order: neck_pitch, head_pitch, head_yaw, head_roll
 
 
 # 5b whole-body circle, feet frame. Tip at HOME relative to the feet midpoint, measured with hc4@6000
@@ -114,7 +114,7 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
     robot = env.scene["robot"]
     self._robot, self._sid, self._bid = robot, robot.find_sites("mouth_tip")[0][0], robot.find_bodies("jaw_soft")[0][0]
     self._feet = robot.find_sites(["left_foot", "right_foot"], preserve_order=True)[0]
-    self.r_max = WB_R_START
+    self.r_max = cfg.r_start
     self._err_sum, self._err_n, self._steps = 0.0, 0, 0
     self.metrics["r_max"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["tip_err_mm"] = torch.zeros(self.num_envs, device=self.device)
@@ -128,6 +128,8 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
     if self.cfg.whole_body:  # radius R (m) in [0.3, 1] x r_max, encoded as R / TIP_M_PER_RAD
       self.amp[env_ids] = torch.empty(n, device=self.device).uniform_(0.3 * self.r_max, self.r_max) / TIP_M_PER_RAD
       self.freq[env_ids] = torch.empty(n, device=self.device).uniform_(*WB_FREQ_RANGE)
+      flip = torch.rand(n, device=self.device) < self.cfg.reverse_prob  # freq < 0: the circle runs backwards
+      self.freq[env_ids] = torch.where(flip, -self.freq[env_ids], self.freq[env_ids])
       self.center[env_ids] = tip_feet(self._robot, self._sid, self._feet)[0][env_ids, 1:]
     else:
       self.amp[env_ids] = torch.empty(n, device=self.device).uniform_(*self.cfg.amp_range)
@@ -172,7 +174,8 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
     self._command[:, HEAD_YAW] = self.amp * torch.sin(self.phase)
     self._command[:, HEAD_PITCH] = self.amp * torch.cos(self.phase)
     if self.cfg.whole_body:
-      self._command[:, NECK_PITCH] = self.freq - WB_FREQ_MID
+      self._command[:, NECK_PITCH] = self.freq.abs() - WB_FREQ_MID
+      self._command[:, HEAD_ROLL] = torch.sign(self.freq) - 1.0  # 0 forward (as before), -2 reversed
 
 
 @dataclass(kw_only=True)
@@ -182,6 +185,8 @@ class HeadCircleCommandCfg(microduck_mdp.UniformPoseCommandCfg):
   tip_load: bool = False
   whole_body: bool = False
   freeze_radius: bool = False  # eval scripts: keep r_max where it is
+  r_start: float = WB_R_START  # initial r_max (play: start at the curriculum's end)
+  reverse_prob: float = 0.0  # whole_body: share of commands turning the other way (the facing turner)
 
   def build(self, env: ManagerBasedRlEnv) -> HeadCircleCommand:
     return HeadCircleCommand(self, env)
@@ -243,7 +248,7 @@ def circle_score(robot, sid, feet, amp, freq, center, std=WB_STD, fine_std=WB_FI
   radial = 0.5 * torch.exp(-e2 / std**2) + 0.5 * torch.exp(-e2 / fine_std**2)
   vt = (y * v[:, 2] - z * v[:, 1]) / rho  # + = the command's sense (y = R sin, z = -R cos)
   w_r = 2 * math.pi * freq * R
-  speed = torch.where(R > 0, torch.exp(-(((vt - w_r) / w_r.clamp_min(1e-4)) ** 2) / speed_std**2), 1.0)
+  speed = torch.where(R > 0, torch.exp(-(((vt - w_r) / w_r.abs().clamp_min(1e-4)) ** 2) / speed_std**2), 1.0)
   return radial * speed
 
 
