@@ -15,11 +15,12 @@ What changes vs the walking task (stage 4a, STAGES-ys.md, is the motivation):
   - tip_space=True (4b-3): the head command is only a phase/amplitude ENCODING; the reward is the
     mouth_tip position on a round circle in the trunk y-z plane. A circle in joint space is an
     ellipse at the tip (forward kinematics, round ~0.7 in 4a/4b-2) -> score the tip itself.
-  - whole_body=True (5b): the rope (5a, STAGES-ys.md) needs a 7-10 cm handle circle at 2 Hz, not the
-    2-3.5 cm the head alone draws. The target circle moves to a FEET frame (feet midpoint, lateral
-    axis = right->left foot), so crouching and leaning count too, and the radius grows on its own
-    (adaptive curriculum) while the tracking error stays small. The amplitude stays encoded in the
-    head_pose slots as R / TIP_M_PER_RAD (obs layout unchanged). Rewards that blocked trunk motion
+  - whole_body=True (5b): the rope (5a, STAGES-ys.md) needs an 8-10 cm handle circle at 1.25-1.5 Hz,
+    not the 2-3.5 cm the head alone draws. The circle is scored in a FEET frame (feet midpoint,
+    lateral axis = right->left foot), about the tip's own running-mean centre, phase-free (radius x
+    turning speed), so crouching and leaning count too; the radius grows on its own (adaptive
+    curriculum on that score). Encoded in head_pose (obs layout unchanged): R / TIP_M_PER_RAD in
+    the yaw/pitch slots, the frequency (1-1.5 Hz, per resample) in the neck_pitch slot. Rewards that blocked trunk motion
     (twist lin-vel incl. z, upright, standing posture stds) are loosened; feet_planted replaces
     feet_slip, which is gated off while standing.
   - tip_load=True (4b-4): a rope-tension stand-in force at mouth_tip, resampled with the command.
@@ -48,14 +49,18 @@ TRACK_FINE_STD = 0.3  # rad; 0.1 (4b-1) had no gradient at the 0.2-0.34 rad pitc
 TIP_CENTER_B = (0.0838, 0.0, 0.0888)
 TIP_M_PER_RAD = 0.05  # target radius R = 0.05·A -> 10-35 mm
 TIP_STD, TIP_FINE_STD = 0.02, 0.005  # m
-HEAD_PITCH, HEAD_YAW = 1, 2  # head_pose order: neck_pitch, head_pitch, head_yaw, head_roll
+NECK_PITCH, HEAD_PITCH, HEAD_YAW = 0, 1, 2  # head_pose order: neck_pitch, head_pitch, head_yaw, head_roll
 
 
 # 5b whole-body circle, feet frame. Tip at HOME relative to the feet midpoint, measured with hc4@6000
 # standing (scratch tipfeet, 2026-11-03): (46.8, 0, 204.9) mm; feet 83 mm apart.
 TIP_CENTER_F = (0.047, 0.0, 0.205)
-WB_FREQ_HZ = 2.0  # 5a: lowest rate a ~0.2 m rope arc stays round at (Froude ω²R/g ≈ 3)
-WB_R_START, WB_R_MAX, WB_R_STEP = 0.035, 0.10, 0.005  # m; start where hc4 already is
+# bc4: both rope ends turning in phase (the partner mirrors the duck) lift the rope over the top at
+# 1.25-1.5 Hz with an 8-10 cm handle circle (5a-3); 2 Hz was what one fixed end needed. A frequency
+# RANGE, sent in the neck_pitch slot as f - WB_FREQ_MID, lets the runtime spin up fast, then slow down.
+WB_FREQ_RANGE, WB_FREQ_MID = (1.0, 1.5), 1.25  # Hz
+WB_CENTER_TAU = 1.0  # s; the circle centre is the tip's own running mean (the rope needs size + speed, not a place)
+WB_R_START, WB_R_MAX, WB_R_STEP = 0.035, 0.12, 0.005  # m; start where hc4 already is
 # Radius curriculum on the mean RELATIVE error err/R (envs with R > 0): grow below GROW, shrink above
 # SHRINK. bc1 compared the absolute error to 0.3·r_max, a bar that loosened as r_max grew: 3.5 -> 10 cm
 # in ~70 iterations, far past the skill, and the policy stopped moving (STAGES-ys.md 5b-1).
@@ -100,6 +105,8 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
     self.amp = torch.zeros(self.num_envs, device=self.device)
     self.phase = torch.zeros(self.num_envs, device=self.device)
     self.tip_force = torch.zeros(self.num_envs, 3, device=self.device)  # fx, fr, fz
+    self.freq = torch.full((self.num_envs,), cfg.freq_hz, device=self.device)
+    self.center = torch.zeros(self.num_envs, 2, device=self.device)  # feet-frame y, z (whole_body)
     robot = env.scene["robot"]
     self._robot, self._sid, self._bid = robot, robot.find_sites("mouth_tip")[0][0], robot.find_bodies("jaw_soft")[0][0]
     self._feet = robot.find_sites(["left_foot", "right_foot"], preserve_order=True)[0]
@@ -116,6 +123,8 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
       return
     if self.cfg.whole_body:  # radius R (m) in [0.3, 1] x r_max, encoded as R / TIP_M_PER_RAD
       self.amp[env_ids] = torch.empty(n, device=self.device).uniform_(0.3 * self.r_max, self.r_max) / TIP_M_PER_RAD
+      self.freq[env_ids] = torch.empty(n, device=self.device).uniform_(*WB_FREQ_RANGE)
+      self.center[env_ids] = tip_feet(self._robot, self._sid, self._feet)[0][env_ids, 1:]
     else:
       self.amp[env_ids] = torch.empty(n, device=self.device).uniform_(*self.cfg.amp_range)
     self.amp[env_ids[torch.rand(n, device=self.device) < self.cfg.zero_command_prob]] = 0.0
@@ -130,13 +139,14 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
     if not self.cfg.whole_body:
       return
     err = tip_error_feet(self._robot, self._sid, self._feet, self.amp, self.phase)
-    score = circle_score(self._robot, self._sid, self._feet, self.amp, self.cfg.freq_hz)
+    self.center += (tip_feet(self._robot, self._sid, self._feet)[0][:, 1:] - self.center) * (self._env.step_dt / WB_CENTER_TAU)
+    score = circle_score(self._robot, self._sid, self._feet, self.amp, self.freq, self.center)
     on = self.amp > 0
     self.metrics["tip_err_mm"] += torch.where(on, 1000 * err, 0.0) * self._env.step_dt / 20.0  # ~mean over a 20 s episode
     self._err_sum += (score * on).sum().item() / max(on.sum().item(), 1)
     self._err_n += 1
     self._steps += 1
-    if self._steps % WB_CHECK_STEPS == 0:
+    if self._steps % WB_CHECK_STEPS == 0 and not self.cfg.freeze_radius:
       mean_score = self._err_sum / self._err_n
       if mean_score > WB_GROW_SCORE:
         self.r_max = min(self.r_max + WB_R_STEP, WB_R_MAX)
@@ -148,7 +158,7 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
     self.metrics["score"][:] = self._mean_score
 
   def _update_command(self) -> None:
-    self.phase += 2 * math.pi * self.cfg.freq_hz * self._env.step_dt
+    self.phase += 2 * math.pi * self.freq * self._env.step_dt
     self._write()
     if self.cfg.tip_load:  # every step: the radial direction follows the tip
       apply_tip_force(self._robot, self._bid, self._sid, *self.tip_force.unbind(1))
@@ -157,6 +167,8 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
     self._command.zero_()
     self._command[:, HEAD_YAW] = self.amp * torch.sin(self.phase)
     self._command[:, HEAD_PITCH] = self.amp * torch.cos(self.phase)
+    if self.cfg.whole_body:
+      self._command[:, NECK_PITCH] = self.freq - WB_FREQ_MID
 
 
 @dataclass(kw_only=True)
@@ -165,6 +177,7 @@ class HeadCircleCommandCfg(microduck_mdp.UniformPoseCommandCfg):
   amp_range: tuple[float, float] = AMP_RANGE
   tip_load: bool = False
   whole_body: bool = False
+  freeze_radius: bool = False  # eval scripts: keep r_max where it is
 
   def build(self, env: ManagerBasedRlEnv) -> HeadCircleCommand:
     return HeadCircleCommand(self, env)
@@ -205,15 +218,21 @@ def tip_error_feet(robot, sid, feet, amp, phase):
   return torch.sqrt(ey**2 + ez**2)
 
 
-def circle_score(robot, sid, feet, amp, freq, std=WB_STD, fine_std=WB_FINE_STD, speed_std=WB_SPEED_STD):
-  """Phase-free circle score in [0, 1], feet frame y-z plane: radius right x turning at the commanded
-  rate in the commanded sense. radial error e = rho - R (wide + fine Gaussian), tangential speed
-  v_t vs omega*R (relative Gaussian). R = 0 (still bucket): reduces to staying at the centre."""
+def tip_feet(robot, sid, feet):
+  """mouth_tip position and velocity in the feet frame, (n, 3) each."""
   o, rot = feet_frame(robot, feet)
   rt = rot.transpose(1, 2)
   p = (rt @ (robot.data.site_pos_w[:, sid] - o).unsqueeze(-1)).squeeze(-1)
-  v = (rt @ robot.data.site_lin_vel_w[:, sid].unsqueeze(-1)).squeeze(-1)
-  y, z = p[:, 1] - TIP_CENTER_F[1], p[:, 2] - TIP_CENTER_F[2]
+  return p, (rt @ robot.data.site_lin_vel_w[:, sid].unsqueeze(-1)).squeeze(-1)
+
+
+def circle_score(robot, sid, feet, amp, freq, center, std=WB_STD, fine_std=WB_FINE_STD, speed_std=WB_SPEED_STD):
+  """Phase-free circle score in [0, 1], feet frame y-z plane, about `center` (n, 2): radius right x
+  turning at the commanded rate (freq: (n,) Hz) in the commanded sense. radial error e = rho - R
+  (wide + fine Gaussian), tangential speed v_t vs omega*R (relative Gaussian). R = 0 (still bucket):
+  reduces to staying at the centre."""
+  p, v = tip_feet(robot, sid, feet)
+  y, z = p[:, 1] - center[:, 0], p[:, 2] - center[:, 1]
   rho = torch.sqrt(y**2 + z**2).clamp_min(1e-4)
   R = TIP_M_PER_RAD * amp
   e2 = (rho - R) ** 2
@@ -226,7 +245,7 @@ def circle_score(robot, sid, feet, amp, freq, std=WB_STD, fine_std=WB_FINE_STD, 
 
 def mouth_circle_feet(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
   cmd = env.command_manager.get_term(command_name)
-  return circle_score(cmd._robot, cmd._sid, cmd._feet, cmd.amp, cmd.cfg.freq_hz)
+  return circle_score(cmd._robot, cmd._sid, cmd._feet, cmd.amp, cmd.freq, cmd.center)
 
 
 def feet_planted(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
@@ -255,7 +274,7 @@ def make_ys_head_circle_env_cfg(play: bool = False, tip_space: bool = False, tip
     zero_command_prob=ZERO_PROB,
     tip_load=tip_load,
     whole_body=whole_body,
-    freq_hz=WB_FREQ_HZ if whole_body else CIRCLE_FREQ_HZ,
+    freq_hz=WB_FREQ_MID if whole_body else CIRCLE_FREQ_HZ,
   )
   cfg.rewards["head_pose_tracking"].params["fine_std"] = TRACK_FINE_STD
   if tip_space:  # joint targets no longer the goal: free the head joints, score the tip

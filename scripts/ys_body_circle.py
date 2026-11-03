@@ -21,7 +21,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 from ys_eval import make_env, make_policy  # noqa: E402
 from ys_head_circle import harmonic  # noqa: E402
-from mjlab_microduck.tasks.ys_head_circle_env_cfg import TIP_M_PER_RAD, circle_score, feet_frame, tip_error_feet  # noqa: E402
+from mjlab_microduck.tasks.ys_head_circle_env_cfg import TIP_M_PER_RAD, circle_score, feet_frame, tip_error_feet, tip_feet  # noqa: E402
 
 
 def run(task, path, radii, reps, warmup, window, freq=None):
@@ -29,9 +29,10 @@ def run(task, path, radii, reps, warmup, window, freq=None):
   env, venv = make_env(task, (0.0, 0.0, 0.0), n)
   policy = make_policy(task, path, venv)
   cmd = env.command_manager.get_term("head_pose")
-  cmd.cfg.whole_body = False  # freeze: no radius curriculum, no resampling from r_max
+  cmd.cfg.freeze_radius = True
   if freq:
     cmd.cfg.freq_hz = freq
+  cmd.freq[:] = cmd.cfg.freq_hz
   R = torch.tensor([r for r in radii for _ in range(reps)], device=env.device)
   robot = env.scene["robot"]
   sid = robot.find_sites("mouth_tip")[0][0]
@@ -43,7 +44,10 @@ def run(task, path, radii, reps, warmup, window, freq=None):
   obs = venv.get_observations()
   with torch.inference_mode():
     for k in range(int((warmup + window) / dt)):
+      if k == 0:
+        cmd.center[:] = tip_feet(robot, sid, feet)[0][:, 1:]
       cmd.amp[:] = R / TIP_M_PER_RAD
+      cmd.freq[:] = f
       cmd.tip_force.zero_()
       cmd.phase.copy_(torch.full_like(cmd.phase, 2 * math.pi * f * k * dt))
       cmd._write()
@@ -55,7 +59,7 @@ def run(task, path, radii, reps, warmup, window, freq=None):
         tip.append((rt @ (robot.data.site_pos_w[:, sid] - o).unsqueeze(-1)).squeeze(-1))
         trunk.append((rt @ (robot.data.root_link_pos_w - o).unsqueeze(-1)).squeeze(-1))
         err.append(tip_error_feet(robot, sid, feet, cmd.amp, cmd.phase))
-        score.append(circle_score(robot, sid, feet, cmd.amp, f))
+        score.append(circle_score(robot, sid, feet, cmd.amp, cmd.freq, cmd.center))
         off.append((contact.data.found == 0).any(1).float())
         ts.append(k * dt)
   env.close()

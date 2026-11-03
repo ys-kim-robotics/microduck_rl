@@ -17,9 +17,12 @@ ROPE_DAMPING = 1e-4  # N·m·s/rad per ball joint: <1e-4 blew up at dt 5 ms + im
 ROPE_ARMATURE = 1e-6  # kg·m²: ~0.4x a link's own inertia; 0 blew up, 1e-5 visibly stiffened the rope (5a)
 
 
-def add_rope(spec, anchor, end, name="rope", length=ROPE_LEN, mass=ROPE_MASS, links=ROPE_LINKS):
-  """Chain from `anchor` (fixed to the world) toward `end`, initialised as a V sagging below the
-  straight line so its length fits. Returns the name of the site at the free end (connect it)."""
+def add_rope(spec, anchor, end, name="rope", length=ROPE_LEN, mass=ROPE_MASS, links=ROPE_LINKS, free=False):
+  """Chain from `anchor` toward `end`, initialised as a V sagging below the straight line so its
+  length fits. The first link hangs from a world-fixed ball joint at `anchor`, or with free=True
+  has a free joint (connect its start site to a moving handle). Never parent the rope to a mocap
+  body: moving a mocap teleports its subtree, so the chain is dragged rigidly with no inertia (5a-2).
+  Returns the names of the (start, end) sites."""
   anchor, end = np.asarray(anchor, float), np.asarray(end, float)
   seg = length / links
   span = np.linalg.norm(end - anchor)
@@ -34,18 +37,22 @@ def add_rope(spec, anchor, end, name="rope", length=ROPE_LEN, mass=ROPE_MASS, li
     d /= np.linalg.norm(d)
     body = parent.add_body(name=f"{name}_{i}", pos=pts[i] - prev)
     prev = pts[i]
-    body.add_joint(name=f"{name}_j{i}", type=mujoco.mjtJoint.mjJNT_BALL, damping=ROPE_DAMPING, armature=ROPE_ARMATURE)
+    if i == 0 and free:
+      body.add_freejoint(name=f"{name}_free")
+      body.add_site(name=f"{name}_start", size=[0.004, 0, 0])
+    else:
+      body.add_joint(name=f"{name}_j{i}", type=mujoco.mjtJoint.mjJNT_BALL, damping=ROPE_DAMPING, armature=ROPE_ARMATURE)
     body.add_geom(type=mujoco.mjtGeom.mjGEOM_CAPSULE, fromto=[0, 0, 0, *(d * seg)], size=[ROPE_RADIUS, 0, 0],
                   mass=mass / links, rgba=[0.9, 0.2, 0.2, 1], contype=2, conaffinity=1, condim=3)
     parent = body
   parent.add_site(name=f"{name}_end", pos=d * seg, size=[0.004, 0, 0])
-  return f"{name}_end"
+  return f"{name}_start", f"{name}_end"
 
 
 def demo():
   spec = mujoco.MjSpec()
   spec.worldbody.add_geom(type=mujoco.mjtGeom.mjGEOM_PLANE, size=[1, 1, 0.1])
-  site = add_rope(spec, (0, 0, 0.2), (0.7, 0, 0.2))
+  _, site = add_rope(spec, (0, 0, 0.2), (0.7, 0, 0.2))
   m = spec.compile()
   d = mujoco.MjData(m)
   mujoco.mj_forward(m, d)

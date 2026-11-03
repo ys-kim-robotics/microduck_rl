@@ -42,6 +42,7 @@ def main():
                  help="drive head_yaw/pitch on a circle (needs --cmd)")
   p.add_argument("--tip-force", type=float, nargs=3, metavar=("FX", "FR", "FZ"), help="rope-tension stand-in at mouth_tip (N)")
   p.add_argument("--body-circle", type=float, metavar="R", help="5b task: hold the feet-frame circle radius R (m), no load")
+  p.add_argument("--body-freq", type=float, help="5b task: circle frequency (Hz)")
   p.add_argument("--views", nargs="+", help="subset of view labels (1, 2 or 4)")
   a = p.parse_args()
   views = [v for v in VIEWS if not a.views or v[0] in a.views]
@@ -68,7 +69,7 @@ def main():
   if a.body_circle is not None:
     from mjlab_microduck.tasks.ys_head_circle_env_cfg import TIP_M_PER_RAD
     hc = env.command_manager.get_term("head_pose")
-    hc.cfg.whole_body = False  # freeze the radius curriculum
+    hc.cfg.freeze_radius = True
   obs = venv.get_observations()
   with torch.inference_mode():
     for k in range(int(a.seconds * fps)):
@@ -78,6 +79,8 @@ def main():
         set_head_circle(env, (k + 1) * env.step_dt, A * boost, F, math.radians(lead))
       if a.body_circle is not None:
         hc.amp[:] = a.body_circle / TIP_M_PER_RAD
+        if a.body_freq:
+          hc.freq[:] = a.body_freq
         hc.tip_force.zero_()
         hc._write()
       if a.tip_force:
