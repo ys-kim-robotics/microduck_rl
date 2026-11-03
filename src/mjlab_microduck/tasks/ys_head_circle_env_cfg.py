@@ -58,7 +58,9 @@ TIP_CENTER_F = (0.047, 0.0, 0.205)
 # bc4: both rope ends turning in phase (the partner mirrors the duck) lift the rope over the top at
 # 1.25-1.5 Hz with an 8-10 cm handle circle (5a-3); 2 Hz was what one fixed end needed. A frequency
 # RANGE, sent in the neck_pitch slot as f - WB_FREQ_MID, lets the runtime spin up fast, then slow down.
-WB_FREQ_RANGE, WB_FREQ_MID = (1.0, 1.5), 1.25  # Hz
+# bc6: 1.0 Hz dropped: the rope collapses below ~1.25 Hz (5a-3 sustain, ω²R/g < 1 at R ≈ 0.2 m), and
+# human long-rope tempo is ~1.5-1.7 Hz (92-100 rpm) -> train only where the rope can turn.
+WB_FREQ_RANGE, WB_FREQ_MID = (1.25, 1.5), 1.25  # Hz
 WB_CENTER_TAU = 1.0  # s; the circle centre is the tip's own running mean (the rope needs size + speed, not a place)
 WB_R_START, WB_R_MAX, WB_R_STEP = 0.035, 0.12, 0.005  # m; start where hc4 already is
 # Radius curriculum on the mean RELATIVE error err/R (envs with R > 0): grow below GROW, shrink above
@@ -298,6 +300,9 @@ def make_ys_head_circle_env_cfg(play: bool = False, tip_space: bool = False, tip
     cfg.rewards["upright"].params["std"] = 0.5  # was 0.22
     pose = cfg.rewards["pose"].params
     pose["std_standing"] = dict(pose["std_walking"])
+    # bc6: hip_roll kept 0.05 rad even in the walking stds; a 0.15 rad sideways lean scored e^-9 on it,
+    # and bc1-bc5 moved the trunk only 1-3 mm (head-only circles). Leaning needs hip_roll.
+    pose["std_standing"][".*hip_roll.*"] = 0.3
     cfg.rewards["feet_planted"] = RewardTermCfg(func=feet_planted, weight=-1.0, params={"sensor_name": "feet_ground_contact"})
   return cfg
 
