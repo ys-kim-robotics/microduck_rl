@@ -73,22 +73,26 @@ class PartnerAction(JointPositionAction):
     x[:, CMD] = obs["actor"][:, CMD]
     with torch.no_grad():
       a = self._actor(x) if self._live is None else self._live(TensorDict({"actor": x}, batch_size=[x.shape[0]]))
+      if self._live is not None and self.cfg.stochastic:  # explore like the learner (rope12+), same std
+        a = a + self._live.distribution.std_param.abs() * torch.randn_like(a)
     super().process_actions(a[:, aperm] * asign)
 
 
 @dataclass(kw_only=True)
 class PartnerActionCfg(JointPositionActionCfg):
   checkpoint: str = PARTNER_CKPT
+  stochastic: bool = False  # self-play: sample the partner's action with the learner's std
 
   def build(self, env):
     return PartnerAction(self, env)
 
 
-def make_ys_rope_duo_env_cfg(play: bool = False):
+def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: float = 1.0):
   """rope10+: resume from rope5, rope5's rewards (stay_put 2.0), real partner duck."""
   cfg = make_ys_rope_bob_env_cfg(play, stay=True)
   cfg.curriculum.pop("stay_put_ramp")
   cfg.rewards["stay_put"].weight = 2.0
+  cfg.rewards["trunk_bob"].weight = bob  # rope13: 2.0 to win back the vertical swing (apex 431 -> 372 mm in rope11)
   ents = cfg.scene.entities
   robot = ents["robot"]
   partner = replace(robot, init_state=replace(robot.init_state, pos=(PARTNER_X, 0.0, robot.init_state.pos[2]), rot=(0.0, 0.0, 0.0, 1.0)))
@@ -106,7 +110,7 @@ def make_ys_rope_duo_env_cfg(play: bool = False):
       cfg.events[f"{k}_partner"] = e2
 
   act = cfg.actions["joint_pos"]
-  cfg.actions["partner_joint_pos"] = PartnerActionCfg(**{k: getattr(act, k) for k in act.__dataclass_fields__ if k != "entity_name"}, entity_name="partner")
+  cfg.actions["partner_joint_pos"] = PartnerActionCfg(**{k: getattr(act, k) for k in act.__dataclass_fields__ if k != "entity_name"}, entity_name="partner", stochastic=stochastic)
   actor = cfg.observations["actor"]
   part = copy.deepcopy(actor)
   for t in part.terms.values():

@@ -34,7 +34,7 @@ from mjlab.managers import ObservationTermCfg, TerminationTermCfg  # noqa: E402
 from mjlab.managers.scene_entity_config import SceneEntityCfg  # noqa: E402
 from mjlab.rl import RslRlVecEnvWrapper  # noqa: E402
 from mjlab.tasks.registry import load_rl_cfg  # noqa: E402
-from ys_eval import make_env, make_policy  # noqa: E402
+from ys_eval import fix_command, make_env, make_policy  # noqa: E402
 import mjlab_microduck.tasks.ys_head_circle_env_cfg as hc  # noqa: E402
 from mjlab_microduck.tasks.symmetry import _get_tensors  # noqa: E402
 from mjlab_microduck.tasks.ys_rope import ROPE_LINKS, ROPE_RADIUS  # noqa: E402
@@ -67,7 +67,7 @@ def own_action(lo, hi):
   return lambda env: env.action_manager.action[:, lo:hi]
 
 
-def duo_cfg(n, connect=True):
+def duo_cfg(n, connect=True, fixed_cmd=False):
   cfg = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)
   cfg.scene.num_envs, cfg.seed = n, 0
   ents = cfg.scene.entities
@@ -79,6 +79,11 @@ def duo_cfg(n, connect=True):
   cfg.sim.nconmax = 96
   cfg.commands["head_pose"] = hc.HeadCircleCommandCfg(**{k: getattr(cfg.commands["head_pose"], k) for k in hc.HeadCircleCommandCfg.__dataclass_fields__})
   cfg.commands["head_pose"].freeze_radius = True
+  # TASK's cfg flips half the resampled commands (reverse_prob 0.5): the -2 reverse flag then reached the
+  # obs for a step at every resample/reset (normalizer blow-up, as rope6) and kicked the ducks over
+  cfg.commands["head_pose"].reverse_prob = 0.0
+  if fixed_cmd:
+    fix_command(cfg, (0.0, 0.0, 0.0))
   cfg.rewards, cfg.curriculum = {}, {}
   cfg.terminations = {"time_out": cfg.terminations["time_out"]}
   cfg.events.pop("reset_far_handle")
@@ -120,6 +125,7 @@ def main():
   p.add_argument("--seconds", type=float, default=19.0)
   p.add_argument("--window", type=float, default=6.0)
   p.add_argument("--partner", help="partner checkpoint (default: the same policy)")
+  p.add_argument("--fix-cmd", action="store_true", help="as the single-duck evals: neutral body pose, no command resampling")
   p.add_argument("--no-connect", action="store_true", help="rope not attached: isolates the scene/wiring from rope forces")
   p.add_argument("--video", help="render env 0 (2x2 views) to this mp4")
   a = p.parse_args()
@@ -128,7 +134,7 @@ def main():
   policy = make_policy(TASK, a.policy, venv1)
   ppolicy = make_policy(TASK, a.partner, venv1) if a.partner else policy
 
-  cfg = duo_cfg(a.n if not a.video else 1, connect=not a.no_connect)
+  cfg = duo_cfg(a.n if not a.video else 1, connect=not a.no_connect, fixed_cmd=a.fix_cmd)
   if a.video:
     cfg.viewer.height, cfg.viewer.width, cfg.viewer.distance = 360, 480, 1.7
     cfg.viewer.origin_type, cfg.viewer.lookat = cfg.viewer.OriginType.WORLD, ((PARTNER_X) / 2, 0.0, 0.15)
@@ -147,7 +153,7 @@ def main():
   t_fall = torch.full((n,), math.nan, device=env.device)
   t_duck = torch.full((n, 2), math.nan, device=env.device)  # first tilt per duck (robot, partner)
   t_blow = torch.full((n,), math.nan, device=env.device)  # rope link > 15 m/s or non-finite (rope_blew_up)
-  ang, low, apex, frames = [], [], [], []
+  ang, low, apex, frames, stems, trunk_z = [], [], [], [], [], []
   writer = None
   if a.video:
     writer = imageio.get_writer(a.video, fps=round(1 / dt), codec="libx264", quality=7, macro_block_size=8)
@@ -178,6 +184,8 @@ def main():
         z = rope.data.body_link_pos_w[..., 2]
         low.append(z.min(1).values - ROPE_RADIUS)
         apex.append(z.max(1).values)
+        stems.append(torch.stack([robot.data.site_pos_w[:, sid_r, 1:], partner.data.site_pos_w[:, sid_p, 1:]], 1))  # (n, 2, yz)
+        trunk_z.append(torch.stack([robot.data.root_link_pos_w[:, 2], partner.data.root_link_pos_w[:, 2]], 1))
       if writer:
         tiles = []
         for az, el in ((0, -15), (90, -15), (135, -25), (90, -89)):
@@ -204,6 +212,16 @@ def main():
   print("  first tilt t(s):", [round(x, 2) for x in t_fall[fb].tolist()], " first blow t(s):", [round(x, 2) for x in t_blow[bb].tolist()])
   print(f"freq {a.freq} Hz  radius {a.radius} m  envs {n}")
   print(f"  rope turn {turn[ok].mean():.2f}   apex {apex_w[:, ok].mean():.0f} mm   lowest {low_w[:, ok].mean():.1f} mm   fall% {100 * fell.any(1).float().mean():.1f}")
+  st = torch.stack(stems)  # (T, n, 2, 2)
+  size = 1000 * (st.quantile(0.95, dim=0) - st.quantile(0.05, dim=0))  # handle circle p5-p95 (mm), (n, 2, yz)
+  c = st - st.mean(0)
+  ph = torch.atan2(c[..., 1], c[..., 0])  # (T, n, 2)
+  dph = ph[..., 0] - ph[..., 1]
+  lock = torch.complex(dph.cos(), dph.sin()).mean(0).abs()  # 1 = constant phase offset
+  off = torch.rad2deg(torch.atan2(dph.sin().mean(0), dph.cos().mean(0)))
+  bob = 1000 * (torch.stack(trunk_z).quantile(0.95, dim=0) - torch.stack(trunk_z).quantile(0.05, dim=0))
+  print(f"  handle circle y/z mm  robot {size[ok, 0, 0].mean():.0f}/{size[ok, 0, 1].mean():.0f}  partner {size[ok, 1, 0].mean():.0f}/{size[ok, 1, 1].mean():.0f}"
+        f"   trunk bob mm {bob[ok, 0].mean():.1f}/{bob[ok, 1].mean():.1f}   phase lock {lock[ok].mean():.2f}  offset {off[ok].abs().mean():.0f} deg")
   for i, (name, d) in enumerate(zip(("robot", "partner"), ducks)):
     dxy = 1000 * (d.data.root_link_pos_w[:, :2] - p0[i]).norm(dim=-1)
     dyaw = torch.rad2deg((yaw(d.data.root_link_quat_w) - y0[i] + math.pi) % (2 * math.pi) - math.pi).abs()

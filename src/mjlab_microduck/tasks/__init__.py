@@ -420,3 +420,19 @@ register_mjlab_task(
     rl_cfg=YsRopeRlCfg,
     runner_cls=YsSelfPlayRunner,
 )
+
+register_mjlab_task(
+    task_id="Mjlab-YsRopeSelfNoisy-Flat-MicroDuck",
+    env_cfg=make_ys_rope_duo_env_cfg(stochastic=True),
+    play_env_cfg=make_ys_rope_duo_env_cfg(play=True, stochastic=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=YsSelfPlayRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-YsRopeSelfBob-Flat-MicroDuck",
+    env_cfg=make_ys_rope_duo_env_cfg(bob=2.0),
+    play_env_cfg=make_ys_rope_duo_env_cfg(play=True, bob=2.0),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=YsSelfPlayRunner,
+)
