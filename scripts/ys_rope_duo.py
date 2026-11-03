@@ -130,6 +130,7 @@ def main():
   p.add_argument("--fix-cmd", action="store_true", help="as the single-duck evals: neutral body pose, no command resampling")
   p.add_argument("--no-connect", action="store_true", help="rope not attached: isolates the scene/wiring from rope forces")
   p.add_argument("--video", help="render env 0 (2x2 views) to this mp4")
+  p.add_argument("--load", action="store_true", help="per-joint motor load table (BAM xl330 m6: kt, R)")
   a = p.parse_args()
 
   env1, venv1 = make_env(TASK, (0.0, 0.0, 0.0), 1)  # only to build the policy (28-D duo actions would not load)
@@ -155,7 +156,7 @@ def main():
   t_fall = torch.full((n,), math.nan, device=env.device)
   t_duck = torch.full((n, 2), math.nan, device=env.device)  # first tilt per duck (robot, partner)
   t_blow = torch.full((n,), math.nan, device=env.device)  # rope link > 15 m/s or non-finite (rope_blew_up)
-  ang, low, apex, frames, stems, trunk_z = [], [], [], [], [], []
+  ang, low, apex, frames, stems, trunk_z, taus, vels = [], [], [], [], [], [], [], []
   writer = None
   if a.video:
     writer = imageio.get_writer(a.video, fps=round(1 / dt), codec="libx264", quality=7, macro_block_size=8)
@@ -188,6 +189,8 @@ def main():
         apex.append(z.max(1).values)
         stems.append(torch.stack([robot.data.site_pos_w[:, sid_r, 1:], partner.data.site_pos_w[:, sid_p, 1:]], 1))  # (n, 2, yz)
         trunk_z.append(torch.stack([robot.data.root_link_pos_w[:, 2], partner.data.root_link_pos_w[:, 2]], 1))
+        taus.append(torch.stack([d.data.qfrc_actuator for d in ducks], 1))  # (n, 2, nj) motor torque
+        vels.append(torch.stack([d.data.joint_vel for d in ducks], 1))
       if writer:
         tiles = []
         for az, el in ((0, -15), (90, -15), (135, -25), (90, -89)):
@@ -229,6 +232,29 @@ def main():
     dyaw = torch.rad2deg((yaw(d.data.root_link_quat_w) - y0[i] + math.pi) % (2 * math.pi) - math.pi).abs()
     down = 100 * (d.data.projected_gravity_b[:, 2] > -0.5).float().mean()
     print(f"  {name:8s} dxy {dxy[ok].mean():5.1f} mm  dyaw {dyaw[ok].mean():5.1f} deg  tilted>60deg ever {100 * fell[:, i].float().mean():.0f}%  down at end {down:.0f}%")
+  if a.load:
+    print_load(torch.stack(taus)[:, ok], torch.stack(vels)[:, ok], robot.joint_names)
+
+
+KT, R_OHM, V_STALL = 0.366, 2.811, 7.4  # bam/params/xl330/m6.json; nominal vin (DR 6.5-8.2 V)
+
+
+def print_load(tau, vel, names):
+  """tau, vel (T, n_ok, 2 ducks, nj). Joule heat I^2 R with I = tau / kt (the thermal load on an xl330)."""
+  stall = V_STALL * KT / R_OHM  # ~0.96 Nm
+  rms = tau.pow(2).mean((0, 1)).sqrt()  # (2, nj)
+  peak = tau.abs().flatten(0, 1).quantile(0.99, dim=0)
+  wrms = vel.pow(2).mean((0, 1)).sqrt()
+  pmech = (tau * vel).clamp(min=0).mean((0, 1))
+  heat = (tau / KT).pow(2).mean((0, 1)) * R_OHM
+  print(f"  motor load (robot duck; partner = its mirror)   stall ~{stall:.2f} Nm @ {V_STALL} V")
+  print(f"  {'joint':18s} {'tau_rms':>8s} {'tau_p99':>8s} {'p99/stall':>9s} {'w_rms':>7s} {'P_mech+':>8s} {'I2R':>6s}")
+  for j, nm in enumerate(names):
+    if nm.startswith("passive_"):
+      continue
+    print(f"  {nm:18s} {rms[0, j]:8.3f} {peak[0, j]:8.3f} {100 * peak[0, j] / stall:8.0f}% {wrms[0, j]:7.2f} {pmech[0, j]:8.3f} {heat[0, j]:6.3f}")
+  for i, who in enumerate(("robot", "partner")):
+    print(f"  TOTAL {who:8s} I2R {heat[i].sum():.2f} W   P_mech+ {pmech[i].sum():.2f} W   sum tau_rms {rms[i].sum():.2f} Nm   max p99 {peak[i].max():.3f} Nm")
 
 
 if __name__ == "__main__":
