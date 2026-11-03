@@ -67,7 +67,9 @@ WB_R_START, WB_R_MAX, WB_R_STEP = 0.035, 0.12, 0.005  # m; start where hc4 alrea
 # bc2: that relative error sat at ~0.3 for EVERY radius = a constant ~17° phase lag, which the rope
 # does not care about (it only rotates the circle) -> bc3 scores radius + turning speed, phase-free,
 # and the curriculum reads that score: grow above GROW, shrink below SHRINK.
-WB_GROW_SCORE, WB_SHRINK_SCORE = 0.6, 0.35
+# bc4: 0.6 was calibrated unloaded at 2 Hz; with the tip load at 1-1.5 Hz the training score sat at
+# 0.54 (0.87 unloaded at R=35 mm) and r_max never left 3.5 cm -> 0.5 / 0.3.
+WB_GROW_SCORE, WB_SHRINK_SCORE = 0.5, 0.3
 WB_SPEED_STD = 0.3  # relative tangential-speed error
 WB_CHECK_STEPS = 500  # env steps between checks (~20 iterations)
 WB_STD, WB_FINE_STD = 0.03, 0.01  # m
