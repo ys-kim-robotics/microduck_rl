@@ -316,3 +316,13 @@ register_mjlab_task(
     rl_cfg=YsHeadCircleRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+from mjlab_microduck.tasks.ys_rope_env_cfg import YsRopeRlCfg, make_ys_rope_env_cfg  # noqa: E402
+
+register_mjlab_task(
+    task_id="Mjlab-YsRope-Flat-MicroDuck",
+    env_cfg=make_ys_rope_env_cfg(),
+    play_env_cfg=make_ys_rope_env_cfg(play=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
