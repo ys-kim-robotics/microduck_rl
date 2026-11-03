@@ -55,9 +55,12 @@ HEAD_PITCH, HEAD_YAW = 1, 2  # head_pose order: neck_pitch, head_pitch, head_yaw
 # standing (scratch tipfeet, 2026-11-03): (46.8, 0, 204.9) mm; feet 83 mm apart.
 TIP_CENTER_F = (0.047, 0.0, 0.205)
 WB_FREQ_HZ = 2.0  # 5a: lowest rate a ~0.2 m rope arc stays round at (Froude ω²R/g ≈ 3)
-WB_R_START, WB_R_MAX, WB_R_STEP = 0.035, 0.10, 0.01  # m; start where hc4 already is
-WB_ERR_FRAC = 0.3  # grow the radius when the mean tip error < this x the current max radius
-WB_CHECK_STEPS = 250  # env steps between checks (~10 iterations)
+WB_R_START, WB_R_MAX, WB_R_STEP = 0.035, 0.10, 0.005  # m; start where hc4 already is
+# Radius curriculum on the mean RELATIVE error err/R (envs with R > 0): grow below GROW, shrink above
+# SHRINK. bc1 compared the absolute error to 0.3·r_max, a bar that loosened as r_max grew: 3.5 -> 10 cm
+# in ~70 iterations, far past the skill, and the policy stopped moving (STAGES-ys.md 5b-1).
+WB_GROW_REL, WB_SHRINK_REL = 0.25, 0.5
+WB_CHECK_STEPS = 500  # env steps between checks (~20 iterations)
 WB_STD, WB_FINE_STD = 0.03, 0.01  # m
 
 TIP_FX_RANGE = (0.0, 1.0)  # N toward the partner (trunk +x)
@@ -100,6 +103,8 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
     self._err_sum, self._err_n, self._steps = 0.0, 0, 0
     self.metrics["r_max"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["tip_err_mm"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["err_rel"] = torch.zeros(self.num_envs, device=self.device)
+    self._mean_rel = 0.0
 
   def _resample_command(self, env_ids: torch.Tensor) -> None:
     n = len(env_ids)
@@ -123,14 +128,20 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
     err = tip_error_feet(self._robot, self._sid, self._feet, self.amp, self.phase)
     on = self.amp > 0
     self.metrics["tip_err_mm"] += torch.where(on, 1000 * err, 0.0) * self._env.step_dt / 20.0  # ~mean over a 20 s episode
-    self._err_sum += (err * on).sum().item() / max(on.sum().item(), 1)
+    rel = err / (TIP_M_PER_RAD * self.amp).clamp_min(1e-3)
+    self._err_sum += (rel * on).sum().item() / max(on.sum().item(), 1)
     self._err_n += 1
     self._steps += 1
     if self._steps % WB_CHECK_STEPS == 0:
-      if self._err_sum / self._err_n < WB_ERR_FRAC * self.r_max:
+      mean_rel = self._err_sum / self._err_n
+      if mean_rel < WB_GROW_REL:
         self.r_max = min(self.r_max + WB_R_STEP, WB_R_MAX)
+      elif mean_rel > WB_SHRINK_REL:
+        self.r_max = max(self.r_max - WB_R_STEP, WB_R_START)
+      self._mean_rel = mean_rel
       self._err_sum, self._err_n = 0.0, 0
     self.metrics["r_max"][:] = self.r_max
+    self.metrics["err_rel"][:] = self._mean_rel
 
   def _update_command(self) -> None:
     self.phase += 2 * math.pi * self.cfg.freq_hz * self._env.step_dt
