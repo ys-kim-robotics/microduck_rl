@@ -3,7 +3,8 @@
 Runs Mjlab-YsBodyCircle-Flat-MicroDuck (or any head-circle task) with the circle command's radius
 fixed per env (R list x reps), tip load off, and measures over the last WINDOW seconds:
   Ay / Az (mm)   first-harmonic tip amplitude, feet-frame lateral / vertical (target = R)
-  tipE (mm)      mean distance to the feet-frame target circle
+  tipE (mm)      mean distance to the feet-frame target circle (phase-locked)
+  score          phase-free circle score the 5b-3 reward pays (radius x turning speed), 0-1
   trunk (mm)     first-harmonic trunk lateral / vertical amplitude: how much the BODY moves
   off %          share of steps with a foot off the ground,  fall %
 
@@ -20,7 +21,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 from ys_eval import make_env, make_policy  # noqa: E402
 from ys_head_circle import harmonic  # noqa: E402
-from mjlab_microduck.tasks.ys_head_circle_env_cfg import TIP_M_PER_RAD, feet_frame, tip_error_feet  # noqa: E402
+from mjlab_microduck.tasks.ys_head_circle_env_cfg import TIP_M_PER_RAD, circle_score, feet_frame, tip_error_feet  # noqa: E402
 
 
 def run(task, path, radii, reps, warmup, window, freq=None):
@@ -37,7 +38,7 @@ def run(task, path, radii, reps, warmup, window, freq=None):
   feet = robot.find_sites(["left_foot", "right_foot"], preserve_order=True)[0]
   contact = env.scene["feet_ground_contact"]
   dt, f = env.step_dt, cmd.cfg.freq_hz
-  ts, tip, trunk, err, off = [], [], [], [], []
+  ts, tip, trunk, err, off, score = [], [], [], [], [], []
   fell = torch.zeros(n, dtype=torch.bool, device=env.device)
   obs = venv.get_observations()
   with torch.inference_mode():
@@ -54,6 +55,7 @@ def run(task, path, radii, reps, warmup, window, freq=None):
         tip.append((rt @ (robot.data.site_pos_w[:, sid] - o).unsqueeze(-1)).squeeze(-1))
         trunk.append((rt @ (robot.data.root_link_pos_w - o).unsqueeze(-1)).squeeze(-1))
         err.append(tip_error_feet(robot, sid, feet, cmd.amp, cmd.phase))
+        score.append(circle_score(robot, sid, feet, cmd.amp, f))
         off.append((contact.data.found == 0).any(1).float())
         ts.append(k * dt)
   env.close()
@@ -62,7 +64,8 @@ def run(task, path, radii, reps, warmup, window, freq=None):
   tip, trunk = torch.stack(tip).double(), torch.stack(trunk).double()
   amp = lambda x: 1000 * harmonic(x, t, fr).abs()  # noqa: E731
   m = {"Ay": amp(tip[..., 1]), "Az": amp(tip[..., 2]), "tipE": 1000 * torch.stack(err).double().mean(0),
-       "trY": amp(trunk[..., 1]), "trZ": amp(trunk[..., 2]), "off%": 100 * torch.stack(off).double().mean(0)}
+       "trY": amp(trunk[..., 1]), "trZ": amp(trunk[..., 2]), "off%": 100 * torch.stack(off).double().mean(0),
+       "score": torch.stack(score).double().mean(0)}
   rows = []
   for i, r in enumerate(radii):
     sl = slice(i * reps, (i + 1) * reps)
@@ -84,12 +87,12 @@ def main():
   p.add_argument("--warmup", type=float, default=2.0)
   p.add_argument("--window", type=float, default=8.0)
   a = p.parse_args()
-  keys = ["R", "Ay", "Az", "tipE", "trY", "trZ", "off%", "fall%"]
+  keys = ["R", "Ay", "Az", "tipE", "score", "trY", "trZ", "off%", "fall%"]
   out = [f"{'policy':34s} " + " ".join(f"{k:>6s}" for k in keys)]
   for path in a.policies:
     name = "/".join(Path(path).parts[-2:])[-34:]
     for r in run(a.task, path, a.radii, a.reps, a.warmup, a.window, a.freq):
-      out.append(f"{name:34s} " + " ".join(f"{r[k]:6.1f}" for k in keys))
+      out.append(f"{name:34s} " + " ".join(f"{r[k]:6.2f}" if k == "score" else f"{r[k]:6.1f}" for k in keys))
   print("\n" + "\n".join(out))
 
 

@@ -59,7 +59,11 @@ WB_R_START, WB_R_MAX, WB_R_STEP = 0.035, 0.10, 0.005  # m; start where hc4 alrea
 # Radius curriculum on the mean RELATIVE error err/R (envs with R > 0): grow below GROW, shrink above
 # SHRINK. bc1 compared the absolute error to 0.3·r_max, a bar that loosened as r_max grew: 3.5 -> 10 cm
 # in ~70 iterations, far past the skill, and the policy stopped moving (STAGES-ys.md 5b-1).
-WB_GROW_REL, WB_SHRINK_REL = 0.25, 0.5
+# bc2: that relative error sat at ~0.3 for EVERY radius = a constant ~17° phase lag, which the rope
+# does not care about (it only rotates the circle) -> bc3 scores radius + turning speed, phase-free,
+# and the curriculum reads that score: grow above GROW, shrink below SHRINK.
+WB_GROW_SCORE, WB_SHRINK_SCORE = 0.6, 0.35
+WB_SPEED_STD = 0.3  # relative tangential-speed error
 WB_CHECK_STEPS = 500  # env steps between checks (~20 iterations)
 WB_STD, WB_FINE_STD = 0.03, 0.01  # m
 
@@ -103,8 +107,8 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
     self._err_sum, self._err_n, self._steps = 0.0, 0, 0
     self.metrics["r_max"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["tip_err_mm"] = torch.zeros(self.num_envs, device=self.device)
-    self.metrics["err_rel"] = torch.zeros(self.num_envs, device=self.device)
-    self._mean_rel = 0.0
+    self.metrics["score"] = torch.zeros(self.num_envs, device=self.device)
+    self._mean_score = 0.0
 
   def _resample_command(self, env_ids: torch.Tensor) -> None:
     n = len(env_ids)
@@ -126,22 +130,22 @@ class HeadCircleCommand(microduck_mdp.UniformPoseCommand):
     if not self.cfg.whole_body:
       return
     err = tip_error_feet(self._robot, self._sid, self._feet, self.amp, self.phase)
+    score = circle_score(self._robot, self._sid, self._feet, self.amp, self.cfg.freq_hz)
     on = self.amp > 0
     self.metrics["tip_err_mm"] += torch.where(on, 1000 * err, 0.0) * self._env.step_dt / 20.0  # ~mean over a 20 s episode
-    rel = err / (TIP_M_PER_RAD * self.amp).clamp_min(1e-3)
-    self._err_sum += (rel * on).sum().item() / max(on.sum().item(), 1)
+    self._err_sum += (score * on).sum().item() / max(on.sum().item(), 1)
     self._err_n += 1
     self._steps += 1
     if self._steps % WB_CHECK_STEPS == 0:
-      mean_rel = self._err_sum / self._err_n
-      if mean_rel < WB_GROW_REL:
+      mean_score = self._err_sum / self._err_n
+      if mean_score > WB_GROW_SCORE:
         self.r_max = min(self.r_max + WB_R_STEP, WB_R_MAX)
-      elif mean_rel > WB_SHRINK_REL:
+      elif mean_score < WB_SHRINK_SCORE:
         self.r_max = max(self.r_max - WB_R_STEP, WB_R_START)
-      self._mean_rel = mean_rel
+      self._mean_score = mean_score
       self._err_sum, self._err_n = 0.0, 0
     self.metrics["r_max"][:] = self.r_max
-    self.metrics["err_rel"][:] = self._mean_rel
+    self.metrics["score"][:] = self._mean_score
 
   def _update_command(self) -> None:
     self.phase += 2 * math.pi * self.cfg.freq_hz * self._env.step_dt
@@ -201,10 +205,28 @@ def tip_error_feet(robot, sid, feet, amp, phase):
   return torch.sqrt(ey**2 + ez**2)
 
 
-def mouth_circle_feet(env: ManagerBasedRlEnv, command_name: str, std: float, fine_std: float) -> torch.Tensor:
+def circle_score(robot, sid, feet, amp, freq, std=WB_STD, fine_std=WB_FINE_STD, speed_std=WB_SPEED_STD):
+  """Phase-free circle score in [0, 1], feet frame y-z plane: radius right x turning at the commanded
+  rate in the commanded sense. radial error e = rho - R (wide + fine Gaussian), tangential speed
+  v_t vs omega*R (relative Gaussian). R = 0 (still bucket): reduces to staying at the centre."""
+  o, rot = feet_frame(robot, feet)
+  rt = rot.transpose(1, 2)
+  p = (rt @ (robot.data.site_pos_w[:, sid] - o).unsqueeze(-1)).squeeze(-1)
+  v = (rt @ robot.data.site_lin_vel_w[:, sid].unsqueeze(-1)).squeeze(-1)
+  y, z = p[:, 1] - TIP_CENTER_F[1], p[:, 2] - TIP_CENTER_F[2]
+  rho = torch.sqrt(y**2 + z**2).clamp_min(1e-4)
+  R = TIP_M_PER_RAD * amp
+  e2 = (rho - R) ** 2
+  radial = 0.5 * torch.exp(-e2 / std**2) + 0.5 * torch.exp(-e2 / fine_std**2)
+  vt = (y * v[:, 2] - z * v[:, 1]) / rho  # + = the command's sense (y = R sin, z = -R cos)
+  w_r = 2 * math.pi * freq * R
+  speed = torch.where(R > 0, torch.exp(-(((vt - w_r) / w_r.clamp_min(1e-4)) ** 2) / speed_std**2), 1.0)
+  return radial * speed
+
+
+def mouth_circle_feet(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
   cmd = env.command_manager.get_term(command_name)
-  err2 = tip_error_feet(cmd._robot, cmd._sid, cmd._feet, cmd.amp, cmd.phase) ** 2
-  return 0.5 * torch.exp(-err2 / std**2) + 0.5 * torch.exp(-err2 / fine_std**2)
+  return circle_score(cmd._robot, cmd._sid, cmd._feet, cmd.amp, cmd.cfg.freq_hz)
 
 
 def feet_planted(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
@@ -248,7 +270,7 @@ def make_ys_head_circle_env_cfg(play: bool = False, tip_space: bool = False, tip
   if whole_body:
     cfg.rewards.pop("mouth_circle")
     cfg.rewards["mouth_circle_feet"] = RewardTermCfg(
-      func=mouth_circle_feet, weight=2.0, params={"command_name": "head_pose", "std": WB_STD, "fine_std": WB_FINE_STD}
+      func=mouth_circle_feet, weight=2.0, params={"command_name": "head_pose"}
     )
     # motion-blockers for a trunk that must swing ~5 cm at 2 Hz (peak ~0.6 m/s, ~0.3 rad lean)
     cfg.rewards["track_linear_velocity"].params["std"] = 1.0  # was 0.32: 0.5 m/s -> 0.08, now 0.78
