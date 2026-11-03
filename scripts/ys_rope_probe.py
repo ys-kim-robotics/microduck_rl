@@ -3,7 +3,8 @@
 Wall anchor at (0, 0, H); the rope's far end is CONNECTed (free swivel) to a mocap handle that
 circles in the y-z plane around (SPAN, 0, H) at radius r, frequency f, from a hanging start.
 Measured on the rope's middle link over the last WINDOW seconds:
-  rev      mid revolutions per handle revolution (1 = the rope turns with the handle)
+  rev      mid revolutions per handle revolution (1 = the rope turns with the handle), mean of trials
+  ok%      share of trials with rev > 0.8;  blow = trials dropped for solver blow-up (Fmax > 20 N)
   zlo/zhi  lowest / highest mid height (mm): a jumper needs zlo ≈ 0 and zhi above its head
   F        handle force (N): mean, 95th percentile, max of the connect constraint
 CPU MuJoCo, same timestep/integrator as training (5 ms, implicitfast).
@@ -24,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from mjlab_microduck.tasks.ys_rope import ROPE_LINKS, ROPE_MASS, add_rope  # noqa: E402
 
 H, SPAN = 0.2, 0.7  # m: anchor/handle-centre height (≈ duck mouth), anchor-to-handle distance
-SETTLE, RUN, WINDOW = 1.0, 12.0, 4.0  # s
+SETTLE, RUN, WINDOW = 1.0, 16.0, 8.0  # s
 KICK_S = 5.0  # s
 
 
@@ -46,7 +47,7 @@ def build(length, mass=ROPE_MASS):
   return spec.compile()
 
 
-def run(length, r, f, video=None, kick=None, mass=ROPE_MASS):
+def run(length, r, f, video=None, kick=None, mass=ROPE_MASS, zscale=1.0, phase0=0.0):
   """kick: radius held for the first KICK_S seconds (spin-up), then r -> does r SUSTAIN the turn?"""
   m = build(length, mass)
   d = mujoco.MjData(m)
@@ -64,10 +65,10 @@ def run(length, r, f, video=None, kick=None, mass=ROPE_MASS):
   steps = int((SETTLE + RUN) / m.opt.timestep)
   for k in range(steps):
     t = k * m.opt.timestep - SETTLE
-    w = 2 * np.pi * f * max(t, 0.0)
+    w = 2 * np.pi * f * max(t, 0.0) + phase0
     r_now = kick if kick and t < KICK_S else r
     rr = r_now * np.clip(t, 0.0, 1.0)  # 1 s radius ramp: no position jump at t=0
-    d.mocap_pos[0] = (SPAN, rr * np.sin(w), H - rr * np.cos(w))
+    d.mocap_pos[0] = (SPAN, rr * np.sin(w), H - zscale * rr * np.cos(w))
     mujoco.mj_step(m, d)
     if t > RUN - WINDOW:
       p = d.xpos[mid]
@@ -96,13 +97,21 @@ def main():
   p.add_argument("--freqs", type=float, nargs="+", default=[1.0, 1.25, 1.5])
   p.add_argument("--lengths", type=float, nargs="+", default=[0.85])
   p.add_argument("--masses", type=float, nargs="+", default=[ROPE_MASS])
+  p.add_argument("--zscale", type=float, default=1.0, help="vertical radius = this x r (ellipse)")
+  p.add_argument("--trials", type=int, default=6, help="start phases per combo (rope motion is chaotic)")
   p.add_argument("--video")
   p.add_argument("--kick", type=float, help="spin up at this radius for KICK_S s, then drop to --radii")
   a = p.parse_args()
-  print(f"{'M':>5s} {'L':>5s} {'r':>5s} {'f':>5s} {'rev':>5s} {'zlo':>5s} {'zhi':>5s} {'F':>5s} {'F95':>5s} {'Fmax':>5s}")
+  print(f"{'M':>5s} {'L':>5s} {'r':>5s} {'f':>5s} {'rev':>5s} {'ok%':>4s} {'zlo':>5s} {'zhi':>5s} {'F':>5s} {'F95':>5s} {'Fmax':>5s} {'blow':>4s}")
   for M, L, r, f in itertools.product(a.masses, a.lengths, a.radii, a.freqs):
-    o = run(L, r, f, a.video, a.kick, M)
-    print(f"{M:5.3f} {L:5.2f} {r:5.3f} {f:5.2f} {o['rev']:5.2f} {o['zlo']:5.0f} {o['zhi']:5.0f} {o['F']:5.2f} {o['F95']:5.2f} {o['Fmax']:5.2f}", flush=True)
+    os = [run(L, r, f, a.video if i == 0 else None, a.kick, M, a.zscale, 2 * np.pi * i / a.trials) for i in range(a.trials)]
+    good = [o for o in os if o["Fmax"] < 20]  # blown-up runs (solver divergence) excluded
+    if not good:
+      print(f"{M:5.3f} {L:5.2f} {r:5.3f} {f:5.2f}  all {len(os)} trials blew up", flush=True)
+      continue
+    m = {k: np.mean([o[k] for o in good]) for k in good[0]}
+    ok = 100 * np.mean([o["rev"] > 0.8 for o in good])
+    print(f"{M:5.3f} {L:5.2f} {r:5.3f} {f:5.2f} {m['rev']:5.2f} {ok:4.0f} {m['zlo']:5.0f} {m['zhi']:5.0f} {m['F']:5.2f} {m['F95']:5.2f} {m['Fmax']:5.2f} {len(os) - len(good):4d}", flush=True)
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ def main():
   p.add_argument("--head-circle", type=float, nargs="+", metavar="A F [BOOST LEAD_DEG]",
                  help="drive head_yaw/pitch on a circle (needs --cmd)")
   p.add_argument("--tip-force", type=float, nargs=3, metavar=("FX", "FR", "FZ"), help="rope-tension stand-in at mouth_tip (N)")
+  p.add_argument("--body-circle", type=float, metavar="R", help="5b task: hold the feet-frame circle radius R (m), no load")
   p.add_argument("--views", nargs="+", help="subset of view labels (1, 2 or 4)")
   a = p.parse_args()
   views = [v for v in VIEWS if not a.views or v[0] in a.views]
@@ -64,6 +65,10 @@ def main():
   out = Path(a.out or Path(a.checkpoint).with_name(f"{Path(a.checkpoint).stem}_multiview.mp4"))
   writer = imageio.get_writer(out, fps=fps, codec="libx264", quality=7, macro_block_size=8)
 
+  if a.body_circle is not None:
+    from mjlab_microduck.tasks.ys_head_circle_env_cfg import TIP_M_PER_RAD
+    hc = env.command_manager.get_term("head_pose")
+    hc.cfg.whole_body = False  # freeze the radius curriculum
   obs = venv.get_observations()
   with torch.inference_mode():
     for k in range(int(a.seconds * fps)):
@@ -71,6 +76,10 @@ def main():
       if a.head_circle:
         A, F, boost, lead = (list(a.head_circle) + [1.0, 0.0])[:4]
         set_head_circle(env, (k + 1) * env.step_dt, A * boost, F, math.radians(lead))
+      if a.body_circle is not None:
+        hc.amp[:] = a.body_circle / TIP_M_PER_RAD
+        hc.tip_force.zero_()
+        hc._write()
       if a.tip_force:
         rb = env.scene["robot"]
         apply_tip_force(rb, rb.find_bodies("jaw_soft")[0][0], rb.find_sites("mouth_tip")[0][0], *a.tip_force)
