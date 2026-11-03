@@ -20,9 +20,8 @@ from mjlab.managers import SceneEntityCfg
 
 from mjlab_microduck.tasks import MicroduckOnPolicyRunner  # defined before this module is imported
 from mjlab_microduck.tasks.symmetry import _get_tensors
-from mjlab_microduck.tasks.ys_rope_env_cfg import FAR_NOM, STEM_END_NOM, make_ys_rope_bob_env_cfg
+from mjlab_microduck.tasks.ys_rope_env_cfg import SPAN, STEM_END_NOM, make_ys_rope_bob_env_cfg, set_span
 
-PARTNER_X = FAR_NOM[0] + STEM_END_NOM[0]  # partner root: its stem end lands on the far handle spot
 PARTNER_CKPT = "logs/rsl_rl/ys_rope/2026-11-03_17-36-17_rope5_stay/model_18794.pt"
 CMD = slice(51, 55)  # head-circle command slots: the partner gets the robot's (forward) command
 
@@ -87,7 +86,7 @@ class PartnerActionCfg(JointPositionActionCfg):
     return PartnerAction(self, env)
 
 
-def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: float = 1.0):
+def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: float = 1.0, span: float = SPAN):
   """rope10+: resume from rope5, rope5's rewards (stay_put 2.0), real partner duck."""
   cfg = make_ys_rope_bob_env_cfg(play, stay=True)
   cfg.curriculum.pop("stay_put_ramp")
@@ -95,10 +94,12 @@ def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: 
   cfg.rewards["trunk_bob"].weight = bob  # rope13: 2.0 to win back the vertical swing (apex 431 -> 372 mm in rope11)
   ents = cfg.scene.entities
   robot = ents["robot"]
-  partner = replace(robot, init_state=replace(robot.init_state, pos=(PARTNER_X, 0.0, robot.init_state.pos[2]), rot=(0.0, 0.0, 0.0, 1.0)))
+  partner_x = 2 * STEM_END_NOM[0] + span  # partner root: its stem end lands on the far handle spot
+  partner = replace(robot, init_state=replace(robot.init_state, pos=(partner_x, 0.0, robot.init_state.pos[2]), rot=(0.0, 0.0, 0.0, 1.0)))
   # partner before rope: mjlab 1.3.0 slices default_joint_pos from the scene keyframe in entity order
   cfg.scene.entities = {"robot": robot, "partner": partner, "rope": ents["rope"], "far_handle": ents["far_handle"]}
   cfg.scene.spec_fn = connect_duo
+  set_span(cfg, span)  # rope14+: shorter span, same rope
   cfg.sim.nconmax = 96
 
   for k, e in list(cfg.events.items()):  # partner copies of every robot event (reset pose, joints, DR)

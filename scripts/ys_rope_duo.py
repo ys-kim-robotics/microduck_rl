@@ -38,10 +38,9 @@ from ys_eval import fix_command, make_env, make_policy  # noqa: E402
 import mjlab_microduck.tasks.ys_head_circle_env_cfg as hc  # noqa: E402
 from mjlab_microduck.tasks.symmetry import _get_tensors  # noqa: E402
 from mjlab_microduck.tasks.ys_rope import ROPE_LINKS, ROPE_RADIUS  # noqa: E402
-from mjlab_microduck.tasks.ys_rope_env_cfg import FAR_NOM, STEM_END_NOM, make_ys_rope_bob_env_cfg  # noqa: E402
+from mjlab_microduck.tasks.ys_rope_env_cfg import SPAN, STEM_END_NOM, make_ys_rope_bob_env_cfg, set_span  # noqa: E402
 
 TASK = "Mjlab-YsRopeBoth-Flat-MicroDuck"
-PARTNER_X = FAR_NOM[0] + STEM_END_NOM[0]  # partner root: its stem end lands on the far handle spot
 
 
 def connect_duo(spec):
@@ -67,14 +66,16 @@ def own_action(lo, hi):
   return lambda env: env.action_manager.action[:, lo:hi]
 
 
-def duo_cfg(n, connect=True, fixed_cmd=False):
+def duo_cfg(n, connect=True, fixed_cmd=False, span=SPAN):
   cfg = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)
   cfg.scene.num_envs, cfg.seed = n, 0
   ents = cfg.scene.entities
   robot = ents["robot"]
-  partner = replace(robot, init_state=replace(robot.init_state, pos=(PARTNER_X, 0.0, robot.init_state.pos[2]), rot=(0.0, 0.0, 0.0, 1.0)))
+  partner_x = 2 * STEM_END_NOM[0] + span  # partner root: its stem end lands on the far handle spot
+  partner = replace(robot, init_state=replace(robot.init_state, pos=(partner_x, 0.0, robot.init_state.pos[2]), rot=(0.0, 0.0, 0.0, 1.0)))
   cfg.scene.entities = {"robot": robot, "partner": partner, "rope": ents["rope"]}  # partner before rope (default_joint_pos slicing)
   cfg.scene.spec_fn = connect_duo if connect else None
+  set_span(cfg, span)
   cfg.scene.sim_nconmax = None if not hasattr(cfg.scene, "sim_nconmax") else cfg.scene.sim_nconmax
   cfg.sim.nconmax = 96
   cfg.commands["head_pose"] = hc.HeadCircleCommandCfg(**{k: getattr(cfg.commands["head_pose"], k) for k in hc.HeadCircleCommandCfg.__dataclass_fields__})
@@ -125,6 +126,7 @@ def main():
   p.add_argument("--seconds", type=float, default=19.0)
   p.add_argument("--window", type=float, default=6.0)
   p.add_argument("--partner", help="partner checkpoint (default: the same policy)")
+  p.add_argument("--span", type=float, default=SPAN, help="handle centres apart (m); rope length unchanged")
   p.add_argument("--fix-cmd", action="store_true", help="as the single-duck evals: neutral body pose, no command resampling")
   p.add_argument("--no-connect", action="store_true", help="rope not attached: isolates the scene/wiring from rope forces")
   p.add_argument("--video", help="render env 0 (2x2 views) to this mp4")
@@ -134,10 +136,10 @@ def main():
   policy = make_policy(TASK, a.policy, venv1)
   ppolicy = make_policy(TASK, a.partner, venv1) if a.partner else policy
 
-  cfg = duo_cfg(a.n if not a.video else 1, connect=not a.no_connect, fixed_cmd=a.fix_cmd)
+  cfg = duo_cfg(a.n if not a.video else 1, connect=not a.no_connect, fixed_cmd=a.fix_cmd, span=a.span)
   if a.video:
     cfg.viewer.height, cfg.viewer.width, cfg.viewer.distance = 360, 480, 1.7
-    cfg.viewer.origin_type, cfg.viewer.lookat = cfg.viewer.OriginType.WORLD, ((PARTNER_X) / 2, 0.0, 0.15)
+    cfg.viewer.origin_type, cfg.viewer.lookat = cfg.viewer.OriginType.WORLD, ((2 * STEM_END_NOM[0] + a.span) / 2, 0.0, 0.15)
     cfg.viewer.max_extra_envs = 0
   env = ManagerBasedRlEnv(cfg=cfg, device="cuda:0", render_mode="rgb_array" if a.video else None)
   venv = RslRlVecEnvWrapper(env, clip_actions=load_rl_cfg(TASK).clip_actions)

@@ -51,10 +51,10 @@ def add_t_handle(spec: mujoco.MjSpec) -> mujoco.MjSpec:
   return spec
 
 
-def rope_spec() -> mujoco.MjSpec:
+def rope_spec(span: float = SPAN) -> mujoco.MjSpec:
   """Rope entity: free root at the far end (entity origin), chain toward -x to the duck's stem end."""
   spec = mujoco.MjSpec()
-  add_rope(spec, (0, 0, 0), (-SPAN, 0, 0), length=ROPE_LEN, free=True)
+  add_rope(spec, (0, 0, 0), (-span, 0, 0), length=ROPE_LEN, free=True)
   m = spec.compile()
   spec.add_key(name="init", qpos=m.qpos0.tolist())  # the sagging V; entity joint_pos=None reads it
   return spec
@@ -101,24 +101,35 @@ def connect_rope(spec: mujoco.MjSpec) -> None:
     eq.solref = [0.05, 1.0]
 
 
-def reset_rope_joints(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None) -> None:
+def reset_rope_joints(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None, span: float = SPAN) -> None:
   """Back to the sagging V. Not rope.data.default_joint_pos: with several entities mjlab 1.3.0 slices
   that from the SCENE keyframe (65 values here vs the rope's 44), so the rope's own qpos0 is used."""
   rope = env.scene["rope"]
   ids = slice(None) if env_ids is None else env_ids
   n = rope.data.joint_pos[ids].shape[0]
-  q0 = torch.tensor(_rope_q0(), device=env.device).expand(n, -1)
+  q0 = torch.tensor(_rope_q0(span), device=env.device).expand(n, -1)
   rope.write_joint_state_to_sim(q0, torch.zeros_like(rope.data.joint_vel[ids]), env_ids=env_ids)
 
 
-_Q0 = None
+_Q0 = {}
 
 
-def _rope_q0():
-  global _Q0
-  if _Q0 is None:
-    _Q0 = rope_spec().compile().qpos0[7:].tolist()  # after the free root
-  return _Q0
+def _rope_q0(span: float = SPAN):
+  if span not in _Q0:
+    _Q0[span] = rope_spec(span).compile().qpos0[7:].tolist()  # after the free root
+  return _Q0[span]
+
+
+def set_span(cfg, span: float) -> None:
+  """rope14+: handle centres `span` apart (rope length unchanged): rope layout, its reset, the far handle."""
+  far = (STEM_END_NOM[0] + span, 0.0, STEM_END_NOM[2])
+  ents = cfg.scene.entities
+  ents["rope"] = replace(ents["rope"], spec_fn=lambda: rope_spec(span), init_state=replace(ents["rope"].init_state, pos=far))
+  if "far_handle" in ents:
+    ents["far_handle"] = replace(ents["far_handle"], init_state=replace(ents["far_handle"].init_state, pos=far))
+  cfg.events["reset_rope_joints"].params = {"span": span}
+  if hasattr(cfg.commands["head_pose"], "span"):
+    cfg.commands["head_pose"].span = span
 
 
 class RopeCircleCommand(hc.HeadCircleCommand):
@@ -129,7 +140,7 @@ class RopeCircleCommand(hc.HeadCircleCommand):
     self._sid = self._robot.find_sites("stem_end")[0][0]  # circle score / centre now at the stem end
     self._far = env.scene["far_handle"]
     self._stem_c = torch.zeros(self.num_envs, 3, device=self.device)
-    self._far_c = torch.tensor(FAR_NOM, device=self.device) + env.scene.env_origins
+    self._far_c = torch.tensor((STEM_END_NOM[0] + cfg.span, 0.0, STEM_END_NOM[2]), device=self.device) + env.scene.env_origins
     self._fresh = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
     # imperfect partner (rope7+): per-env lag (steps), circle scale, and a wandering centre offset
     L = cfg.partner_lag_steps + 1
@@ -178,6 +189,7 @@ class RopeCircleCommand(hc.HeadCircleCommand):
 
 @dataclass(kw_only=True)
 class RopeCircleCommandCfg(hc.HeadCircleCommandCfg):
+  span: float = SPAN  # far handle centre = stem end nominal + span along x
   partner_lag_steps: int = 0  # far handle copies the stem offset this many 20 ms steps late (U[0, max] per env)
   partner_scale: tuple[float, float] = (1.0, 1.0)  # far circle = this x the duck's (U per env)
   partner_wander: float = 0.0  # std (m) of the far circle centre's slow drift
