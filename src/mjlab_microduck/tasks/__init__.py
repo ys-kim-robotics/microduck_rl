@@ -453,6 +453,14 @@ register_mjlab_task(
     runner_cls=YsSelfPlayRunner,
 )
 
+register_mjlab_task(  # 7.2 rope16: rope14 + handle-circle centre 5 cm lower (214 -> 164 mm)
+    task_id="Mjlab-YsRope16-Flat-MicroDuck",
+    env_cfg=make_ys_rope_duo_env_cfg(span=0.60, axis_z=0.164),
+    play_env_cfg=make_ys_rope_duo_env_cfg(play=True, span=0.60, axis_z=0.164),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=YsSelfPlayRunner,
+)
+
 from .ys_jump_env_cfg import YsJumpRlCfg, make_ys_jump_env_cfg
 
 register_mjlab_task(
@@ -460,5 +468,15 @@ register_mjlab_task(
     env_cfg=make_ys_jump_env_cfg(),
     play_env_cfg=make_ys_jump_env_cfg(play=True),
     rl_cfg=YsJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+from .ys_jump_env_cfg import YsSideJumpRlCfg, make_ys_side_jump_env_cfg
+
+register_mjlab_task(
+    task_id="Mjlab-YsSideJump-Flat-MicroDuck",
+    env_cfg=make_ys_side_jump_env_cfg(),
+    play_env_cfg=make_ys_side_jump_env_cfg(play=True),
+    rl_cfg=YsSideJumpRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )

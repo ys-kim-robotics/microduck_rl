@@ -16,7 +16,7 @@ import mujoco
 import torch
 from tensordict import TensorDict
 from mjlab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
-from mjlab.managers import SceneEntityCfg
+from mjlab.managers import RewardTermCfg, SceneEntityCfg
 
 from mjlab_microduck.tasks import MicroduckOnPolicyRunner  # defined before this module is imported
 from mjlab_microduck.tasks.symmetry import _get_tensors
@@ -86,7 +86,15 @@ class PartnerActionCfg(JointPositionActionCfg):
     return PartnerAction(self, env)
 
 
-def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: float = 1.0, span: float = SPAN):
+def axis_low(env, z_target: float, std: float = 0.04):  # 0.02 paid 0.003 at the 5 cm start: no gradient
+  """rope16 (7.2): 1 while the handle-circle centre (feet-frame z of the mouth tip's running mean) is at
+  or below z_target, Gaussian above it. rope14 turns about 214 mm (stem ends 232 mm): the loop's
+  bottom is a sharp V; a lower axis lays more rope on the floor -> a blunt, slower bottom (user)."""
+  z = env.command_manager.get_term("head_pose").center[:, 1]
+  return torch.exp(-((z - z_target).clamp(min=0) / std).square())
+
+
+def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: float = 1.0, span: float = SPAN, axis_z: float | None = None):
   """rope10+: resume from rope5, rope5's rewards (stay_put 2.0), real partner duck."""
   cfg = make_ys_rope_bob_env_cfg(play, stay=True)
   cfg.curriculum.pop("stay_put_ramp")
@@ -122,6 +130,8 @@ def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: 
   part.terms["actions"].params = {**(part.terms["actions"].params or {}), "action_name": "partner_joint_pos"}
   cfg.observations["partner"] = part
 
+  if axis_z is not None:
+    cfg.rewards["axis_low"] = RewardTermCfg(func=axis_low, weight=2.0, params={"z_target": axis_z})
   # partner down: end the episode as a timeout (bootstrapped, no fall penalty for the robot)
   fell = copy.deepcopy(cfg.terminations["fell_over"])
   fell.params = {**fell.params, "asset_cfg": SceneEntityCfg("partner")}

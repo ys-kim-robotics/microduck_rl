@@ -225,6 +225,7 @@ def main():
   lock = torch.complex(dph.cos(), dph.sin()).mean(0).abs()  # 1 = constant phase offset
   off = torch.rad2deg(torch.atan2(dph.sin().mean(0), dph.cos().mean(0)))
   bob = 1000 * (torch.stack(trunk_z).quantile(0.95, dim=0) - torch.stack(trunk_z).quantile(0.05, dim=0))
+  print(f"  handle centre z mm (rope axis height)  robot {1000 * st[..., 0, 1].mean(0)[ok].mean():.0f}  partner {1000 * st[..., 1, 1].mean(0)[ok].mean():.0f}   cmd.center (feet frame y/z) {(1000 * cmd.center[ok].mean(0)).round().tolist()}")
   print(f"  handle circle y/z mm  robot {size[ok, 0, 0].mean():.0f}/{size[ok, 0, 1].mean():.0f}  partner {size[ok, 1, 0].mean():.0f}/{size[ok, 1, 1].mean():.0f}"
         f"   trunk bob mm {bob[ok, 0].mean():.1f}/{bob[ok, 1].mean():.1f}   phase lock {lock[ok].mean():.2f}  offset {off[ok].abs().mean():.0f} deg")
   for i, (name, d) in enumerate(zip(("robot", "partner"), ducks)):

@@ -41,17 +41,22 @@ _SOLE_LO, _SOLE_HI = (-0.00636, -0.02175, -0.02689), (0.00679, 0.02175, 0.02723)
 _CORNERS = torch.tensor([[x, y, z] for x in (_SOLE_LO[0], _SOLE_HI[0]) for y in (_SOLE_LO[1], _SOLE_HI[1]) for z in (_SOLE_LO[2], _SOLE_HI[2])])
 
 
-def jump_clearance(robot, feet) -> torch.Tensor:
-  """lowest corner of BOTH foot collision boxes above the ground (m): >0 only when every part of both
-  soles is up, toes included. jump2-5 used the foot SITE: the user saw toes still on the ground at
-  "31 mm" (a tilted foot lifts its site while the tip stays down). feet = (left, right) geom ids."""
+def foot_clearance(robot, feet) -> torch.Tensor:
+  """(N, 2) lowest corner of each foot collision box above the ground (m); see jump_clearance."""
   q = robot.data.geom_quat_w[:, feet]  # (N, 2, 4) wxyz
   c = _CORNERS.to(q.device)  # (8, 3)
   w, v = q[..., :1, None], q[..., None, 1:]  # rotate the corners: c + 2w(v x c) + 2 v x (v x c)
   cc = c.expand(*q.shape[:2], 8, 3)
   t = 2 * torch.cross(v.expand_as(cc), cc, dim=-1)
   z = (cc + w * t + torch.cross(v.expand_as(cc), t, dim=-1))[..., 2] + robot.data.geom_pos_w[:, feet, 2, None]
-  return z.amin((1, 2)) - FOOT_Z0
+  return z.amin(-1) - FOOT_Z0
+
+
+def jump_clearance(robot, feet) -> torch.Tensor:
+  """lowest corner of BOTH foot collision boxes above the ground (m): >0 only when every part of both
+  soles is up, toes included. jump2-5 used the foot SITE: the user saw toes still on the ground at
+  "31 mm" (a tilted foot lifts its site while the tip stays down). feet = (left, right) geom ids."""
+  return foot_clearance(robot, feet).amin(-1)
 
 
 class JumpClockCommand(hc.HeadCircleCommand):
@@ -62,7 +67,7 @@ class JumpClockCommand(hc.HeadCircleCommand):
   def __init__(self, cfg, env):
     super().__init__(cfg, env)
     self.h = cfg.h_start
-    self._peak = torch.zeros(self.num_envs, device=self.device)  # per-hop max clearance in the window
+    self._peak = torch.zeros(self.num_envs, 2, device=self.device)  # per-hop max clearance in the window
     self._peaks, self._steps_h = [], 0
     self.metrics["h_target_cm"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["peak_clear_cm"] = torch.zeros(self.num_envs, device=self.device)
@@ -92,13 +97,14 @@ class JumpClockCommand(hc.HeadCircleCommand):
     v[:, 2] = (-CENTER_GAIN * yaw).clamp(-0.5, 0.5)
 
   def _update_metrics(self) -> None:
-    c = jump_clearance(self._robot, self._sole)
-    d = self.window()
-    inw = (d.abs() < JUMP_HALF_W) & (self.amp > 0)
+    # per-foot peak in its own window (side jump: offset feet); a hop scores the lower foot's peak
+    c = foot_clearance(self._robot, self._sole)
+    inw = (foot_window(self).abs() < JUMP_HALF_W) & (self.amp > 0)[:, None]
     self._peak = torch.where(inw, torch.maximum(self._peak, c), self._peak)
-    done = (self.amp > 0) & (d > JUMP_HALF_W) & (d - 2 * math.pi * self.freq * self._env.step_dt <= JUMP_HALF_W)
-    if done.any():  # the window just closed: one hop scored
-      self._peaks.append(self._peak[done].mean().item())
+    d, span = self.window(), JUMP_HALF_W + max(abs(o) for o in self.cfg.foot_offset)
+    done = (self.amp > 0) & (d > span) & (d - 2 * math.pi * self.freq * self._env.step_dt <= span)
+    if done.any():  # the last window just closed: one hop scored
+      self._peaks.append(self._peak[done].amin(-1).mean().item())
       self._peak[done] = 0.0
     self._steps_h += 1
     if self._steps_h % H_CHECK_STEPS == 0 and self._peaks:
@@ -114,6 +120,8 @@ class JumpClockCommand(hc.HeadCircleCommand):
 @dataclass(kw_only=True)
 class JumpClockCommandCfg(hc.HeadCircleCommandCfg):
   h_start: float = H_START
+  foot_offset: tuple[float, float] = (0.0, 0.0)  # rad: each foot's air-phase centre minus JUMP_PHASE (L, R)
+  air_half_w: float = math.pi * 0.18  # rad: half-width of each foot's air phase
 
   def build(self, env):
     return JumpClockCommand(self, env)
@@ -177,11 +185,17 @@ def rope_hit(env: ManagerBasedRlEnv) -> torch.Tensor:
 AIR_HALF_W = math.pi * 0.18  # rad: air phase = 18% of the cycle (144 ms; a 25-30 mm hop flies ~140 ms)
 
 
+def foot_window(cmd) -> torch.Tensor:
+  """(N, 2) signed phase distance of each foot to its own air-phase centre (side jump: offset feet)."""
+  off = torch.tensor(cmd.cfg.foot_offset, device=cmd.device)
+  return torch.remainder(cmd.window()[:, None] - off + math.pi, 2 * math.pi) - math.pi
+
+
 def _air_phase(env):
   cmd = env.command_manager.get_term("head_pose")
-  c = ((cmd.window().abs() < AIR_HALF_W) & (cmd.amp > 0)).float()
+  c = ((foot_window(cmd).abs() < cmd.cfg.air_half_w) & (cmd.amp > 0)[:, None]).float()
   s = env.scene["feet_ground_contact"].data
-  return c, (s.found == 0).float(), s.force.norm(dim=-1)  # (N,), (N, 2) per-foot airborne, (N, 2) N
+  return c, (s.found == 0).float(), s.force.norm(dim=-1)  # (N, 2) per-foot air phase, airborne, force N
 
 
 def contact_clock(env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -189,20 +203,41 @@ def contact_clock(env: ManagerBasedRlEnv) -> torch.Tensor:
   clock, -1 if not, scaled 0.8 in the air phase and 0.2 on the ground. Standing nets ~0, a hop +.
   jump2-9 all paid standing (Gaussian 92%, tiptoe trunk z); here a foot down in the air phase costs."""
   c, air, _ = _air_phase(env)
-  match = (air == c[:, None]).float()
-  return ((2 * match - 1) * (0.8 * c + 0.2 * (1 - c))[:, None]).mean(-1)
+  match = (air == c).float()
+  return ((2 * match - 1) * (0.8 * c + 0.2 * (1 - c))).mean(-1)
 
 
 def both_air(env: ManagerBasedRlEnv) -> torch.Tensor:
   """both feet off in the air phase: pays the hop, not a one-foot step."""
   c, air, _ = _air_phase(env)
-  return c * air.prod(-1)
+  return (c * air).prod(-1)
 
 
 def air_force(env: ManagerBasedRlEnv, sigma: float = 13.0) -> torch.Tensor:
   """Siekmann/WTW swing force term (>0, weight < 0): foot force in the air phase, saturating at ~mg/2."""
   c, _, f = _air_phase(env)
-  return c * (1 - torch.exp(-f.square() / sigma)).mean(-1)
+  return (c * (1 - torch.exp(-f.square() / sigma))).mean(-1)
+
+
+def foot_lift(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """side jump: each sole's height in its own air phase, saturating at the curriculum target h."""
+  cmd = env.command_manager.get_term("head_pose")
+  c, _, _ = _air_phase(env)
+  # side4: per-mm slope fixed at 1/1.5 cm. side3 divided by h = 3 cm: half the pay per mm, lift 13 -> 9 mm
+  return (c * foot_clearance(cmd._robot, cmd._sole).clamp(0, cmd.h) / 0.015).mean(-1)
+
+
+def head_up(env: ManagerBasedRlEnv, pitch_std: float = 0.15, yaw_std: float = 0.3) -> torch.Tensor:
+  """user: while jumping the head looks ahead or up. Camera axis pitch below level and its yaw off
+  the trunk heading are Gaussian-charged; looking up is free (default pose looks 17 deg down)."""
+  robot = env.scene["robot"]
+  sid = robot.find_sites(["head_camera"])[0]
+  w, x, y, z = robot.data.site_quat_w[:, sid[0]].unbind(-1)
+  fx, fy, fz = 1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)  # camera x axis, world
+  pitch = torch.asin(fz.clamp(-1, 1))
+  w, x, y, z = robot.data.root_link_quat_w.unbind(-1)
+  dyaw = torch.remainder(torch.atan2(fy, fx) - torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)) + math.pi, 2 * math.pi) - math.pi
+  return torch.exp(-(pitch.clamp(max=0) / pitch_std).square() - (dyaw / yaw_std).square())
 
 
 def landing_impact(env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -257,8 +292,9 @@ def make_ys_jump_env_cfg(play: bool = False):
   r["air_force"] = RewardTermCfg(func=air_force, weight=-4.0)
   for k in ("jump_track", "trunk_track", "jump_push"):
     r[k].weight = 0.0
-  r["jump_lift"].weight = 8.0  # sole height, saturating at the curriculum target (jump12: 4 -> 8)
+  r["jump_lift"].weight = 12.0  # sole height, saturating at the curriculum target (jump12: 4 -> 8; jump17: 12, head fixed cost 35 -> 25 mm)
   r["landing_impact"] = RewardTermCfg(func=landing_impact, weight=-3.0)  # jump13: -0.5 -> -3 (jump12 still landed 61 N p95)
+  r["head_up"] = RewardTermCfg(func=head_up, weight=2.0, params={"pitch_std": 0.5, "yaw_std": 0.8})  # sidejump branch: head ahead/up, front and side (jump14: std 0.15/0.3 flat at the hop's -56 deg pitch)
   # cfg.terminations["rope_hit"] = TerminationTermCfg(func=rope_hit)  # jump9: no hop in 400 it
   # r["foot_level"] = RewardTermCfg(func=foot_level, weight=2.0)  # jump6: 0.01 of 0.5, no gradient
   r["stay_put"] = RewardTermCfg(func=stay_put, weight=3.0, params={"pos_std": 0.05, "yaw_std": 0.3})  # jump4: 2 -> 5 cm std (jump3 drifted 1.9 m); jump5: weight 2 -> 6, yaw 0.1 -> 0.3 rad (jump4 drifted 32 cm); jump10: 1, it out-paid the hop (jump8); jump11: 3 (jump10 drifted 93 cm)
@@ -267,3 +303,26 @@ def make_ys_jump_env_cfg(play: bool = False):
 
 
 YsJumpRlCfg = replace(MicroduckRlCfg, experiment_name="ys_jump")
+
+SIDE_GAP = 2 * math.pi * 0.2  # rad: left-to-right air-phase centre spacing (160 ms)
+SIDE_HALF_W = math.pi * 0.12  # rad: each foot up 96 ms -> 64 ms between the windows for the weight shift
+
+
+def make_ys_side_jump_env_cfg(play: bool = False):
+  """7-1s (ys/stage7-sidejump): face the turner (+x), the rope crosses the feet one after the other
+  (rope14: under each foot for ~10-60 ms, ~40 ms apart, never both at once) -> a timed waddle:
+  left sole up in its window, then right. Same clock/centering as the hop; per-foot contact clock."""
+  cfg = make_ys_jump_env_cfg(play)
+  jc = cfg.commands["head_pose"]
+  jc.foot_offset, jc.air_half_w = (-SIDE_GAP / 2, SIDE_GAP / 2), SIDE_HALF_W
+  # side3: target fixed at 3 cm. side2 sat at h 1.5 cm (training peak 1.07 < 0.8 h, eval 13 mm) and
+  # foot_lift saturates at h, so nothing paid a higher lift; linear lift needs no ramp from 0
+  jc.h_start, jc.freeze_radius = 0.03, True
+  r = cfg.rewards
+  r["both_air"].weight = 0.0  # one foot at a time
+  r["jump_lift"].weight = 0.0
+  r["foot_lift"] = RewardTermCfg(func=foot_lift, weight=12.0)  # side3: 8 -> 12
+  return cfg
+
+
+YsSideJumpRlCfg = replace(MicroduckRlCfg, experiment_name="ys_side_jump")

@@ -45,6 +45,7 @@ def main():
   p.add_argument("--body-circle", type=float, metavar="R", help="5b task: hold the feet-frame circle radius R (m), no load")
   p.add_argument("--body-freq", type=float, help="5b task: circle frequency (Hz)")
   p.add_argument("--views", nargs="+", help="subset of view labels (1, 2 or 4)")
+  p.add_argument("--jump-clock", action="store_true", help="7-1 jump tasks: hold the 1.25 Hz clock on (amp 1)")
   a = p.parse_args()
   views = [v for v in VIEWS if not a.views or v[0] in a.views]
 
@@ -86,6 +87,11 @@ def main():
           hc.freq[:] = a.body_freq
         hc.tip_force.zero_()
         hc._write()
+      if a.jump_clock:
+        from mjlab_microduck.tasks.ys_jump_env_cfg import JUMP_FREQ_HZ
+        jc = env.command_manager.get_term("head_pose")
+        jc.amp[:], jc.freq[:] = 1.0, JUMP_FREQ_HZ
+        jc._write()
       if a.tip_force:
         rb = env.scene["robot"]
         apply_tip_force(rb, rb.find_bodies("jaw_soft")[0][0], rb.find_sites("mouth_tip")[0][0], *a.tip_force)
