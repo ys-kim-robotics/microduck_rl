@@ -29,7 +29,7 @@ SCENARIOS = [
 WARMUP_S = 1.0  # skip the spawn transient
 
 
-def make_env(task, cmd, n, drop=()):
+def make_env(task, cmd, n, drop=(), render=False):
   cfg = load_env_cfg(task, play=True)
   for k in drop:  # DR ablation: event names, or "imu" for the IMU mounting-error obs
     if k == "imu":
@@ -41,7 +41,9 @@ def make_env(task, cmd, n, drop=()):
   cfg.scene.num_envs = n
   cfg.seed = 0
   fix_command(cfg, cmd)
-  env = ManagerBasedRlEnv(cfg=cfg, device="cuda:0")
+  if render:
+    cfg.viewer.height, cfg.viewer.width, cfg.viewer.distance = 360, 480, 0.9
+  env = ManagerBasedRlEnv(cfg=cfg, device="cuda:0", render_mode="rgb_array" if render else None)
   return env, RslRlVecEnvWrapper(env, clip_actions=load_rl_cfg(task).clip_actions)
 
 

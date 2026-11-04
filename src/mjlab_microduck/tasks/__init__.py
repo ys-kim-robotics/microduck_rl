@@ -452,3 +452,13 @@ register_mjlab_task(
     rl_cfg=YsRopeRlCfg,
     runner_cls=YsSelfPlayRunner,
 )
+
+from .ys_jump_env_cfg import YsJumpRlCfg, make_ys_jump_env_cfg
+
+register_mjlab_task(
+    task_id="Mjlab-YsJump-Flat-MicroDuck",
+    env_cfg=make_ys_jump_env_cfg(),
+    play_env_cfg=make_ys_jump_env_cfg(play=True),
+    rl_cfg=YsJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
