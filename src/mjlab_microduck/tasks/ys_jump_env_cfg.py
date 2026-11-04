@@ -247,6 +247,19 @@ def landing_impact(env: ManagerBasedRlEnv) -> torch.Tensor:
   return (env.scene["feet_ground_contact"].data.force.norm(dim=-1).sum(-1) / mg - 2.5).clamp(min=0)
 
 
+TOUCHDOWN_W = 0.6  # rad of phase after each foot's air phase (~76 ms): the landing
+
+
+def touchdown_speed(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """jump19: sole sink speed squared (m/s)^2 just after the air phase (>0, weight < 0). jump18's bigger
+  force penalty cut the impact 60 -> 49 N but also the hop 37 -> 34 mm; a slowed foot lands soft."""
+  cmd = env.command_manager.get_term("head_pose")
+  d = foot_window(cmd)
+  on = (d > cmd.cfg.air_half_w) & (d < cmd.cfg.air_half_w + TOUCHDOWN_W) & (cmd.amp > 0)[:, None]
+  vz = cmd._robot.data.geom_lin_vel_w[:, cmd._sole, 2]
+  return (on * (-vz).clamp(min=0).square()).sum(-1)
+
+
 TRUNK_Z0 = 0.116  # standing root height (m), measured with jump2 (sd 0.3 mm)
 TRUNK_H, TRUNK_HALF_W, TRUNK_STD = 0.05, 0.65 * math.pi, 0.025  # Circus ropehop's body-z command
 
@@ -293,7 +306,8 @@ def make_ys_jump_env_cfg(play: bool = False):
   for k in ("jump_track", "trunk_track", "jump_push"):
     r[k].weight = 0.0
   r["jump_lift"].weight = 12.0  # sole height, saturating at the curriculum target (jump12: 4 -> 8; jump17: 12, head fixed cost 35 -> 25 mm)
-  r["landing_impact"] = RewardTermCfg(func=landing_impact, weight=-3.0)  # jump13: -0.5 -> -3 (jump12 still landed 61 N p95)
+  r["landing_impact"] = RewardTermCfg(func=landing_impact, weight=-10.0)  # jump13: -0.5 -> -3 (jump12 still landed 61 N p95); jump18: -10 (jump17 60 N)
+  r["touchdown_speed"] = RewardTermCfg(func=touchdown_speed, weight=-4.0)  # jump19
   r["head_up"] = RewardTermCfg(func=head_up, weight=2.0, params={"pitch_std": 0.5, "yaw_std": 0.8})  # sidejump branch: head ahead/up, front and side (jump14: std 0.15/0.3 flat at the hop's -56 deg pitch)
   # cfg.terminations["rope_hit"] = TerminationTermCfg(func=rope_hit)  # jump9: no hop in 400 it
   # r["foot_level"] = RewardTermCfg(func=foot_level, weight=2.0)  # jump6: 0.01 of 0.5, no gradient
@@ -322,6 +336,7 @@ def make_ys_side_jump_env_cfg(play: bool = False):
   r["both_air"].weight = 0.0  # one foot at a time
   r["jump_lift"].weight = 0.0
   r["foot_lift"] = RewardTermCfg(func=foot_lift, weight=12.0)  # side3: 8 -> 12
+  r["landing_impact"].weight = -6.0  # side5: -3 -> -6 (side4 landed 27 N p95, target 25)
   return cfg
 
 
