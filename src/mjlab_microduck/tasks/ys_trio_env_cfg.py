@@ -86,43 +86,68 @@ CAM_NOISE = 0.01  # normalized image units (~6 px at 1280)
 CAM_DROP = 0.05
 
 
-def _cam_true(env) -> torch.Tensor:
-  """(N, 3) u, v in [-1, 1] (right, up) of the turner's head (head_imu site) in the jumper's head_camera site
-  frame (x forward, y left, z up: probed), valid = in front and in the frame."""
+def _cam_true(env, site: str = "head_imu", occlude: bool = False) -> torch.Tensor:
+  """(N, 3) u, v in [-1, 1] (right, up) of a turner site (head_imu: its head; stem_end: the red ball) in
+  the jumper's head_camera site frame (x forward, y left, z up: probed), valid = in front and in the
+  frame (and, occlude, not behind a rope link)."""
   rob, tu = env.scene["robot"], env.scene["turner"]
-  if not hasattr(env, "_ys_cam_ids"):
-    env._ys_cam_ids = (rob.find_sites("head_camera")[0][0], tu.find_sites("head_imu")[0][0])
-  i, j = env._ys_cam_ids
+  ids = env.__dict__.setdefault("_ys_cam_ids", {})
+  if site not in ids:
+    ids[site] = (rob.find_sites("head_camera")[0][0], tu.find_sites(site)[0][0])
+  i, j = ids[site]
+  p0, p1 = rob.data.site_pos_w[:, i], tu.data.site_pos_w[:, j]
   R = matrix_from_quat(rob.data.site_quat_w[:, i])
-  d = (R.transpose(1, 2) @ (tu.data.site_pos_w[:, j] - rob.data.site_pos_w[:, i])[..., None])[..., 0]
+  d = (R.transpose(1, 2) @ (p1 - p0)[..., None])[..., 0]
   x = d[:, 0].clamp(min=1e-3)
   u, v = -d[:, 1] / x / CAM_TAN_H, d[:, 2] / x / CAM_TAN_V
   ok = (d[:, 0] > 0.02) & (u.abs() <= 1) & (v.abs() <= 1)
+  if occlude:  # a rope link across the line of sight hides the ball. ponytail: the turner's own head/body never does
+    seg = p1 - p0
+    L = env.scene["rope"].data.body_link_pos_w  # link origins are ~7 cm apart: test 4 points per link
+    w = torch.linspace(0, 1, 5, device=L.device)[:-1]
+    q = (L[:, :-1, None] + w[None, None, :, None] * (L[:, 1:, None] - L[:, :-1, None])).flatten(1, 2) - p0[:, None]
+    t = ((q * seg[:, None]).sum(-1) / seg.square().sum(-1, keepdim=True)).clamp(0, 1)
+    dist = (q - t[..., None] * seg[:, None]).norm(dim=-1)
+    ok &= ~((dist < ROPE_RADIUS + 0.5 * BALL_R) & (t > 0.05) & (t < 0.9)).any(-1)
   return torch.stack([u.clamp(-1, 1), v.clamp(-1, 1), ok.float()], -1)
 
 
-def cam_tip_obs(env) -> torch.Tensor:
-  """trio4: (N, 6) the tracker's last two delivered frames (u, v, valid) -- what the real jumper can
-  get. 30 Hz sample-and-hold at a per-env camera phase, 60-100 ms lag, noise, 5% dropped frames
-  (valid 0, last u v held). Advanced once per env step (actor and critic both call it)."""
-  st = getattr(env, "_ys_cam", None)
+def _cam_track(env, key: str, site: str, occlude: bool) -> torch.Tensor:
+  """(N, 6) the tracker's last two delivered frames (u, v, valid) of one marker. 30 Hz sample-and-hold
+  at a per-env camera phase, 60-100 ms lag (one camera: shared by every marker), noise, 5% dropped
+  frames (valid 0, last u v held). Advanced once per env step (actor and critic both call it)."""
   n, dev = env.num_envs, env.device
+  clk = env.__dict__.get("_ys_cam_clock")
+  if clk is None:
+    clk = env._ys_cam_clock = dict(lag=torch.randint(CAM_LAG[0], CAM_LAG[1] + 1, (n,), device=dev), ph=torch.rand(n, device=dev))
+  st = env.__dict__.get(key)
   if st is None:
-    lag = torch.randint(CAM_LAG[0], CAM_LAG[1] + 1, (n,), device=dev)
-    st = env._ys_cam = dict(step=-1, ring=_cam_true(env)[:, None].repeat(1, CAM_LAG[1] + 1, 1), lag=lag,
-                            ph=torch.rand(n, device=dev), cur=torch.zeros(n, 3, device=dev), prev=torch.zeros(n, 3, device=dev))
+    st = dict(step=-1, ring=_cam_true(env, site, occlude)[:, None].repeat(1, CAM_LAG[1] + 1, 1),
+              cur=torch.zeros(n, 3, device=dev), prev=torch.zeros(n, 3, device=dev))
+    setattr(env, key, st)
   if st["step"] != env.common_step_counter:
     st["step"] = env.common_step_counter
-    st["ring"] = torch.cat([_cam_true(env)[:, None], st["ring"][:, :-1]], 1)
-    t = env.episode_length_buf * env.step_dt * CAM_HZ + st["ph"]
+    st["ring"] = torch.cat([_cam_true(env, site, occlude)[:, None], st["ring"][:, :-1]], 1)
+    t = env.episode_length_buf * env.step_dt * CAM_HZ + clk["ph"]
     new = (t.floor() != (t - env.step_dt * CAM_HZ).floor()) | (env.episode_length_buf <= 1)
-    m = st["ring"][torch.arange(n, device=dev), st["lag"]].clone()
+    m = st["ring"][torch.arange(n, device=dev), clk["lag"]].clone()
     m[:, :2] += CAM_NOISE * torch.randn_like(m[:, :2])
     drop = torch.rand(n, device=dev) < CAM_DROP
     m[drop, :2], m[drop, 2] = st["cur"][drop, :2], 0.0
     st["prev"] = torch.where(new[:, None], st["cur"], st["prev"])
     st["cur"] = torch.where(new[:, None], m, st["cur"])
   return torch.cat([st["cur"], st["prev"]], -1)
+
+
+def cam_tip_obs(env) -> torch.Tensor:
+  """trio4+: the leader's head through the jumper's tracker (6)."""
+  return _cam_track(env, "_ys_cam", "head_imu", False)
+
+
+def cam_ball_obs(env) -> torch.Tensor:
+  """stage 7-4 (2): the leader's red ball (the rope's attach point) through the same tracker (6), hidden
+  by rope links crossing the line of sight. In frame ~32% of the time (trio6 posture)."""
+  return _cam_track(env, "_ys_cam_ball", "stem_end", True)
 
 
 def widen_checkpoint(src: str, dst: str, add: dict) -> None:
@@ -282,7 +307,7 @@ def rope_overlap(env: ManagerBasedRlEnv, cap: float = 0.05) -> torch.Tensor:
   return torch.where(env.episode_length_buf > ROPE_GRACE_STEPS, pen.nan_to_num(0.0) / 0.01, 0.0)
 
 
-def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS):
+def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS, ball_obs: bool = False):
   cfg = J.make_ys_side_jump_env_cfg(play, half_w=J.SIDE_OVERLAP_HALF_W, both=3.0)  # side6's task
   cfg.commands["head_pose"].zero_command_prob = 0.0  # the rope always turns: always jump
   rc = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)  # turners as in the duo evals (no pushes)
@@ -336,6 +361,9 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     for grp in ("actor", "critic"):
       cfg.observations[grp].terms["cam_tip"] = ObservationTermCfg(func=cam_tip_obs)
     cfg.observations["critic"].terms["rope_phase"] = ObservationTermCfg(func=rope_phase_obs)
+  if ball_obs:  # appended after cam_tip / rope_phase: actor 67:73, critic 84:90
+    for grp in ("actor", "critic"):
+      cfg.observations[grp].terms["cam_ball"] = ObservationTermCfg(func=cam_ball_obs)
   if head_w:
     cfg.rewards["head_back"] = RewardTermCfg(func=head_back, weight=-head_w, params={"tol": head_tol})
   if no_clock:
