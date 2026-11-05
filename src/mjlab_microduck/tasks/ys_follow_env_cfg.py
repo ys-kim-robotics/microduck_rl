@@ -63,13 +63,14 @@ def shifted_head_command(env, command_name: str = "head_pose") -> torch.Tensor:
   return c
 
 
-def _leader_ball(env) -> torch.Tensor:
+def _leader_ball(env, me: str = "robot", leader: str = "partner") -> torch.Tensor:
   """(N, 3) leader's stem end in the follower's head_camera frame; hidden by the follower's own ball
   (it hangs right below the camera) or a rope segment across the line of sight."""
-  rob, pa = env.scene["robot"], env.scene["partner"]
-  if not hasattr(env, "_ys_fol_ids"):
-    env._ys_fol_ids = (rob.find_sites("head_camera")[0][0], pa.find_sites("stem_end")[0][0], rob.find_sites("stem_end")[0][0])
-  i, j, own = env._ys_fol_ids
+  rob, pa = env.scene[me], env.scene[leader]
+  ids = env.__dict__.setdefault("_ys_fol_ids", {})
+  if me not in ids:
+    ids[me] = (rob.find_sites("head_camera")[0][0], pa.find_sites("stem_end")[0][0], rob.find_sites("stem_end")[0][0])
+  i, j, own = ids[me]
   p0, p1 = rob.data.site_pos_w[:, i], pa.data.site_pos_w[:, j]
   R = matrix_from_quat(rob.data.site_quat_w[:, i])
   d = (R.transpose(1, 2) @ (p1 - p0)[..., None])[..., 0]
