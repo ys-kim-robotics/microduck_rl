@@ -566,8 +566,8 @@ from mjlab_microduck.tasks.ys_follow_env_cfg import make_ys_follow_env_cfg  # no
 
 register_mjlab_task(
     task_id="Mjlab-YsRopeFollow-Flat-MicroDuck",
-    env_cfg=make_ys_follow_env_cfg(),
-    play_env_cfg=make_ys_follow_env_cfg(play=True),
+    env_cfg=make_ys_follow_env_cfg(sync_w=float(_os.environ.get("YS_SYNC_W", "2.0"))),
+    play_env_cfg=make_ys_follow_env_cfg(play=True, sync_w=float(_os.environ.get("YS_SYNC_W", "2.0"))),
     rl_cfg=YsRopeRlCfg,  # experiment ys_rope (rope14 lives there too)
     runner_cls=MicroduckOnPolicyRunner,
 )

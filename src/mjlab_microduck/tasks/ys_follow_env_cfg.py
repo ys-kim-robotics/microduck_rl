@@ -115,7 +115,7 @@ def sync_gap(env, std: float = SYNC_STD) -> torch.Tensor:
   return torch.where(env.episode_length_buf > 50, torch.exp(-(gap / std).square()), 0.0)
 
 
-def make_ys_follow_env_cfg(play: bool = False, offset_half: float = OFFSET_HALF):
+def make_ys_follow_env_cfg(play: bool = False, offset_half: float = OFFSET_HALF, sync_w: float = 2.0):
   cfg = make_ys_rope_duo_env_cfg(play, span=T.SPAN)
   act = cfg.actions["partner_joint_pos"]
   cfg.actions["partner_joint_pos"] = LeaderActionCfg(**{k: getattr(act, k) for k in act.__dataclass_fields__ if k != "checkpoint"}, checkpoint=LEADER_CKPT)
@@ -123,5 +123,5 @@ def make_ys_follow_env_cfg(play: bool = False, offset_half: float = OFFSET_HALF)
   for grp in ("actor", "critic"):  # appended last: actor 61:67, critic 76:82
     cfg.observations[grp].terms["leader_ball"] = ObservationTermCfg(func=leader_ball_obs)
   cfg.events["sample_offset"] = EventTermCfg(func=sample_offset, mode="reset", params={"half": offset_half})
-  cfg.rewards["sync_gap"] = RewardTermCfg(func=sync_gap, weight=2.0)
+  cfg.rewards["sync_gap"] = RewardTermCfg(func=sync_gap, weight=sync_w)
   return cfg
