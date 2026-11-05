@@ -540,3 +540,14 @@ register_mjlab_task(
     rl_cfg=YsTrioJumpRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+# stage 7-4 (ys): trio6 + head_back; weight / tolerance per run from the env (default H1)
+import os as _os
+_hw, _ht = float(_os.environ.get("YS_HEAD_W", "0.5")), float(_os.environ.get("YS_HEAD_TOL", "0.015"))
+register_mjlab_task(
+    task_id="Mjlab-YsTrioJumpHead-Flat-MicroDuck",
+    env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0),
+    play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0),
+    rl_cfg=YsTrioJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)

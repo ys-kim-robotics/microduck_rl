@@ -28,7 +28,7 @@ from mjlab.managers import EventTermCfg, ObservationTermCfg, RewardTermCfg, Scen
 import mjlab_microduck.tasks.ys_head_circle_env_cfg as hc
 import mjlab_microduck.tasks.ys_jump_env_cfg as J
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import MicroduckRlCfg
-from mjlab.utils.lab_api.math import matrix_from_quat
+from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply_inverse
 from mjlab_microduck.tasks.symmetry import _get_tensors
 from mjlab_microduck.tasks.ys_rope import ROPE_RADIUS
 from mjlab_microduck.tasks.ys_rope_duo_env_cfg import load_frozen_actor
@@ -233,6 +233,19 @@ def with_rope_color(spec_fn, rgba):
   return fn
 
 
+HEAD_X0 = 0.042  # m: head_imu ahead of the trunk root in the standing pose (trio6 jumps at 0.104)
+
+
+def head_back(env: ManagerBasedRlEnv, tol: float = 0.015, cap: float = 0.06) -> torch.Tensor:
+  """(>0, weight < 0) cm the jumper's head sits ahead of its standing spot beyond tol (user: no need to
+  thrust the head forward; trio6 holds it 62 mm ahead, neck and head pitch ~-1.7 rad each)."""
+  rob = env.scene["robot"]
+  if not hasattr(env, "_ys_head_site"):
+    env._ys_head_site = rob.find_sites("head_imu")[0][0]
+  d = quat_apply_inverse(rob.data.root_link_quat_w, rob.data.site_pos_w[:, env._ys_head_site] - rob.data.root_link_pos_w)
+  return (d[:, 0] - HEAD_X0 - tol).clamp(0, cap) / 0.01
+
+
 def connect_trio(spec: mujoco.MjSpec) -> None:
   for a, b in (("rope/rope_start", "partner/stem_end"), ("rope/rope_end", "turner/stem_end")):
     eq = spec.add_equality(type=mujoco.mjtEq.mjEQ_CONNECT, objtype=mujoco.mjtObj.mjOBJ_SITE, name1=a, name2=b)
@@ -269,7 +282,7 @@ def rope_overlap(env: ManagerBasedRlEnv, cap: float = 0.05) -> torch.Tensor:
   return torch.where(env.episode_length_buf > ROPE_GRACE_STEPS, pen.nan_to_num(0.0) / 0.01, 0.0)
 
 
-def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False):
+def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS):
   cfg = J.make_ys_side_jump_env_cfg(play, half_w=J.SIDE_OVERLAP_HALF_W, both=3.0)  # side6's task
   cfg.commands["head_pose"].zero_command_prob = 0.0  # the rope always turns: always jump
   rc = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)  # turners as in the duo evals (no pushes)
@@ -323,9 +336,11 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     for grp in ("actor", "critic"):
       cfg.observations[grp].terms["cam_tip"] = ObservationTermCfg(func=cam_tip_obs)
     cfg.observations["critic"].terms["rope_phase"] = ObservationTermCfg(func=rope_phase_obs)
+  if head_w:
+    cfg.rewards["head_back"] = RewardTermCfg(func=head_back, weight=-head_w, params={"tol": head_tol})
   if no_clock:
     t = cfg.observations["actor"].terms["head_command"]
-    t.func, t.params = faded_head_command, {**t.params, "fade_steps": 0 if play else CLOCK_FADE_STEPS}
+    t.func, t.params = faded_head_command, {**t.params, "fade_steps": 0 if play else clock_fade}  # 0: resuming a clock-free policy
   if rope_windows:
     c = cfg.commands["head_pose"]
     cfg.commands["head_pose"] = TrioClockCommandCfg(**{f: getattr(c, f) for f in c.__dataclass_fields__})
