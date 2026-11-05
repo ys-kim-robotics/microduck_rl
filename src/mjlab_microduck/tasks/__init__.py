@@ -560,3 +560,14 @@ register_mjlab_task(
     rl_cfg=YsTrioJumpRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+# stage 7-4 (3): follower turner synced to the frozen rope14 leader by watching its ball
+from mjlab_microduck.tasks.ys_follow_env_cfg import make_ys_follow_env_cfg  # noqa: E402
+
+register_mjlab_task(
+    task_id="Mjlab-YsRopeFollow-Flat-MicroDuck",
+    env_cfg=make_ys_follow_env_cfg(),
+    play_env_cfg=make_ys_follow_env_cfg(play=True),
+    rl_cfg=YsRopeRlCfg,  # experiment ys_rope (rope14 lives there too)
+    runner_cls=MicroduckOnPolicyRunner,
+)

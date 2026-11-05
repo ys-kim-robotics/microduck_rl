@@ -112,22 +112,24 @@ def _cam_true(env, site: str = "head_imu", occlude: bool = False) -> torch.Tenso
   return torch.stack([u.clamp(-1, 1), v.clamp(-1, 1), ok.float()], -1)
 
 
-def _cam_track(env, key: str, site: str, occlude: bool) -> torch.Tensor:
+def _cam_track(env, key: str, site: str, occlude: bool, true_fn=None) -> torch.Tensor:
   """(N, 6) the tracker's last two delivered frames (u, v, valid) of one marker. 30 Hz sample-and-hold
   at a per-env camera phase, 60-100 ms lag (one camera: shared by every marker), noise, 5% dropped
-  frames (valid 0, last u v held). Advanced once per env step (actor and critic both call it)."""
+  frames (valid 0, last u v held). Advanced once per env step (actor and critic both call it).
+  true_fn(env) -> (N, 3) overrides the jumper-to-turner geometry (the follower's camera)."""
   n, dev = env.num_envs, env.device
+  meas = true_fn or (lambda e: _cam_true(e, site, occlude))
   clk = env.__dict__.get("_ys_cam_clock")
   if clk is None:
     clk = env._ys_cam_clock = dict(lag=torch.randint(CAM_LAG[0], CAM_LAG[1] + 1, (n,), device=dev), ph=torch.rand(n, device=dev))
   st = env.__dict__.get(key)
   if st is None:
-    st = dict(step=-1, ring=_cam_true(env, site, occlude)[:, None].repeat(1, CAM_LAG[1] + 1, 1),
+    st = dict(step=-1, ring=meas(env)[:, None].repeat(1, CAM_LAG[1] + 1, 1),
               cur=torch.zeros(n, 3, device=dev), prev=torch.zeros(n, 3, device=dev))
     setattr(env, key, st)
   if st["step"] != env.common_step_counter:
     st["step"] = env.common_step_counter
-    st["ring"] = torch.cat([_cam_true(env, site, occlude)[:, None], st["ring"][:, :-1]], 1)
+    st["ring"] = torch.cat([meas(env)[:, None], st["ring"][:, :-1]], 1)
     t = env.episode_length_buf * env.step_dt * CAM_HZ + clk["ph"]
     new = (t.floor() != (t - env.step_dt * CAM_HZ).floor()) | (env.episode_length_buf <= 1)
     m = st["ring"][torch.arange(n, device=dev), clk["lag"]].clone()
