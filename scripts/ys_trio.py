@@ -43,12 +43,12 @@ BANDS = {"right": (-0.065, -0.018), "left": (0.020, 0.064)}  # foot y bands, jum
 HEAD_TOP = 0.17
 
 
-def trio_cfg(n, span, jtask):
+def trio_cfg(n, span, jtask, face=1.0):
   cfg = D.duo_cfg(n, span=span)
   jc = load_env_cfg(jtask, play=True)
   mid = STEM_END_NOM[0] + span / 2
   jr = jc.scene.entities["robot"]
-  jumper = replace(jr, init_state=replace(jr.init_state, pos=(mid, 0.0, jr.init_state.pos[2]), rot=(1.0, 0.0, 0.0, 0.0)))
+  jumper = replace(jr, init_state=replace(jr.init_state, pos=(mid, 0.0, jr.init_state.pos[2]), rot=(1.0, 0.0, 0.0, 0.0) if face > 0 else (0.0, 0.0, 0.0, 1.0)))
   e = cfg.scene.entities
   cfg.scene.entities = {"robot": e["robot"], "partner": e["partner"], "jumper": jumper, "rope": e["rope"]}  # ducks before rope
   for k, ev in list(cfg.events.items()):  # jumper copies of the robot events (reset pose, joints, DR)
@@ -78,7 +78,7 @@ def yaw(q):
   return torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
 
 
-def jumper_slots(jumper, spot, phase):
+def jumper_slots(jumper, spot, phase, yaw0=0.0):
   """(n, 13) command block: centering twist, jump clock (amp 1), body pose 0 (side-jump obs, probe.py)."""
   ya = yaw(jumper.data.root_link_quat_w)
   dx, dy = (spot - jumper.data.root_link_pos_w[:, :2]).unbind(-1)
@@ -86,7 +86,7 @@ def jumper_slots(jumper, spot, phase):
   out = torch.zeros(len(phase), 13, device=phase.device)
   out[:, 0] = (J.CENTER_GAIN * (c * dx + s * dy)).clamp(-0.3, 0.3)
   out[:, 1] = (J.CENTER_GAIN * (-s * dx + c * dy)).clamp(-0.3, 0.3)
-  out[:, 2] = (-J.CENTER_GAIN * ya).clamp(-0.5, 0.5)
+  out[:, 2] = (-J.CENTER_GAIN * (torch.remainder(ya - yaw0 + math.pi, 2 * math.pi) - math.pi)).clamp(-0.5, 0.5)
   out[:, 4], out[:, 5] = torch.cos(phase), torch.sin(phase)  # head_pitch, head_yaw
   return out
 
@@ -117,6 +117,7 @@ def main():
   p.add_argument("--y", default="0", help="jumper spot y (m), comma list: envs split over (y, delta) (the rope circle sits ~-66 mm off the mid line)")
   p.add_argument("--video", help="render env 0 (2x2 views)")
   p.add_argument("--rope-len", type=float, help="rope length (m; default ys_rope.ROPE_LEN 0.85), mass unchanged")
+  p.add_argument("--face", type=float, default=1.0, help="+1: jumper faces +x (right foot at -y), -1: faces -x (left foot at -y)")
   p.add_argument("--dump", help="save per-step rope y (jumper frame), rope z, sole z (L, R) to this npz")
   a = p.parse_args()
 
@@ -130,7 +131,7 @@ def main():
     RE.ROPE_LEN = a.rope_len  # rope_spec reads it at scene build (and the reset keyframe)
   ys = [float(v) for v in a.y.split(",")]
   n = 1 if a.video else a.n * len(ys)
-  cfg, mid = trio_cfg(n, a.span, a.jtask)
+  cfg, mid = trio_cfg(n, a.span, a.jtask, a.face)
   if a.video:
     cfg.viewer.height, cfg.viewer.width, cfg.viewer.distance = 360, 480, 1.4
     cfg.viewer.origin_type, cfg.viewer.lookat = cfg.viewer.OriginType.WORLD, (mid, 0.0, 0.12)
@@ -146,7 +147,7 @@ def main():
   spot = env.scene.env_origins[:, :2] + torch.stack([torch.full_like(yspot, mid), yspot], 1)
   sole = jumper.find_geoms(["left_foot_collision", "right_foot_collision"], preserve_order=True)[0]
   fell = torch.zeros(n, 3, dtype=torch.bool, device=dev)
-  hits, ang, dump = [], [], []
+  hits, ang, dump, pens = [], [], [], []
   sid_r, sid_p = robot.find_sites("stem_end")[0][0], partner.find_sites("stem_end")[0][0]
   writer = None
   if a.video:
@@ -162,7 +163,7 @@ def main():
       po["actor"] = D.mirror_obs(obs["partner"], obs["actor"])
       jo = obs.clone()
       jo["actor"] = obs["jumper"].clone()
-      jo["actor"][:, 48:61] = jumper_slots(jumper, spot, cmd.phase + delta)
+      jo["actor"][:, 48:61] = jumper_slots(jumper, spot, cmd.phase + delta, 0.0 if a.face > 0 else math.pi)
       obs, *_ = venv.step(torch.cat([tpol(obs), D.mirror_act(tpol(po)), jpol(jo)], 1))
       for i, d in enumerate((robot, partner, jumper)):
         fell[:, i] |= d.data.projected_gravity_b[:, 2] > -0.5
@@ -175,10 +176,15 @@ def main():
         yj = -ya.sin() * dx_ + ya.cos() * dy  # rope y in the jumper frame (x offset 0 at the section)
         soles = J.foot_clearance(jumper, sole) + J.FOOT_Z0  # (n, 2) lowest sole corner z (left, right)
         h = torch.zeros(n, dtype=torch.bool, device=dev)
+        pen = torch.zeros(n, device=dev)  # how far the rope top sits above the sole it is under (m)
         for j, nm in ((0, "left"), (1, "right")):
           lo, hi = BANDS[nm]
-          h |= (yj > lo) & (yj < hi) & (sec[:, 1] + ROPE_RADIUS > soles[:, j]) & (sec[:, 1] - ROPE_RADIUS < HEAD_TOP)
+          inb = (yj > lo) & (yj < hi) & (sec[:, 1] - ROPE_RADIUS < HEAD_TOP)
+          d = sec[:, 1] + ROPE_RADIUS - soles[:, j]
+          h |= inb & (d > 0)
+          pen = torch.where(inb, torch.maximum(pen, d.clamp(min=0)), pen)
         hits.append(h)
+        pens.append(pen)
         dump.append(torch.cat([yj[:, None], sec[:, 1:], soles], 1))
         axis = 0.5 * (robot.data.site_pos_w[:, sid_r, 1:] + partner.data.site_pos_w[:, sid_p, 1:])
         m = rope.data.body_link_pos_w[:, rope.data.body_link_pos_w.shape[1] // 2, 1:] - axis
@@ -203,17 +209,25 @@ def main():
   turn = ((ang.diff(dim=0) + math.pi) % (2 * math.pi) - math.pi).sum(0) / (2 * math.pi) / (1.25 * a.window)
   ok = ~fell.any(1).cpu().numpy()
   rate = cyc.mean(0)
+  Pn = torch.stack(pens).cpu().numpy()
+  depth = 1000 * np.median(Pn[: (len(Pn) // per) * per].reshape(-1, per, n).max(1), 0)  # per env: median per-cycle worst overlap, mm
   print(f"trio  envs {n}  span {a.span}  fell robot/partner/jumper {[round(100 * x, 1) for x in fell.float().mean(0).tolist()]}%  rope turn {turn[torch.from_numpy(ok).to(dev)].mean():.2f}")
   if a.delta_deg is None:  # rows y, columns delta: % of cycles with a hit (X = jumper fell)
     dd = np.degrees(delta.cpu().numpy()[:nd])
     print("  y mm \\ delta deg " + " ".join(f"{x:4.0f}" for x in dd))
     for i, yv in enumerate(ys):
       print(f"  {1000 * yv:6.0f}            " + " ".join(f"{100 * rate[i * nd + j]:4.0f}" if ok[i * nd + j] else "   X" for j in range(nd)))
+    print("  median per-cycle worst overlap mm (rope top above the sole it passes under)")
+    for i, yv in enumerate(ys):
+      print(f"  {1000 * yv:6.0f}            " + " ".join(f"{depth[i * nd + j]:4.0f}" if ok[i * nd + j] else "   X" for j in range(nd)))
+    sc = np.where(ok, depth, np.inf)
+    for b in np.argsort(sc)[:3]:  # single envs: confirm with --y/--delta-deg at 32 envs
+      print(f"  BEST y {1000 * ys[b // nd]:.0f} mm  delta {dd[b % nd]:.0f} deg: overlap {depth[b]:.0f} mm  hit {100 * rate[b]:.0f}%")
   else:
     for i, yv in enumerate(ys):
       s_ = slice(i * nd, (i + 1) * nd)
       o = ok[s_]
-      print(f"  y {1000 * yv:.0f} mm  delta {a.delta_deg} deg: hit {100 * cyc[:, s_][:, o].mean():.1f}% of cycles (clean envs {100 * (rate[s_][o] == 0).mean():.0f}%)  fell {100 * (~o).mean():.0f}%  cycles {cyc.shape[0]}")
+      print(f"  y {1000 * yv:.0f} mm  delta {a.delta_deg} deg: hit {100 * cyc[:, s_][:, o].mean():.1f}% of cycles (clean envs {100 * (rate[s_][o] == 0).mean():.0f}%)  overlap p50 {np.median(depth[s_][o]):.0f} mm  fell {100 * (~o).mean():.0f}%  cycles {cyc.shape[0]}")
 
 
 if __name__ == "__main__":
