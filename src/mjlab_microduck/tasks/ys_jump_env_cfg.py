@@ -322,18 +322,18 @@ SIDE_GAP = 2 * math.pi * 0.2  # rad: left-to-right air-phase centre spacing (160
 SIDE_HALF_W = math.pi * 0.12  # rad: each foot up 96 ms -> 64 ms between the windows for the weight shift
 
 
-def make_ys_side_jump_env_cfg(play: bool = False):
+def make_ys_side_jump_env_cfg(play: bool = False, gap: float = SIDE_GAP, half_w: float = SIDE_HALF_W, both: float = 0.0):
   """7-1s (ys/stage7-sidejump): face the turner (+x), the rope crosses the feet one after the other
   (rope14: under each foot for ~10-60 ms, ~40 ms apart, never both at once) -> a timed waddle:
   left sole up in its window, then right. Same clock/centering as the hop; per-foot contact clock."""
   cfg = make_ys_jump_env_cfg(play)
   jc = cfg.commands["head_pose"]
-  jc.foot_offset, jc.air_half_w = (-SIDE_GAP / 2, SIDE_GAP / 2), SIDE_HALF_W
+  jc.foot_offset, jc.air_half_w = (-gap / 2, gap / 2), half_w
   # side3: target fixed at 3 cm. side2 sat at h 1.5 cm (training peak 1.07 < 0.8 h, eval 13 mm) and
   # foot_lift saturates at h, so nothing paid a higher lift; linear lift needs no ramp from 0
   jc.h_start, jc.freeze_radius = 0.03, True
   r = cfg.rewards
-  r["both_air"].weight = 0.0  # one foot at a time
+  r["both_air"].weight = both  # one foot at a time (7-3 overlap variant: pays both up where the windows overlap)
   r["jump_lift"].weight = 0.0
   r["foot_lift"] = RewardTermCfg(func=foot_lift, weight=12.0)  # side3: 8 -> 12
   r["landing_impact"].weight = -6.0  # side5: -3 -> -6 (side4 landed 27 N p95, target 25)
@@ -341,3 +341,8 @@ def make_ys_side_jump_env_cfg(play: bool = False):
 
 
 YsSideJumpRlCfg = replace(MicroduckRlCfg, experiment_name="ys_side_jump")
+
+# 7-3 base1 (rope14 + side5) hit ~100% of cycles: at the jumper the rope lifts off the floor diagonally
+# through the footprint (10-80 mm). User's fallbacks, in order (2: overlap, 3: gap):
+SIDE_OVERLAP_HALF_W = math.pi * 0.28  # 224 ms per foot, centres 160 ms apart -> both up ~64 ms
+SIDE_SHORT_GAP = 2 * math.pi * 0.1  # centres 80 ms apart (side5: 160)

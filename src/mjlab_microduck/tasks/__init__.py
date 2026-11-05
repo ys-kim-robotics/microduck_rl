@@ -480,3 +480,21 @@ register_mjlab_task(
     rl_cfg=YsSideJumpRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+from .ys_jump_env_cfg import SIDE_OVERLAP_HALF_W, SIDE_SHORT_GAP
+
+register_mjlab_task(
+    task_id="Mjlab-YsSideJumpOverlap-Flat-MicroDuck",
+    env_cfg=make_ys_side_jump_env_cfg(half_w=SIDE_OVERLAP_HALF_W, both=3.0),
+    play_env_cfg=make_ys_side_jump_env_cfg(play=True, half_w=SIDE_OVERLAP_HALF_W, both=3.0),
+    rl_cfg=YsSideJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-YsSideJumpGap-Flat-MicroDuck",
+    env_cfg=make_ys_side_jump_env_cfg(gap=SIDE_SHORT_GAP),
+    play_env_cfg=make_ys_side_jump_env_cfg(play=True, gap=SIDE_SHORT_GAP),
+    rl_cfg=YsSideJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
