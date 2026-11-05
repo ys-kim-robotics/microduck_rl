@@ -218,6 +218,12 @@ class TurnerActionCfg(JointPositionActionCfg):
     return TurnerAction(self, env)
 
 
+def cam_age_obs(env) -> torch.Tensor:
+  """(N, 2) s since the jumper's tracker last saw the leader's head / ball (capped 1 s). B1 saw the
+  ball 15% of steps, the head 0%. Must come after cam_tip and cam_ball (they advance the tracker)."""
+  return torch.stack([env._ys_cam["age"], env._ys_cam_ball["age"]], -1)
+
+
 def trio_follower_ball_obs(env) -> torch.Tensor:
   """The front turner as follower: the leader (partner)'s ball through its own camera (6)."""
   import mjlab_microduck.tasks.ys_follow_env_cfg as F  # circular at module level
@@ -325,7 +331,7 @@ def rope_overlap(env: ManagerBasedRlEnv, cap: float = 0.05) -> torch.Tensor:
   return torch.where(env.episode_length_buf > ROPE_GRACE_STEPS, pen.nan_to_num(0.0) / 0.01, 0.0)
 
 
-def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS, ball_obs: bool = False, follower: str | None = None, follower_off: float = math.radians(60)):
+def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS, ball_obs: bool = False, cam_age: bool = False, follower: str | None = None, follower_off: float = math.radians(60)):
   cfg = J.make_ys_side_jump_env_cfg(play, half_w=J.SIDE_OVERLAP_HALF_W, both=3.0)  # side6's task
   cfg.commands["head_pose"].zero_command_prob = 0.0  # the rope always turns: always jump
   rc = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)  # turners as in the duo evals (no pushes)
@@ -369,6 +375,8 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     a = cfg.actions["turner_joint_pos"]
     a.checkpoint, a.clock_off = follower, True
     cfg.observations["turner"].terms["leader_ball"] = ObservationTermCfg(func=trio_follower_ball_obs)
+    if torch.load(follower, map_location="cpu", weights_only=False)["actor_state_dict"]["mlp.0.weight"].shape[1] == 68:  # F3+: + age
+      cfg.observations["turner"].terms["leader_ball_age"] = ObservationTermCfg(func=lambda env: env._ys_trio_fol["age"][:, None])
     import mjlab_microduck.tasks.ys_follow_env_cfg as F
     cfg.events["sample_offset"] = EventTermCfg(func=F.sample_offset, mode="reset", params={"half": follower_off})
 
@@ -388,6 +396,9 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
   if ball_obs:  # appended after cam_tip / rope_phase: actor 67:73, critic 84:90
     for grp in ("actor", "critic"):
       cfg.observations[grp].terms["cam_ball"] = ObservationTermCfg(func=cam_ball_obs)
+  if cam_age:  # B2+: actor 73:75, critic 90:92
+    for grp in ("actor", "critic"):
+      cfg.observations[grp].terms["cam_age"] = ObservationTermCfg(func=cam_age_obs)
   if head_w:
     cfg.rewards["head_back"] = RewardTermCfg(func=head_back, weight=-head_w, params={"tol": head_tol})
   if no_clock:

@@ -555,8 +555,8 @@ register_mjlab_task(
 # stage 7-4 (2): + the leader's red ball on the jumper's tracker (head_back as the chosen stage-1 run)
 register_mjlab_task(
     task_id="Mjlab-YsTrioJumpBall-Flat-MicroDuck",
-    env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True),
-    play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True),
+    env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, cam_age=bool(_os.environ.get("YS_AGE"))),
+    play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, cam_age=bool(_os.environ.get("YS_AGE"))),
     rl_cfg=YsTrioJumpRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
@@ -577,8 +577,8 @@ _fol = _os.environ.get("YS_FOLLOWER")
 if _fol:
     register_mjlab_task(
         task_id="Mjlab-YsTrioJumpFollow-Flat-MicroDuck",
-        env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, follower=_fol),
-        play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, follower=_fol),
+        env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, cam_age=bool(_os.environ.get("YS_AGE")), follower=_fol),
+        play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, cam_age=bool(_os.environ.get("YS_AGE")), follower=_fol),
         rl_cfg=YsTrioJumpRlCfg,
         runner_cls=MicroduckOnPolicyRunner,
     )
