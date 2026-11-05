@@ -32,7 +32,7 @@ from mjlab.utils.lab_api.math import matrix_from_quat
 from mjlab_microduck.tasks.symmetry import _get_tensors
 from mjlab_microduck.tasks.ys_rope import ROPE_RADIUS
 from mjlab_microduck.tasks.ys_rope_duo_env_cfg import load_frozen_actor
-from mjlab_microduck.tasks.ys_rope_env_cfg import STEM_END_NOM, make_ys_rope_bob_env_cfg, set_span
+from mjlab_microduck.tasks.ys_rope_env_cfg import STEM_END_NOM, STEM_LEN, make_ys_rope_bob_env_cfg, set_span
 
 TURNER_CKPT = "logs/rsl_rl/ys_rope/2026-11-03_23-03-17_rope14_short/model_19200.pt"
 SPAN = 0.60  # rope14
@@ -210,6 +210,29 @@ class TrioClockCommandCfg(J.JumpClockCommandCfg):
     return TrioClockCommand(self, env)
 
 
+BALL_R = 0.010  # stage 7-4: tracking markers on the stem ends (rope attach point): T, ball, rope
+BALL_RGBA = {"turner": (0.95, 0.05, 0.05, 1), "partner": (0.05, 0.8, 0.1, 1)}  # leader red, follower green
+ROPE_RGBA = (0.95, 0.95, 0.95, 1)  # white: the red rope would read as the leader's ball
+
+
+def with_ball(spec_fn, rgba):
+  def fn():
+    spec = spec_fn()
+    spec.body("t_handle").add_geom(type=mujoco.mjtGeom.mjGEOM_SPHERE, pos=[0, 0, -STEM_LEN], size=[BALL_R, 0, 0],
+                                   mass=0.001, contype=0, conaffinity=0, rgba=list(rgba))
+    return spec
+  return fn
+
+
+def with_rope_color(spec_fn, rgba):
+  def fn():
+    spec = spec_fn()
+    for g in spec.geoms:
+      g.rgba = list(rgba)
+    return spec
+  return fn
+
+
 def connect_trio(spec: mujoco.MjSpec) -> None:
   for a, b in (("rope/rope_start", "partner/stem_end"), ("rope/rope_end", "turner/stem_end")):
     eq = spec.add_equality(type=mujoco.mjtEq.mjEQ_CONNECT, objtype=mujoco.mjtObj.mjOBJ_SITE, name1=a, name2=b)
@@ -254,10 +277,10 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
   mid = STEM_END_NOM[0] + SPAN / 2
   tr = rc.scene.entities["robot"]  # the T-handle duck
   flip = (0.0, 0.0, 0.0, 1.0)  # yaw pi
-  turner = replace(tr, init_state=replace(tr.init_state, pos=(mid, -JUMPER_Y, tr.init_state.pos[2]), rot=flip))
-  partner = replace(tr, init_state=replace(tr.init_state, pos=(-mid, -JUMPER_Y, tr.init_state.pos[2]), rot=(1.0, 0.0, 0.0, 0.0)))
+  turner = replace(tr, spec_fn=with_ball(tr.spec_fn, BALL_RGBA["turner"]), init_state=replace(tr.init_state, pos=(mid, -JUMPER_Y, tr.init_state.pos[2]), rot=flip))
+  partner = replace(tr, spec_fn=with_ball(tr.spec_fn, BALL_RGBA["partner"]), init_state=replace(tr.init_state, pos=(-mid, -JUMPER_Y, tr.init_state.pos[2]), rot=(1.0, 0.0, 0.0, 0.0)))
   rope = rc.scene.entities["rope"]
-  rope = replace(rope, init_state=replace(rope.init_state, pos=(-SPAN / 2, -JUMPER_Y, STEM_END_NOM[2]), rot=flip))
+  rope = replace(rope, spec_fn=with_rope_color(rope.spec_fn, ROPE_RGBA), init_state=replace(rope.init_state, pos=(-SPAN / 2, -JUMPER_Y, STEM_END_NOM[2]), rot=flip))
   # ducks before the rope: mjlab 1.3.0 slices default_joint_pos from the scene keyframe in entity order
   cfg.scene.entities = {"robot": cfg.scene.entities["robot"], "turner": turner, "partner": partner, "rope": rope}
   cfg.scene.spec_fn = connect_trio
