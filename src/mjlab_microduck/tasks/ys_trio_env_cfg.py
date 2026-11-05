@@ -181,6 +181,17 @@ class TurnerActionCfg(JointPositionActionCfg):
     return TurnerAction(self, env)
 
 
+CLOCK_FADE_STEPS = 24 * 200  # trio6: env steps (24 per iteration) over which the actor's clock fades out
+
+
+def faded_head_command(env, command_name: str = "head_pose", fade_steps: int = CLOCK_FADE_STEPS) -> torch.Tensor:
+  """trio6: the actor's head-command slots (the jump clock, amp cos/sin) scaled 1 -> 0 over
+  fade_steps (0: off from the start, play): the jumper then only knows when to jump from the camera
+  (no clock sync between real ducks). The critic keeps the clock."""
+  a = max(0.0, 1.0 - env.common_step_counter / fade_steps) if fade_steps else 0.0
+  return a * env.command_manager.get_command(command_name)
+
+
 class TrioClockCommand(J.JumpClockCommand):
   """trio5: the jump windows (every clock-based reward) follow the rope, not the jumper's clock.
   trio3/4 randomized the rope offset but rewarded the clock's windows, so tracking the rope was
@@ -235,7 +246,7 @@ def rope_overlap(env: ManagerBasedRlEnv, cap: float = 0.05) -> torch.Tensor:
   return torch.where(env.episode_length_buf > ROPE_GRACE_STEPS, pen.nan_to_num(0.0) / 0.01, 0.0)
 
 
-def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False):
+def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False):
   cfg = J.make_ys_side_jump_env_cfg(play, half_w=J.SIDE_OVERLAP_HALF_W, both=3.0)  # side6's task
   cfg.commands["head_pose"].zero_command_prob = 0.0  # the rope always turns: always jump
   rc = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)  # turners as in the duo evals (no pushes)
@@ -289,6 +300,9 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     for grp in ("actor", "critic"):
       cfg.observations[grp].terms["cam_tip"] = ObservationTermCfg(func=cam_tip_obs)
     cfg.observations["critic"].terms["rope_phase"] = ObservationTermCfg(func=rope_phase_obs)
+  if no_clock:
+    t = cfg.observations["actor"].terms["head_command"]
+    t.func, t.params = faded_head_command, {**t.params, "fade_steps": 0 if play else CLOCK_FADE_STEPS}
   if rope_windows:
     c = cfg.commands["head_pose"]
     cfg.commands["head_pose"] = TrioClockCommandCfg(**{f: getattr(c, f) for f in c.__dataclass_fields__})

@@ -532,3 +532,11 @@ register_mjlab_task(
     rl_cfg=YsTrioJumpRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+register_mjlab_task(
+    task_id="Mjlab-YsTrioJumpCamOnly-Flat-MicroDuck",
+    env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True),
+    play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True),
+    rl_cfg=YsTrioJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
