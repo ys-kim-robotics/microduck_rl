@@ -23,7 +23,7 @@ import mujoco
 import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
-from mjlab.managers import RewardTermCfg, SceneEntityCfg
+from mjlab.managers import EventTermCfg, RewardTermCfg, SceneEntityCfg
 
 import mjlab_microduck.tasks.ys_head_circle_env_cfg as hc
 import mjlab_microduck.tasks.ys_jump_env_cfg as J
@@ -46,10 +46,19 @@ ROPE_GRACE_STEPS = 100  # 2 s: the rope spins up after a reset
 def turner_slots(env) -> torch.Tensor:
   """(N, 13) the command block the turners saw in ys_rope_duo (probe2): twist 0, whole-body circle
   head slots [neck f - 1.25 = 0, pitch amp cos, yaw amp sin, roll 0], body 0."""
-  ph = env.command_manager.get_term("head_pose").phase - DELTA0
+  ph = env.command_manager.get_term("head_pose").phase - getattr(env, "_ys_delta", DELTA0)
   out = torch.zeros(ph.shape[0], 13, device=ph.device)
   out[:, 4], out[:, 5] = TURNER_AMP * torch.cos(ph), TURNER_AMP * torch.sin(ph)
   return out
+
+
+def sample_delta(env, env_ids: torch.Tensor | None, half: float) -> None:
+  """trio3: per-episode DELTA0 +- half. trio1 learned DELTA0 exactly (60 deg: 67% clean, 45/75: 27/43%)
+  while the real rope phase spreads ~19 deg over envs: train a timing margin."""
+  if not hasattr(env, "_ys_delta"):
+    env._ys_delta = torch.full((env.num_envs,), DELTA0, device=env.device)
+  ids = slice(None) if env_ids is None else env_ids
+  env._ys_delta[ids] = DELTA0 + (2 * torch.rand_like(env._ys_delta[ids]) - 1) * half
 
 
 class TurnerAction(JointPositionAction):
@@ -124,7 +133,7 @@ def rope_overlap(env: ManagerBasedRlEnv, cap: float = 0.05) -> torch.Tensor:
   return torch.where(env.episode_length_buf > ROPE_GRACE_STEPS, pen.nan_to_num(0.0) / 0.01, 0.0)
 
 
-def make_ys_trio_jump_env_cfg(play: bool = False):
+def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0):
   cfg = J.make_ys_side_jump_env_cfg(play, half_w=J.SIDE_OVERLAP_HALF_W, both=3.0)  # side6's task
   cfg.commands["head_pose"].zero_command_prob = 0.0  # the rope always turns: always jump
   rc = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)  # turners as in the duo evals (no pushes)
@@ -171,6 +180,8 @@ def make_ys_trio_jump_env_cfg(play: bool = False):
     fell.time_out = True
     cfg.terminations[f"{who}_fell"] = fell
   cfg.rewards["rope_overlap"] = RewardTermCfg(func=rope_overlap, weight=-3.0)
+  if delta_half:
+    cfg.events["sample_delta"] = EventTermCfg(func=sample_delta, mode="reset", params={"half": delta_half})
   return cfg
 
 
