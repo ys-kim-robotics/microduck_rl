@@ -498,3 +498,13 @@ register_mjlab_task(
     rl_cfg=YsSideJumpRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+from .ys_trio_env_cfg import YsTrioJumpRlCfg, make_ys_trio_jump_env_cfg
+
+register_mjlab_task(
+    task_id="Mjlab-YsTrioJump-Flat-MicroDuck",
+    env_cfg=make_ys_trio_jump_env_cfg(),
+    play_env_cfg=make_ys_trio_jump_env_cfg(play=True),
+    rl_cfg=YsTrioJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
