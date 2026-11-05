@@ -23,11 +23,12 @@ import mujoco
 import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
-from mjlab.managers import EventTermCfg, RewardTermCfg, SceneEntityCfg
+from mjlab.managers import EventTermCfg, ObservationTermCfg, RewardTermCfg, SceneEntityCfg
 
 import mjlab_microduck.tasks.ys_head_circle_env_cfg as hc
 import mjlab_microduck.tasks.ys_jump_env_cfg as J
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import MicroduckRlCfg
+from mjlab.utils.lab_api.math import matrix_from_quat
 from mjlab_microduck.tasks.symmetry import _get_tensors
 from mjlab_microduck.tasks.ys_rope import ROPE_RADIUS
 from mjlab_microduck.tasks.ys_rope_duo_env_cfg import load_frozen_actor
@@ -59,6 +60,89 @@ def sample_delta(env, env_ids: torch.Tensor | None, half: float) -> None:
     env._ys_delta = torch.full((env.num_envs,), DELTA0, device=env.device)
   ids = slice(None) if env_ids is None else env_ids
   env._ys_delta[ids] = DELTA0 + (2 * torch.rand_like(env._ys_delta[ids]) - 1) * half
+
+
+def rope_phase_obs(env) -> torch.Tensor:
+  """trio4: (N, 2) cos, sin of the rope's real angle about the stem-end axis minus the jumper clock.
+  trio1/3 jumped on their clock alone; the real rope phase sits ~19 deg apart over envs (p10-p90)."""
+  tu, pa, rope = env.scene["turner"], env.scene["partner"], env.scene["rope"]
+  if not hasattr(env, "_ys_stem"):
+    env._ys_stem = (tu.find_sites("stem_end")[0][0], pa.find_sites("stem_end")[0][0])
+  s1, s2 = env._ys_stem
+  axis = 0.5 * (tu.data.site_pos_w[:, s1, 1:] + pa.data.site_pos_w[:, s2, 1:])
+  m = rope.data.body_link_pos_w[:, 6, 1:] - axis  # middle link
+  rel = -torch.atan2(m[:, 0], -m[:, 1]) - env.command_manager.get_term("head_pose").phase  # rope turns -clock (trio_diag)
+  return torch.stack([rel.cos(), rel.sin()], -1)
+
+
+# Head camera (runtime/deploy/robotd.toml, mediad/src/camera.rs): IMX219, 62 deg horizontal, 16:9, 30 fps.
+# A colour-marker tracker on the turner's head (the detector NN runs at 2 Hz: too slow for a rope). The head
+# circles with the rope and stays in frame 89% of the time (handle tip 45%: the jumper's head swings).
+CAM_TAN_H = math.tan(math.radians(31.0))
+CAM_TAN_V = CAM_TAN_H * 9 / 16
+CAM_HZ = 30.0
+CAM_LAG = (3, 5)  # policy steps (60-100 ms): capture + ISP + tracker, unmeasured -> randomized per env
+CAM_NOISE = 0.01  # normalized image units (~6 px at 1280)
+CAM_DROP = 0.05
+
+
+def _cam_true(env) -> torch.Tensor:
+  """(N, 3) u, v in [-1, 1] (right, up) of the turner's head (head_imu site) in the jumper's head_camera site
+  frame (x forward, y left, z up: probed), valid = in front and in the frame."""
+  rob, tu = env.scene["robot"], env.scene["turner"]
+  if not hasattr(env, "_ys_cam_ids"):
+    env._ys_cam_ids = (rob.find_sites("head_camera")[0][0], tu.find_sites("head_imu")[0][0])
+  i, j = env._ys_cam_ids
+  R = matrix_from_quat(rob.data.site_quat_w[:, i])
+  d = (R.transpose(1, 2) @ (tu.data.site_pos_w[:, j] - rob.data.site_pos_w[:, i])[..., None])[..., 0]
+  x = d[:, 0].clamp(min=1e-3)
+  u, v = -d[:, 1] / x / CAM_TAN_H, d[:, 2] / x / CAM_TAN_V
+  ok = (d[:, 0] > 0.02) & (u.abs() <= 1) & (v.abs() <= 1)
+  return torch.stack([u.clamp(-1, 1), v.clamp(-1, 1), ok.float()], -1)
+
+
+def cam_tip_obs(env) -> torch.Tensor:
+  """trio4: (N, 6) the tracker's last two delivered frames (u, v, valid) -- what the real jumper can
+  get. 30 Hz sample-and-hold at a per-env camera phase, 60-100 ms lag, noise, 5% dropped frames
+  (valid 0, last u v held). Advanced once per env step (actor and critic both call it)."""
+  st = getattr(env, "_ys_cam", None)
+  n, dev = env.num_envs, env.device
+  if st is None:
+    lag = torch.randint(CAM_LAG[0], CAM_LAG[1] + 1, (n,), device=dev)
+    st = env._ys_cam = dict(step=-1, ring=_cam_true(env)[:, None].repeat(1, CAM_LAG[1] + 1, 1), lag=lag,
+                            ph=torch.rand(n, device=dev), cur=torch.zeros(n, 3, device=dev), prev=torch.zeros(n, 3, device=dev))
+  if st["step"] != env.common_step_counter:
+    st["step"] = env.common_step_counter
+    st["ring"] = torch.cat([_cam_true(env)[:, None], st["ring"][:, :-1]], 1)
+    t = env.episode_length_buf * env.step_dt * CAM_HZ + st["ph"]
+    new = (t.floor() != (t - env.step_dt * CAM_HZ).floor()) | (env.episode_length_buf <= 1)
+    m = st["ring"][torch.arange(n, device=dev), st["lag"]].clone()
+    m[:, :2] += CAM_NOISE * torch.randn_like(m[:, :2])
+    drop = torch.rand(n, device=dev) < CAM_DROP
+    m[drop, :2], m[drop, 2] = st["cur"][drop, :2], 0.0
+    st["prev"] = torch.where(new[:, None], st["cur"], st["prev"])
+    st["cur"] = torch.where(new[:, None], m, st["cur"])
+  return torch.cat([st["cur"], st["prev"]], -1)
+
+
+def widen_checkpoint(src: str, dst: str, add: dict) -> None:
+  """trio1 checkpoint -> one whose actor/critic take add[net] more obs at the end, zero-weighted
+  (same behaviour at the start), unit normalizer stats, Adam moments padded with zeros."""
+  sd = torch.load(src, map_location="cpu", weights_only=False)
+  pad = lambda t, k, v=0.0: torch.cat([t, torch.full((*t.shape[:-1], k), v, dtype=t.dtype)], -1)
+  old = {}
+  for net, k in add.items():
+    d = sd[f"{net}_state_dict"]
+    old[d["mlp.0.weight"].shape[1]] = k
+    d["mlp.0.weight"] = pad(d["mlp.0.weight"], k)
+    d["obs_normalizer._mean"] = pad(d["obs_normalizer._mean"], k)
+    for n in ("_var", "_std"):
+      d["obs_normalizer." + n] = pad(d["obs_normalizer." + n], k, 1.0)
+  for st in sd["optimizer_state_dict"]["state"].values():
+    for n in ("exp_avg", "exp_avg_sq"):
+      if st[n].dim() == 2 and st[n].shape[0] == 512 and st[n].shape[1] in old:
+        st[n] = pad(st[n], old[st[n].shape[1]])
+  torch.save(sd, dst)
 
 
 class TurnerAction(JointPositionAction):
@@ -133,7 +217,7 @@ def rope_overlap(env: ManagerBasedRlEnv, cap: float = 0.05) -> torch.Tensor:
   return torch.where(env.episode_length_buf > ROPE_GRACE_STEPS, pen.nan_to_num(0.0) / 0.01, 0.0)
 
 
-def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0):
+def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False):
   cfg = J.make_ys_side_jump_env_cfg(play, half_w=J.SIDE_OVERLAP_HALF_W, both=3.0)  # side6's task
   cfg.commands["head_pose"].zero_command_prob = 0.0  # the rope always turns: always jump
   rc = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)  # turners as in the duo evals (no pushes)
@@ -180,6 +264,13 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0):
     fell.time_out = True
     cfg.terminations[f"{who}_fell"] = fell
   cfg.rewards["rope_overlap"] = RewardTermCfg(func=rope_overlap, weight=-3.0)
+  if rope_obs:  # sim-only (privileged): appended last, slots 61:63 (actor), 76:78 (critic)
+    for grp in ("actor", "critic"):
+      cfg.observations[grp].terms["rope_phase"] = ObservationTermCfg(func=rope_phase_obs)
+  if cam_obs:  # real-feasible: tracker on the actor (61:67); the critic also gets the true rope phase (76:84)
+    for grp in ("actor", "critic"):
+      cfg.observations[grp].terms["cam_tip"] = ObservationTermCfg(func=cam_tip_obs)
+    cfg.observations["critic"].terms["rope_phase"] = ObservationTermCfg(func=rope_phase_obs)
   if delta_half:
     cfg.events["sample_delta"] = EventTermCfg(func=sample_delta, mode="reset", params={"half": delta_half})
   return cfg
