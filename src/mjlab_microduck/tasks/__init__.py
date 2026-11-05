@@ -566,8 +566,19 @@ from mjlab_microduck.tasks.ys_follow_env_cfg import make_ys_follow_env_cfg  # no
 
 register_mjlab_task(
     task_id="Mjlab-YsRopeFollow-Flat-MicroDuck",
-    env_cfg=make_ys_follow_env_cfg(sync_w=float(_os.environ.get("YS_SYNC_W", "2.0"))),
-    play_env_cfg=make_ys_follow_env_cfg(play=True, sync_w=float(_os.environ.get("YS_SYNC_W", "2.0"))),
+    env_cfg=make_ys_follow_env_cfg(sync_w=float(_os.environ.get("YS_SYNC_W", "2.0")), age=bool(_os.environ.get("YS_AGE"))),
+    play_env_cfg=make_ys_follow_env_cfg(play=True, sync_w=float(_os.environ.get("YS_SYNC_W", "2.0")), age=bool(_os.environ.get("YS_AGE"))),
     rl_cfg=YsRopeRlCfg,  # experiment ys_rope (rope14 lives there too)
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+# stage 7-4 (3, integration): B1-style jumper + a follower (YS_FOLLOWER ckpt) as the front turner, rope14 leader behind
+_fol = _os.environ.get("YS_FOLLOWER")
+if _fol:
+    register_mjlab_task(
+        task_id="Mjlab-YsTrioJumpFollow-Flat-MicroDuck",
+        env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, follower=_fol),
+        play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, follower=_fol),
+        rl_cfg=YsTrioJumpRlCfg,
+        runner_cls=MicroduckOnPolicyRunner,
+    )

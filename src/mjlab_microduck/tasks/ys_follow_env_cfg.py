@@ -115,13 +115,23 @@ def sync_gap(env, std: float = SYNC_STD) -> torch.Tensor:
   return torch.where(env.episode_length_buf > 50, torch.exp(-(gap / std).square()), 0.0)
 
 
-def make_ys_follow_env_cfg(play: bool = False, offset_half: float = OFFSET_HALF, sync_w: float = 2.0):
+def leader_ball_age_obs(env) -> torch.Tensor:
+  """(N, 1) s since the follower last saw the leader's ball (tracker timestamp; 1 = not for >= 1 s).
+  F1/F2 saw the ball in 15% of steps and, memoryless, could not tell a fresh sighting from a stale
+  held one. Must come after leader_ball (which advances the tracker this step)."""
+  return env._ys_fol_cam["age"][:, None]
+
+
+def make_ys_follow_env_cfg(play: bool = False, offset_half: float = OFFSET_HALF, sync_w: float = 2.0, age: bool = False):
   cfg = make_ys_rope_duo_env_cfg(play, span=T.SPAN)
   act = cfg.actions["partner_joint_pos"]
   cfg.actions["partner_joint_pos"] = LeaderActionCfg(**{k: getattr(act, k) for k in act.__dataclass_fields__ if k != "checkpoint"}, checkpoint=LEADER_CKPT)
   cfg.observations["actor"].terms["head_command"].func = shifted_head_command
   for grp in ("actor", "critic"):  # appended last: actor 61:67, critic 76:82
     cfg.observations[grp].terms["leader_ball"] = ObservationTermCfg(func=leader_ball_obs)
+  if age:  # F3+: actor 67, critic 82
+    for grp in ("actor", "critic"):
+      cfg.observations[grp].terms["leader_ball_age"] = ObservationTermCfg(func=leader_ball_age_obs)
   cfg.events["sample_offset"] = EventTermCfg(func=sample_offset, mode="reset", params={"half": offset_half})
   cfg.rewards["sync_gap"] = RewardTermCfg(func=sync_gap, weight=sync_w)
   return cfg

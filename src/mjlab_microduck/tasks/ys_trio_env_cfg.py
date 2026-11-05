@@ -125,7 +125,7 @@ def _cam_track(env, key: str, site: str, occlude: bool, true_fn=None) -> torch.T
   st = env.__dict__.get(key)
   if st is None:
     st = dict(step=-1, ring=meas(env)[:, None].repeat(1, CAM_LAG[1] + 1, 1),
-              cur=torch.zeros(n, 3, device=dev), prev=torch.zeros(n, 3, device=dev))
+              cur=torch.zeros(n, 3, device=dev), prev=torch.zeros(n, 3, device=dev), age=torch.ones(n, device=dev))
     setattr(env, key, st)
   if st["step"] != env.common_step_counter:
     st["step"] = env.common_step_counter
@@ -138,6 +138,9 @@ def _cam_track(env, key: str, site: str, occlude: bool, true_fn=None) -> torch.T
     m[drop, :2], m[drop, 2] = st["cur"][drop, :2], 0.0
     st["prev"] = torch.where(new[:, None], st["cur"], st["prev"])
     st["cur"] = torch.where(new[:, None], m, st["cur"])
+    seen = new & (m[:, 2] > 0)  # age: s since the last delivered valid sighting (capped 1 s; 1 at reset)
+    st["age"] = torch.where(seen, torch.zeros_like(st["age"]), (st["age"] + env.step_dt).clamp(max=1.0))
+    st["age"][env.episode_length_buf <= 1] = 1.0
   return torch.cat([st["cur"], st["prev"]], -1)
 
 
