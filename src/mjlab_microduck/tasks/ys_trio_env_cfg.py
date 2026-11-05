@@ -181,6 +181,24 @@ class TurnerActionCfg(JointPositionActionCfg):
     return TurnerAction(self, env)
 
 
+class TrioClockCommand(J.JumpClockCommand):
+  """trio5: the jump windows (every clock-based reward) follow the rope, not the jumper's clock.
+  trio3/4 randomized the rope offset but rewarded the clock's windows, so tracking the rope was
+  penalized: trio4's actor ignored its camera (camera zeroed: same clean %). The observed clock is
+  unchanged: only the camera tells the jumper where the windows are."""
+
+  def window(self) -> torch.Tensor:
+    shift = getattr(self._env, "_ys_delta", None)
+    shift = 0.0 if shift is None else shift - DELTA0  # turner phase = clock - delta: a later rope
+    return torch.remainder(self.phase - J.JUMP_PHASE - shift + math.pi, 2 * math.pi) - math.pi
+
+
+@dataclass(kw_only=True)
+class TrioClockCommandCfg(J.JumpClockCommandCfg):
+  def build(self, env):
+    return TrioClockCommand(self, env)
+
+
 def connect_trio(spec: mujoco.MjSpec) -> None:
   for a, b in (("rope/rope_start", "partner/stem_end"), ("rope/rope_end", "turner/stem_end")):
     eq = spec.add_equality(type=mujoco.mjtEq.mjEQ_CONNECT, objtype=mujoco.mjtObj.mjOBJ_SITE, name1=a, name2=b)
@@ -217,7 +235,7 @@ def rope_overlap(env: ManagerBasedRlEnv, cap: float = 0.05) -> torch.Tensor:
   return torch.where(env.episode_length_buf > ROPE_GRACE_STEPS, pen.nan_to_num(0.0) / 0.01, 0.0)
 
 
-def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False):
+def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False):
   cfg = J.make_ys_side_jump_env_cfg(play, half_w=J.SIDE_OVERLAP_HALF_W, both=3.0)  # side6's task
   cfg.commands["head_pose"].zero_command_prob = 0.0  # the rope always turns: always jump
   rc = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)  # turners as in the duo evals (no pushes)
@@ -271,6 +289,9 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     for grp in ("actor", "critic"):
       cfg.observations[grp].terms["cam_tip"] = ObservationTermCfg(func=cam_tip_obs)
     cfg.observations["critic"].terms["rope_phase"] = ObservationTermCfg(func=rope_phase_obs)
+  if rope_windows:
+    c = cfg.commands["head_pose"]
+    cfg.commands["head_pose"] = TrioClockCommandCfg(**{f: getattr(c, f) for f in c.__dataclass_fields__})
   if delta_half:
     cfg.events["sample_delta"] = EventTermCfg(func=sample_delta, mode="reset", params={"half": delta_half})
   return cfg
