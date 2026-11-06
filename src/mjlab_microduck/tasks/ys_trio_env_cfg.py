@@ -216,6 +216,9 @@ class TurnerAction(JointPositionAction):
         sl[:, 4], sl[:, 5] = sl[:, 4] * co - sl[:, 5] * so, sl[:, 5] * co + sl[:, 4] * so
       if amp is not None:
         sl[:, 4:6] *= amp[:, None]
+    stop = self._env.__dict__.get("_ys_amp")  # (N,) 0..1 both turners' circle size (7-8: stop the rope after a hit;
+    if stop is not None:  # rope14 saw circle-off commands 10% of the time in training: zero_command_prob 0.1)
+      sl[:, 4:6] *= stop[:, None]
     x[:, 48:61] = sl
     lock = self._beat.f.lock if self.cfg.beat else None
     if lock is not None and x.shape[1] > 61 and B.AFTER_LOCK == "mask":  # 7-6: camera blocked by the jumper

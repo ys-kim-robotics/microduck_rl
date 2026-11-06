@@ -10,11 +10,18 @@ YS_BEAT_FOLLOWER/YS_BEAT_CAM choose the follower.
 Hit = end (user 2026-11-06): STREAK = rope passes (0.8 s windows from entry) before the first overlap > 0 or a
 jumper fall; a turner restart censors. BEAT_ENTER_PH="deg,..." (leader phase at the put-in; default ENTER_PH) sweeps
 the entry; BEAT_NOREF=1 skips the start-0 reference run. Also prints the leader phase at J's foot events.
+BEAT_WALKIN="y0,ph" (with BEAT_JSTAND): a stand-in walk-in, see WALKIN. BEAT_JSTAND=<onnx>: J switches to that standing policy at the stop. BEAT_STOP="delay,ramp,force": after J's first hit (+ delay s, J's call to the turners' ears) both turners' circle
+command ramps to 0 over ramp s and stays there (env._ys_amp); envs not hit by force s stop then. Reports L/F falls and
+the rope's speed after the stop, and the first 5 s of it per env.
 BEAT_LOAD=1: per-joint actuator torque of J / L / F from J's entry + 0.5 s (p99, max, rms vs the BAM xl330 stall).
 Also importable: away(env), enter(env) for videos."""
 import sys, math, os; sys.path.insert(0, "scripts")
 import numpy as np, torch
 T_ENTER, AWAY, EPISODE = 6.0, (0.0, 0.8, 0.0), 30.0  # s, m, s (trained at 20 s: longer to see after convergence)
+WALKIN = tuple(float(v) for v in os.environ["BEAT_WALKIN"].split(",")) if os.environ.get("BEAT_WALKIN") else None
+# BEAT_WALKIN="y0,ph": J waits standing (BEAT_JSTAND policy, not pinned) y0 m to the side and at leader phase ph (deg)
+# from T_ENTER switches to its jumper policy, whose centering command (twist = 2/s x offset to the spot) brings it in
+if WALKIN: AWAY = (0.0, WALKIN[0], 0.0)
 OMEGA_DT = 2 * math.pi * 1.25 * 0.02  # rad of rope per step
 ENTER_PH = math.radians(225)  # rad, leader phase at the put-in: the rope just passed (scn_v2_sweep.eval: standing
 # put-in, 1st pass hit 63% here vs 89-100% elsewhere; was 154, the left landing: 100%)
@@ -24,6 +31,16 @@ BANK_OUT, BANK_IN = os.environ.get("BEAT_BANK_OUT"), os.environ.get("BEAT_BANK_I
 # entry; else: put it in with that state (already jumping: a stand-in for walking in) instead of standing
 
 LOAD = os.environ.get("BEAT_LOAD") == "1"
+STOP = tuple(float(v) for v in os.environ["BEAT_STOP"].split(",")) if os.environ.get("BEAT_STOP") else None
+JSTAND = os.environ.get("BEAT_JSTAND")  # with BEAT_STOP: J switches to this 61-D ONNX (e.g. policies/velstand.onnx) at the stop
+
+
+def jstand(x):
+  """(n, 73) J actor obs -> (n, 14) actions of the standing ONNX: its 61-D layout, the command block zeroed (stand still)."""
+  import onnxruntime as ort
+  if "sess" not in jstand.__dict__: jstand.sess = ort.InferenceSession(JSTAND)
+  z = x[:, :61].clone(); z[:, 48:61] = 0.0; z = z.cpu().numpy().astype(np.float32)
+  return torch.from_numpy(np.concatenate([jstand.sess.run(None, {"obs": z[i: i + 1]})[0] for i in range(len(z))])).to(x.device)
 KT, R_OHM, V_NOM, I_MAX = 0.366, 2.811, 7.4, 1.75  # bam/params/xl330/m6.json; battery DR 6.5-8.2 V; firmware current
 # limit (bam/dynamixel/actuator.py max_current): |tau| <= KT * I_MAX = 0.64 N m whatever the voltage
 
@@ -49,6 +66,32 @@ def print_load(tau, inn, names, settle):
     print(f"  {w}: worst p99 {q.max():.3f} N m ({names[int(q.argmax())]}), any joint at the cap {100 * (x.max(-1).values >= 0.98 * cap).float().mean():.1f}% of play, hottest motor I2R {heat.max():.2f} W ({names[int(heat.argmax())]}), all {heat.sum():.1f} W")
 
 
+def print_stop(S, dt, win=5.0):
+  """S (T, N, 14): time since the stop began, rope middle speed, L fallen, F fallen, J gravity z, restart,
+  J left/right sole z (m), L stem end xyz, F stem end xyz."""
+  T_, N_ = S.shape[:2]; rows, curves = [], []
+  for n in range(N_):
+    k0 = np.flatnonzero(S[:, n, 0] >= 0)
+    if not len(k0): continue
+    k0 = k0[0]; k1 = min(T_, k0 + int(win / dt)); seg = S[k0:k1, n]
+    if S[k0:k1, n, 5].any(): seg = seg[: int(np.argmax(S[k0:k1, n, 5]))]  # an episode restart (a turner down) ends it
+    if len(seg) < int(win / dt): rows.append((True, None, len(seg) * dt)); continue  # ran out or restarted
+    still = seg[:, 1] < 0.1; settle = next((i * dt for i in range(len(seg)) if still[i:].all()), np.inf)
+    rows.append((bool(seg[:, 2].any() or seg[:, 3].any()), settle, None)); curves.append(seg[:, 1])
+  full = [r for r in rows if r[2] is None]; cut = [r for r in rows if r[2] is not None]
+  st = np.array([r[1] for r in full]); fell = np.array([r[0] for r in full])
+  C = np.array(curves) if curves else np.zeros((0, 1))
+  print(f"  STOP: {len(full)} envs with a full {win:.0f} s after the stop ({len(cut)} cut short by the episode end or a restart: {sum(1 for r in cut if r[0])})")
+  print(f"  turner fell within {win:.0f} s: {100 * fell.mean():.0f}%   rope still (< 0.1 m/s for good) after p50 {np.median(st):.1f} s, p90 {np.percentile(st, 90):.1f} s, never {100 * np.isinf(st).mean():.0f}%")
+  if len(C): print("  rope middle speed m/s p50 at +0/0.5/1/2/3/5 s: " + " ".join(f"{np.median(C[:, min(int(t / dt), C.shape[1] - 1)]):.2f}" for t in (0, 0.5, 1, 2, 3, 4.98)))
+  hop = []  # J after the stop: highest sole in each second (mm)
+  for n in range(N_):
+    k0 = np.flatnonzero(S[:, n, 0] >= 0)
+    if len(k0) and k0[0] + int(win / dt) <= T_ and not S[k0[0]: k0[0] + int(win / dt), n, 5].any():
+      seg = S[k0[0]: k0[0] + int(win / dt), n, 6:8].min(1) * 1000; hop.append([seg[int(i / dt): int((i + 1) / dt)].max() for i in range(int(win))])
+  if hop: print("  J's lower sole, max per second after the stop (mm) p50: " + " ".join(f"{v:.0f}" for v in np.median(hop, 0)) + f"  (>= 15 mm = still hopping: {100 * (np.array(hop)[:, -1] >= 15).mean():.0f}% in the last second)")
+
+
 def patch_cfg():  # the jumper may fall while it waits outside: drop its terminations
   import ys_eval
   orig = ys_eval.load_env_cfg
@@ -65,6 +108,7 @@ def away(env):
   env._ys_spot = torch.cat([rob.data.root_link_pos_w, rob.data.root_link_quat_w], 1).clone()
   st = torch.cat([env._ys_spot, torch.zeros(env.num_envs, 6, device=env.device)], 1); st[:, :3] += torch.tensor(AWAY, device=env.device)
   if not INPLACE: rob.write_root_state_to_sim(st)
+  if WALKIN: env._ys_walk_ph = math.radians(WALKIN[1])
   if BANK_IN: env._ys_bank = torch.load(BANK_IN, map_location=env.device, weights_only=False)
   env._ys_in = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
   env._ys_tin = torch.full((env.num_envs,), math.inf, device=env.device)
@@ -78,12 +122,12 @@ def enter(env):
   fresh = env.episode_length_buf == 0
   done[fresh] = False; env._ys_tin[fresh] = math.inf
   out = (~done).nonzero()[:, 0]  # still waiting: held standing where it waits (a statue, not a policy at the side)
-  if len(out) and not INPLACE:
+  if len(out) and not INPLACE and not WALKIN:
     st = torch.cat([env._ys_spot[out], torch.zeros(len(out), 6, device=env.device)], 1); st[:, :3] += torch.tensor(AWAY, device=env.device)
     rob.write_root_state_to_sim(st, out)
     rob.write_joint_state_to_sim(rob.data.default_joint_pos[out].clone(), torch.zeros_like(rob.data.default_joint_pos[out]), env_ids=out)
   lead = env.command_manager.get_term("head_pose").phase - getattr(env, "_ys_delta", math.radians(60))
-  ids = (~done & (te >= T_ENTER) & (torch.remainder(lead - ENTER_PH, 2 * math.pi) < OMEGA_DT)).nonzero()[:, 0]
+  ids = (~done & (te >= T_ENTER) & (torch.remainder(lead - (env._ys_walk_ph if WALKIN else ENTER_PH), 2 * math.pi) < OMEGA_DT)).nonzero()[:, 0]
   env._ys_tin[ids] = te[ids]
   if len(ids) and INPLACE and BANK_OUT:
     if not hasattr(env, "_ys_bank"):
@@ -94,7 +138,7 @@ def enter(env):
       for f, v in env.__dict__.get(key, {}).items():
         if torch.is_tensor(v) and v.shape[:1] == (env.num_envs,):
           env._ys_bank.setdefault(f"{key}.{f}", torch.zeros_like(v))[ids] = v[ids]
-  if len(ids) and not INPLACE:
+  if len(ids) and not INPLACE and not WALKIN:
     if BANK_IN:
       bk = env._ys_bank
       rob.write_root_state_to_sim(torch.cat([bk["pos"][ids] + env.scene.env_origins[ids], bk["quat"][ids], bk["lin"][ids], bk["ang"][ids]], 1), ids)
@@ -131,7 +175,7 @@ if __name__ == "__main__":
   ref = None; PHS = [math.radians(float(v)) for v in os.environ["BEAT_ENTER_PH"].split(",")] if os.environ.get("BEAT_ENTER_PH") else [ENTER_PH]
   RUNS = [(ph, X) for ph in PHS for X in STARTS]
   for ENTER_PH, X in RUNS:
-    globals()["ENTER_PH"] = ENTER_PH; ins, fj, rs, sole, leads, taus = [], [], [], [], [], []
+    globals()["ENTER_PH"] = ENTER_PH; ins, fj, rs, sole, leads, taus, stops = [], [], [], [], [], [], []
     fell = torch.zeros(N, 3, dtype=torch.bool, device=dev); ce, gap, pen, vis = [], [], [], []
     with torch.inference_mode():
       if os.environ.get("SEED"): torch.manual_seed(int(os.environ["SEED"])); torch.cuda.manual_seed_all(int(os.environ["SEED"]))
@@ -141,7 +185,27 @@ if __name__ == "__main__":
       off0 = env._ys_off.clone(); dsg = torch.where(torch.rand(N, device=dev) < 0.5, -1.0, 1.0)
       for k in range(int(SECS / dt)):
         enter(env)
-        cmd.amp[:] = 1.0; cmd.freq[:] = 1.25; cmd._write(); obs, *_ = venv.step(pol(obs))
+        if STOP:  # the turners stop: J's first hit (+ its call's delay) or the forced time
+          te = env.episode_length_buf * dt
+          if k == 0: t_stop = torch.full((N,), STOP[2], device=dev); hit_t = torch.full((N,), math.inf, device=dev)
+          t_stop = torch.where(env.episode_length_buf == 0, STOP[2], t_stop); hit_t = torch.where(env.episode_length_buf == 0, math.inf, hit_t)
+          env._ys_amp = (1 - (te - t_stop) / max(STOP[1], dt)).clamp(0, 1)
+        act_j = pol(obs)
+        if WALKIN:  # still waiting: standing on its own beside the rope
+          m = (~env._ys_in).nonzero()[:, 0]
+          if len(m): act_j[m] = jstand(obs["actor"][m])
+        if STOP and JSTAND:  # J stops too: from the stop, its actions come from a standing policy (zero command)
+          m = (env.episode_length_buf * dt >= t_stop).nonzero()[:, 0]
+          if len(m): act_j[m] = jstand(obs["actor"][m])
+        cmd.amp[:] = 1.0; cmd.freq[:] = 1.25; cmd._write(); obs, *_ = venv.step(act_j)
+        if STOP:
+          te = env.episode_length_buf * dt; ov_now = (T.rope_overlap(env) > 0) | (rob.data.projected_gravity_b[:, 2] > -0.5)
+          new = env._ys_in & ov_now & hit_t.isinf() & (te > env._ys_tin + 0.04)
+          hit_t = torch.where(new, te, hit_t); t_stop = torch.minimum(t_stop, hit_t + STOP[0])
+          rope_e = env.scene["rope"]; rv = rope_e.data.body_link_lin_vel_w[:, rope_e.data.body_link_lin_vel_w.shape[1] // 2].norm(dim=-1)
+          stops.append(torch.stack([te - t_stop, rv, (tu.data.projected_gravity_b[:, 2] > -0.5).float(), (pa.data.projected_gravity_b[:, 2] > -0.5).float(),
+                                    env.scene["robot"].data.projected_gravity_b[:, 2].clone(), (env.episode_length_buf == 0).float(),
+                                    *(J.foot_clearance(rob, cmd._sole) + J.FOOT_Z0).T, *tu.data.site_pos_w[:, si].T, *pa.data.site_pos_w[:, sj].T], 1))
         re = env.episode_length_buf == 0  # restarted: a new start (sound: a new draw; fixed X: the same offset)
         env._ys_off[re] = (B.start_offset(int(re.sum()), dev) if ear else off0[re])
         env._ys_off += dsg * DRIFT * dt - (torch.rand(N, device=dev) < SLIP * dt).float() * B.OMEGA * dt
@@ -198,6 +262,9 @@ if __name__ == "__main__":
       v = ev(x, up); mu = np.degrees(np.angle(np.exp(1j * np.radians(v)).mean())); sd = np.degrees(np.std(np.angle(np.exp(1j * np.radians(v - mu)))))
       print(f"  leader phase at {nm}: mean {mu:6.1f} deg  sd {sd:4.1f}  (n {len(v)})")
     if LOAD: print_load(torch.stack(taus), torch.stack(ins), rob.joint_names, int(0.5 / dt))
+    if STOP:
+      SS = torch.stack(stops).cpu().numpy(); print_stop(SS, dt)
+      if os.environ.get("BEAT_STOP_NPZ"): np.savez(os.environ["BEAT_STOP_NPZ"], S=SS, dt=dt)
     ph_s = "MU_LAND" if ENTER_PH is None else f"{math.degrees(ENTER_PH):.0f}"
     print(f"enter {ph_s} start {X}: STREAK (hit=end) median {np.median(stk):4.1f}  mean {stk.mean():4.1f}  >=10 {100 * (stk >= 10).mean():3.0f}%  >=20 {100 * (stk >= 20).mean():3.0f}%"
           f"  hit in passes 1-3 {100 * (hit & (stk < 3)).mean():3.0f}%  1st pass {100 * (hit & (stk == 0)).mean():3.0f}%  no hit to end {100 * (~hit).mean():3.0f}% (max ~{full})", flush=True)

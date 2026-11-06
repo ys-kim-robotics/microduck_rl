@@ -30,7 +30,8 @@ def record(ckpt, d, secs):
   TASK = "Mjlab-YsTrioJumpBeat-Flat-MicroDuck"
   cfg = ys_eval.load_env_cfg(TASK, play=True)
   for k in ("sample_delta", "sample_offset"): cfg.events.pop(k)
-  cfg.scene.num_envs, cfg.seed = 1, 0; ys_eval.fix_command(cfg, (0., 0., 0.)); cfg.viewer.height, cfg.viewer.width = H_, W_
+  cfg.scene.num_envs, cfg.seed = 1, int(os.environ.get("SEED", 0))  # startup DR (battery, friction, encoder bias, mass) varies with SEED too
+  ys_eval.fix_command(cfg, (0., 0., 0.)); cfg.viewer.height, cfg.viewer.width = H_, W_
   env = ys_eval.ManagerBasedRlEnv(cfg=cfg, device="cuda:0", render_mode="rgb_array")
   venv = ys_eval.RslRlVecEnvWrapper(env, clip_actions=ys_eval.load_rl_cfg(TASK).clip_actions)
   pol = ys_eval.make_policy(TASK, ckpt, venv)
@@ -81,12 +82,22 @@ def record(ckpt, d, secs):
 
   os.makedirs(d, exist_ok=True)
   out = imageio.get_writer(f"{d}/raw.mp4", fps=FPS, codec="libx264", quality=9, macro_block_size=8)
-  K = ("t", "lead", "err", "soleL", "soleR", "rope_z", "rope_y", "clrL", "clrR", "inn", "emit", "jfell", "restart", "lab", "el", "az")
+  K = ("t", "amp", "lead", "err", "soleL", "soleR", "rope_z", "rope_y", "clrL", "clrR", "inn", "emit", "jfell", "restart", "lab", "el", "az")
   rec = {k: [] for k in K}; obs = venv.get_observations(); delta = getattr(env, "_ys_delta", math.radians(60))
   with torch.inference_mode():
+    STOP = tuple(float(v) for v in os.environ["STOP"].split(",")) if os.environ.get("STOP") else None  # delay, ramp, force (s)
+    t_stop, t_hit = (STOP[2] if STOP else math.inf), math.inf
     for k in range(int(secs / dt)):
       beat_scn.enter(env)
-      cmd.amp[:] = 1.0; cmd.freq[:] = 1.25; cmd._write(); obs, *_ = venv.step(pol(obs))
+      if STOP:  # J's end call at its first hit -> both turners' circle ramps to 0 (ys_trio_scn BEAT_STOP)
+        env._ys_amp = torch.full((1,), min(1.0, max(0.0, 1 - (k * dt - t_stop) / max(STOP[1], dt))), device=env.device)
+      act_j = pol(obs)
+      if STOP and beat_scn.JSTAND and k * dt >= t_stop: act_j = beat_scn.jstand(obs["actor"])  # J stands (BEAT_JSTAND onnx)
+      cmd.amp[:] = 1.0; cmd.freq[:] = 1.25; cmd._write(); obs, *_ = venv.step(act_j)
+      if STOP and math.isinf(t_hit) and bool(env._ys_in[0]) and k * dt > float(env._ys_tin[0]) + 0.04:
+        if float(T.rope_overlap(env)[0]) > 0 or float(rob.data.projected_gravity_b[0, 2]) > -0.5:
+          t_hit = k * dt; t_stop = min(t_stop, t_hit + STOP[0])
+      rec["amp"].append(float(env._ys_amp[0]) if STOP else 1.0)
       t_, inn = k * dt, bool(env._ys_in[0]); lead = float(B.wrap(cmd.phase - delta)[0])
       past = (lead - B.BEEP_PH) % (2 * math.pi)  # J calls on its own clock as it passes BEEP_PH (its right-foot lift)
       rec["emit"].append(t_ - past / B.OMEGA if inn and past < B.OMEGA * dt else math.nan)
@@ -114,17 +125,17 @@ def run_end(D):
 
 
 VOICE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ys_voice")  # runtime/sounds: sounds render <tag> <out.wav> --seed 1 --variant v
-START_WAV, PECK_WAV = f"{VOICE}/greet_0.wav", f"{VOICE}/peck_2.wav"
+START_WAV, PECK_WAV, END_WAV = f"{VOICE}/greet_0.wav", f"{VOICE}/peck_2.wav", f"{VOICE}/alarm_0.wav"
 TXT = {
   "ko": dict(steps=["① J의 시작 소리 → 셋이 같은 시계로 출발", "② L·F 줄 돌리기 (J는 옆에서 대기)", "③ J 입장 (줄이 막 지나간 순간)", "④ J는 오른발 들 때마다 '톡' · 걸리면 끝"],
-             hit_step="걸림 → 끝", L="L (리더)", F="F (팔로워)", J="J (점퍼)", call="시작 소리!", peck="톡!",
+             hit_step="걸림 → 끝", stop_step="⑤ 걸림! J의 끝 소리 → L·F 멈춤", L="L (리더)", F="F (팔로워)", J="J (점퍼)", call="시작 소리!", peck="톡!",
              info="t {t:4.1f} s    연속 {k}번    F 시계 (L 대비) {e:+.0f}°", info0="t {t:4.1f} s    F 시계 (L 대비) {e:+.0f}°", eye="J의 눈: L 머리(●)는 상자 안에", card="0.5배속 슬로모션 + 실시간 그래프", slow="0.5배속",
              gF="J의 발과 줄 (J 위치)", gF_l=("왼발 바닥", "오른발 바닥", "줄 윗면 (발 아래)", "걸림"), gF_y="높이 (mm)", wait="J 대기 중",
              gA="점프마다 발-줄 여유 (mm)", gA_l=("왼발", "오른발"), gA_x="점프 (입장 후)", gA_0="0 = 닿음",
              gC="J 위치의 줄 단면 (L 쪽에서 봄)", gC_x="옆 (mm)", gC_y="높이 (mm)", gC_feet="J 발", gC_head="J 머리 높이",
              gD="세 시계", gD_l=("L 리더", "F 팔로워", "J 점퍼"), gD_v=("{:.0f}°", "L {:+.0f}°", "L +0°"), gD_b="▼ J 소리 위치", font_mpl=NAN_R),
   "en": dict(steps=["① J's start call → all three start one clock", "② L and F turn the rope (J waits aside)", "③ J steps in (right after the rope passes)", "④ J pecks on every right-foot lift · a hit ends it"],
-             hit_step="hit → over", L="L (leader)", F="F (follower)", J="J (jumper)", call="start call!", peck="peck!",
+             hit_step="hit → over", stop_step="⑤ hit! J's end call → L and F stop", L="L (leader)", F="F (follower)", J="J (jumper)", call="start call!", peck="peck!",
              info="t {t:4.1f} s    streak {k}    F clock vs L {e:+.0f}°", info0="t {t:4.1f} s    F clock vs L {e:+.0f}°", eye="J's eye: L's head (●) inside the box", card="0.5x slow motion + live graphs", slow="0.5x",
              gF="J's feet and the rope (at J)", gF_l=("left sole", "right sole", "rope top (under the feet)", "hit"), gF_y="height (mm)", wait="J waiting",
              gA="clearance per jump (mm)", gA_l=("left foot", "right foot"), gA_x="jump (after entry)", gA_0="0 = touch",
@@ -150,7 +161,8 @@ def compose(d, lang, outp):
     fm.fontManager.addfont(X["font_mpl"]); plt.rcParams["font.family"] = fm.FontProperties(fname=X["font_mpl"]).get_name()
   plt.rcParams["axes.unicode_minus"] = False
   fB, fM, fS = ImageFont.truetype(NAN_B, 34), ImageFont.truetype(NAN_B, 24), ImageFont.truetype(NAN_R, 17)
-  i0, hit, _ = run_end(D); n = len(t) if hit is None else min(len(t), hit + int(1.0 / dt))  # a hit: show 1 s more, then end
+  i0, hit, _ = run_end(D); stopm = "amp" in D.files and D["amp"].min() < 1.0  # stop mode: show the turners stopping
+  n = len(t) if hit is None else min(len(t), hit + int((5.0 if stopm else 1.0) / dt))  # a hit: show 1 s (stop: 5 s) more
   t_in = t[i0]; emit = D["emit"][~np.isnan(D["emit"])]; emit = emit[emit < t[n - 1]]
   streak = lambda i: max(0, min(i, hit if hit is not None else i) - i0) // 40 if i >= i0 else 0
   clr = np.stack([D["clrL"], D["clrR"]]) * 1000; npass = (len(t) - i0) // 40  # pass k = steps i0+40k .. i0+40(k+1)
@@ -172,7 +184,7 @@ def compose(d, lang, outp):
     tag(dr, lj, jt, (255, 220, 60) if (ti < 0.6 or se < 0.25) else (255, 255, 255), fmid, s)
     tag(dr, ll, X["L"], (255, 110, 110), fmid, s); tag(dr, lf, X["F"], (120, 255, 140), fmid, s)
     over = hit is not None and i >= hit
-    step = X["hit_step"] if over else X["steps"][0 if ti < 0.8 else 1 if not D["inn"][i] else 2 if ti < t_in + 1.6 else 3]
+    step = (X["stop_step"] if stopm else X["hit_step"]) if over else X["steps"][0 if ti < 0.8 else 1 if not D["inn"][i] else 2 if ti < t_in + 1.6 else 3]
     bw = dr.textbbox((0, 0), step, font=fbig)[2]; dr.rounded_rectangle((12, 12, 12 + bw + 24, 12 + fbig.size + 22), 10, fill=(170, 30, 30, 200) if over else (0, 0, 0, 160)); dr.text((24, 18), step, font=fbig, fill=(255, 255, 255))
     if info:
       s_ = X["info"].format(t=ti, k=streak(i), e=D["err"][i]) if D["inn"][i] else X["info0"].format(t=ti, e=D["err"][i]); bw = dr.textbbox((0, 0), s_, font=fmid)[2]
@@ -246,6 +258,7 @@ def compose(d, lang, outp):
     lL.set_data(ts, sole[0, s0: i + 1]); lR.set_data(ts, sole[1, s0: i + 1]); lP.set_data(ts, rope_show[s0: i + 1])
     hh = bad[s0: i + 1]; lH.set_data(ts[hh], np.full(hh.sum(), 3.0)); axF.set_xlim(ti - 2.4, ti + 0.05); wF.set_visible(not D["inn"][i]); wA.set_visible(not D["inn"][i])
     done = 0 if i < i0 else min(npass, (i - i0) // 40 + (1 if hit is not None and i >= hit else 0))
+    if hit is not None: done = min(done, (hit - i0) // 40 + 1)  # hit = end: no bars for the passes after it
     for k in range(done):
       if k in bars: continue
       for j, dx, col in ((0, -0.2, "#4aa3ff"), (1, 0.2, "#ff9f40")):
@@ -282,6 +295,7 @@ def compose(d, lang, outp):
     j0 = int(at * sr); track[j0: j0 + len(s_)] += s_[: max(0, len(track) - j0)]
   for base, k in ((0.0, 1.0), (n * dt + CARD2, 2.0)):
     put(base, call)
+    if stopm and hit is not None: put(base + k * t[hit], 0.8 * wav48(END_WAV))
     for ts in emit: put(base + k * ts, peck)
   wav = outp.replace(".mp4", ".wav")
   with wave.open(wav, "wb") as w:
