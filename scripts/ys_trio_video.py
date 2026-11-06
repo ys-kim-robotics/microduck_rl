@@ -102,6 +102,7 @@ def record(ckpt, d, secs):
         sa = env._ys_amp.clone() if STOP else None; t_start = beat_scn.walkout_pre(env, WS)
         if STOP: env._ys_amp = torch.minimum(env._ys_amp, sa)  # the start ramp and the stop ramp together
       act_j = pol(obs)
+      if beat_scn.JWALK and not bool(env._ys_jwalk[0, 0].isnan()): act_j = beat_scn.jstand(obs["actor"], env._ys_jwalk)  # J walks in (velstand)
       if STOP and beat_scn.JSTAND and k * dt >= t_stop: act_j = beat_scn.jstand(obs["actor"])  # J stands (BEAT_JSTAND onnx)
       cmd.amp[:] = 1.0; cmd.freq[:] = 1.25; cmd._write(); obs, *_ = venv.step(act_j)
       if STOP and math.isinf(t_hit) and bool(env._ys_in[0]) and k * dt > float(env._ys_tin[0]) + 0.04:
@@ -145,7 +146,7 @@ VOICE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ys_voice")  # 
 START_WAV, PECK_WAV, END_WAV = f"{VOICE}/greet_0.wav", f"{VOICE}/peck_2.wav", f"{VOICE}/alarm_0.wav"
 TXT = {
   "ko": dict(steps=["① J의 시작 소리 → 셋이 같은 시계로 출발", "② L·F 줄 돌리기 (J는 옆에서 대기)", "③ J 입장 (줄이 막 지나간 순간)", "④ J는 오른발 들 때마다 '톡' · 걸리면 끝"],
-             wsteps=["① 바깥 거치대에서 L·F가 손잡이를 묾", "② 조금 뒤로", "③ 작업 위치 쪽으로 돌기", "④ 앞으로 걸어 작업 위치로", "⑤ 다시 마주 보기", "⑥ L 뒷걸음 (거리: odometry)", "⑦ F 뒷걸음 (L의 공 크기로 간격 맞춤)", "⑧ 안정될 때까지 대기"], tfell="줄 돌리는 오리가 넘어짐 (실패)",
+             wsteps=["① 바깥 거치대에서 L·F가 손잡이를 묾", "② 조금 뒤로", "③ 작업 위치 쪽으로 돌기", "④ 앞으로 걸어 작업 위치로", "⑤ 다시 마주 보기", "⑥ L 뒷걸음 (거리: odometry)", "⑦ F 뒷걸음 (L의 공 크기로 간격 맞춤)", "⑧ 안정될 때까지 대기"], tfell="줄 돌리는 오리가 넘어짐 (실패)", jstep="⑨ 줄이 멈춰 있는 동안 J가 자리로 걸어 들어감",
              hit_step="걸림 → 끝", stop_step="⑤ 걸림! J의 끝 소리 → L·F 멈춤", L="L (리더)", F="F (팔로워)", J="J (점퍼)", call="시작 소리!", peck="톡!",
              info="t {t:4.1f} s    연속 {k}번    F 시계 (L 대비) {e:+.0f}°", info0="t {t:4.1f} s    F 시계 (L 대비) {e:+.0f}°", eye="J의 눈: L 머리(●)는 상자 안에", card="0.5배속 슬로모션 + 실시간 그래프", slow="0.5배속",
              gF="J의 발과 줄 (J 위치)", gF_l=("왼발 바닥", "오른발 바닥", "줄 윗면 (발 아래)", "걸림"), gF_y="높이 (mm)", wait="J 대기 중",
@@ -153,7 +154,7 @@ TXT = {
              gC="J 위치의 줄 단면 (L 쪽에서 봄)", gC_x="옆 (mm)", gC_y="높이 (mm)", gC_feet="J 발", gC_head="J 머리 높이",
              gD="세 시계", gD_l=("L 리더", "F 팔로워", "J 점퍼"), gD_v=("{:.0f}°", "L {:+.0f}°", "L +0°"), gD_b="▼ J 소리 위치", font_mpl=NAN_R),
   "en": dict(steps=["① J's start call → all three start one clock", "② L and F turn the rope (J waits aside)", "③ J steps in (right after the rope passes)", "④ J pecks on every right-foot lift · a hit ends it"],
-             wsteps=["① L and F bite their handles at the holder outside", "② back off a little", "③ turn toward the work line", "④ walk forward to the work line", "⑤ face each other again", "⑥ L backs out (distance: odometry)", "⑦ F backs out until L's ball looks right", "⑧ wait until both stand still"], tfell="a turning duck fell (failure)",
+             wsteps=["① L and F bite their handles at the holder outside", "② back off a little", "③ turn toward the work line", "④ walk forward to the work line", "⑤ face each other again", "⑥ L backs out (distance: odometry)", "⑦ F backs out until L's ball looks right", "⑧ wait until both stand still"], tfell="a turning duck fell (failure)", jstep="⑨ J walks to its spot while the rope is still",
              hit_step="hit → over", stop_step="⑤ hit! J's end call → L and F stop", L="L (leader)", F="F (follower)", J="J (jumper)", call="start call!", peck="peck!",
              info="t {t:4.1f} s    streak {k}    F clock vs L {e:+.0f}°", info0="t {t:4.1f} s    F clock vs L {e:+.0f}°", eye="J's eye: L's head (●) inside the box", card="0.5x slow motion + live graphs", slow="0.5x",
              gF="J's feet and the rope (at J)", gF_l=("left sole", "right sole", "rope top (under the feet)", "hit"), gF_y="height (mm)", wait="J waiting",
@@ -209,6 +210,7 @@ def compose(d, lang, outp):
     if tfell: step = X["tfell"]
     elif over: step = X["stop_step"] if stopm else X["hit_step"]
     elif wph < 8: step = X["wsteps"][wph]
+    elif wph == 9: step = X["jstep"]
     else: step = X["steps"][0 if ti < tst + 0.8 else 1 if not D["inn"][i] else 2 if ti < t_in + 1.6 else 3]
     bw = dr.textbbox((0, 0), step, font=fbig)[2]; dr.rounded_rectangle((12, 12, 12 + bw + 24, 12 + fbig.size + 22), 10, fill=(170, 30, 30, 200) if over else (0, 0, 0, 160)); dr.text((24, 18), step, font=fbig, fill=(255, 255, 255))
     if info:

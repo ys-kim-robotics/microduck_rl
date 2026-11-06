@@ -44,7 +44,8 @@ DELTA0 = math.radians(60)  # jumper clock - turner phase (ys_trio sweep, side6 f
 JUMPER_Y = 0.08  # ys_trio's spot y -80 mm, in the rotated frame the turners sit at -0.08 from the jumper
 FOOT_BANDS = ((0.020, 0.064), (-0.065, -0.018))  # (left, right) sole y extents, jumper frame (side.py)
 HEAD_TOP = 0.17  # rope above this passes over the head
-ROPE_GRACE_STEPS = 100  # 2 s: the rope spins up after a reset
+ROPE_GRACE_STEPS = int(__import__("os").environ.get("YS_ROPE_GRACE", "100"))  # 2 s: the rope spins up after a reset. E4 (7-11):
+# 15 (0.3 s) so the spin-up's first passes count: G1 never had to clear them (J walks in before the rope turns, user task 1)
 
 
 def turner_slots(env) -> torch.Tensor:
@@ -417,6 +418,7 @@ _E2 = _os.environ.get("YS_ENTER_V", "2") == "2"
 # level), set off at 140-170 deg, 6/s up to 0.8 m/s; 20% of episodes start at the spot (keeps the in-place jump).
 ENTER_Y, ENTER_RAMP = (0.20, 0) if _E2 else (0.25, 200)  # m: farthest waiting place (+y); iterations to widen U[.., y] to it
 ENTER_YMIN, ENTER_NEAR_P = (0.12, 0.2) if _E2 else (0.0, 0.0)  # far waits from ENTER_YMIN; share of episodes at the spot
+ENTER_NEAR_P = float(_os.environ.get("YS_ENTER_NEAR_P", ENTER_NEAR_P))  # E4: 1.0, J at its spot from the reset (stay_g1 anchor only)
 ENTER_PH = tuple(math.radians(v) for v in ((140, 170) if _E2 else (120, 200)))  # leader phase to set off
 ENTER_GAIN, ENTER_VMAX, ENTER_NEAR = (6.0, 0.8, 0.03) if _E2 else (4.0, 0.6, 0.03)  # 1/s, m/s, m: walk-in command
 ENTER_WAIT = (2.5, 4.0)  # s: earliest set-off (the rope has spun up: ROPE_GRACE_STEPS 2 s)
@@ -589,7 +591,9 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     cfg.events["sample_delta"] = EventTermCfg(func=sample_delta, mode="reset", params={"half": delta_half})
   if enter:  # 7-9 walk-in, warm from the accepted jumper `enter` (its actions anchor the in-place motion)
     cfg.events["enter_reset"] = EventTermCfg(func=enter_reset, mode="reset", params={"full": play})
-    cfg.rewards["stay_g1"] = RewardTermCfg(func=stay_g1, weight=-enter_w, params={"ckpt": enter, "waiting": enter3})
+    cfg.rewards["stay_g1"] = RewardTermCfg(func=stay_g1, weight=-enter_w, params={"ckpt": enter, "waiting": enter3 and _os.environ.get("YS_ENTER3_WAIT", "0") == "1"})
+    # E3 (anchored while waiting too, from G1): falls 5x E1's, episode length stuck ~300 by 250 iterations (G1 falls 77%
+    # while waiting, so anchoring there anchors a faller); E3b: from E1@13199, anchor at the spot only
     if enter3:  # E3 (user 2026-11-06 (a)(b)(c)): hurry in, clear the first passes, anchored harder (enter_w 3)
       cfg.rewards["enter_approach"] = RewardTermCfg(func=enter_approach, weight=2.0)
       cfg.rewards["enter_clear"] = RewardTermCfg(func=enter_clear, weight=3.0)
