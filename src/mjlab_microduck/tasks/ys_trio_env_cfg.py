@@ -468,6 +468,13 @@ def enter_hook(cmd):
   return off, torch.where(walk, ENTER_GAIN, J.CENTER_GAIN), torch.where(walk, ENTER_VMAX, 0.3)
 
 
+def rope_overlap_early(env, t0: float = 0.3, t1: float = 3.0) -> torch.Tensor:
+  """7-11 E5: rope_overlap in the spin-up only (t0..t1 s after the reset): ~10% of an episode, so E4's plain
+  overlap barely moved (-0.35 flat over 300 it) while J walking in first is hit there 92% (passes 1-3)."""
+  t = env.episode_length_buf * env.step_dt
+  return rope_overlap(env) * ((t >= t0) & (t < t1))
+
+
 def enter_approach(env, v_full: float = 0.5) -> torch.Tensor:
   """7-9 E3 (user (a): hurry in): speed toward the spot (m/s, / v_full, clamped 0..1) from set-off until arrival: E1/E2
   took 0.50-0.58 s from 12-20 cm and the rope is back at the feet ~0.5 s after the set-off."""
@@ -594,6 +601,8 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     cfg.rewards["stay_g1"] = RewardTermCfg(func=stay_g1, weight=-enter_w, params={"ckpt": enter, "waiting": enter3 and _os.environ.get("YS_ENTER3_WAIT", "0") == "1"})
     # E3 (anchored while waiting too, from G1): falls 5x E1's, episode length stuck ~300 by 250 iterations (G1 falls 77%
     # while waiting, so anchoring there anchors a faller); E3b: from E1@13199, anchor at the spot only
+    if float(_os.environ.get("YS_EARLY_W", "0")) > 0:  # E5: the spin-up's overlap, extra (x YS_EARLY_W of rope_overlap's -3)
+      cfg.rewards["rope_overlap_early"] = RewardTermCfg(func=rope_overlap_early, weight=-3.0 * float(_os.environ["YS_EARLY_W"]))
     if enter3:  # E3 (user 2026-11-06 (a)(b)(c)): hurry in, clear the first passes, anchored harder (enter_w 3)
       cfg.rewards["enter_approach"] = RewardTermCfg(func=enter_approach, weight=2.0)
       cfg.rewards["enter_clear"] = RewardTermCfg(func=enter_clear, weight=3.0)
