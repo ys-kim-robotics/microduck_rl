@@ -23,6 +23,7 @@ import mujoco
 import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
+from mjlab.entity import EntityCfg
 from mjlab.managers import EventTermCfg, ObservationTermCfg, RewardTermCfg, SceneEntityCfg
 
 import mjlab_microduck.tasks.ys_head_circle_env_cfg as hc
@@ -220,6 +221,8 @@ class TurnerAction(JointPositionAction):
     if stop is not None:  # rope14 saw circle-off commands 10% of the time in training: zero_command_prob 0.1)
       sl[:, 4:6] *= stop[:, None]
     x[:, 48:61] = sl
+    walk = self._env.__dict__.get("_ys_walk", {}).get(self.cfg.obs_group)  # 7-10: (N, 13) command block for the standing ONNX
+    # while it takes the handle and walks to its place (NaN rows: rope14 turns); commands in the duck's own body frame
     lock = self._beat.f.lock if self.cfg.beat else None
     if lock is not None and x.shape[1] > 61 and B.AFTER_LOCK == "mask":  # 7-6: camera blocked by the jumper
       x[lock, 61:] = 0.0
@@ -229,7 +232,23 @@ class TurnerAction(JointPositionAction):
         if not hasattr(self, "_actor2"):
           self._actor2 = load_frozen_actor(TURNER_CKPT, self.device)
         a = torch.where(lock[:, None], self._actor2(x[:, :61]), a)
+    if walk is not None and (m := ~walk[:, 0].isnan()).any():  # ...on the standing policy (env._ys_pick_onnx, 61-D, e.g. velstand)
+      c = walk[m].clone()
+      if self.cfg.mirror:  # the obs is mirrored: so are the lateral / turning command slots
+        c[:, [1, 2, 5, 6, 8, 10, 12]] *= -1
+      a = a.clone(); a[m] = pick_actions(self._env, x[m, :61], c)
     super().process_actions(a[:, aperm] * asign if self.cfg.mirror else a)
+
+
+def pick_actions(env, x: torch.Tensor, cmd: torch.Tensor) -> torch.Tensor:
+  """(n, 61) turner obs, (n, 13) command block [twist 3, head 4, body 6] -> (n, 14) actions of the standing ONNX."""
+  import numpy as np
+  import onnxruntime as ort
+  if "_ys_pick_sess" not in env.__dict__:
+    env._ys_pick_sess = ort.InferenceSession(env._ys_pick_onnx)
+  z = x.clone(); z[:, 48:61] = cmd
+  z = z.cpu().numpy().astype(np.float32)
+  return torch.from_numpy(np.concatenate([env._ys_pick_sess.run(None, {"obs": z[i: i + 1]})[0] for i in range(len(z))])).to(x.device)
 
 
 @dataclass(kw_only=True)
@@ -341,6 +360,25 @@ def connect_trio(spec: mujoco.MjSpec) -> None:
     eq.solref = [0.05, 1.0]  # as connect_rope
 
 
+def holder_spec(name: str):
+  """7-10 (user: the handle waits in a holder, 2 (a)): where a rope end rests before its turner takes the handle."""
+  spec = mujoco.MjSpec(); b = spec.worldbody.add_body(name=name, mocap=True)
+  b.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.008, 0.008, 0.008], contype=0, conaffinity=0, rgba=[0.45, 0.45, 0.5, 1]); b.add_site(name="s")
+  return spec
+
+
+PICK_EQ = ("rope_p_stem", "rope_t_stem", "rope_p_hold", "rope_t_hold")  # equality names (connect_trio_pick order)
+
+
+def connect_trio_pick(spec: mujoco.MjSpec) -> None:
+  """Each rope end is held by its holder until the turner bites the handle, then by the stem end (env.sim.data.eq_active):
+  the holder sits where the stem end is at the full bow, so the switch moves nothing."""
+  for nm, a, b, on in (("rope_p_stem", "rope/rope_start", "partner/stem_end", False), ("rope_t_stem", "rope/rope_end", "turner/stem_end", False),
+                       ("rope_p_hold", "rope/rope_start", "hold_p/s", True), ("rope_t_hold", "rope/rope_end", "hold_t/s", True)):
+    eq = spec.add_equality(type=mujoco.mjtEq.mjEQ_CONNECT, objtype=mujoco.mjtObj.mjOBJ_SITE, name1=a, name2=b, name=nm)
+    eq.solref, eq.active = [0.05, 1.0], on
+
+
 def rope_section(pts: torch.Tensor, xq: torch.Tensor) -> torch.Tensor:
   """rope polyline (N, L, 3) where it crosses x = xq (N,) -> (N, 2) y, z (nan where it does not)."""
   x = pts[..., 0] - xq[:, None]
@@ -371,7 +409,74 @@ def rope_overlap(env: ManagerBasedRlEnv, cap: float = 0.05) -> torch.Tensor:
   return torch.where(env.episode_length_buf > ROPE_GRACE_STEPS, pen.nan_to_num(0.0) / 0.01, 0.0)
 
 
-def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS, ball_obs: bool = False, cam_age: bool = False, follower: str | None = None, follower_off: float = math.radians(60), gaze_w: float = 0.0, beat: bool = False, follower_cam: bool = False, beat_start: str = "ear"):
+import os as _os
+_E2 = _os.environ.get("YS_ENTER_V", "2") == "2"
+# E1: waiting place U[0, 0.25] m widened over 200 iterations, set-off at leader phase 120-200 deg, 4/s, 0.6 m/s: no falls,
+# arrival 96-100% (0.58-0.90 s from 12+ cm) but 62-76% hit on the way: the rope sweeps the path at foot level from +0.09
+# to -0.19 m and the clear gap is ~0.5 s. E2 (YS_ENTER_V=2): wait 12-20 cm away (the rope reaches ~+0.09-0.13 m at foot
+# level), set off at 140-170 deg, 6/s up to 0.8 m/s; 20% of episodes start at the spot (keeps the in-place jump).
+ENTER_Y, ENTER_RAMP = (0.20, 0) if _E2 else (0.25, 200)  # m: farthest waiting place (+y); iterations to widen U[.., y] to it
+ENTER_YMIN, ENTER_NEAR_P = (0.12, 0.2) if _E2 else (0.0, 0.0)  # far waits from ENTER_YMIN; share of episodes at the spot
+ENTER_PH = tuple(math.radians(v) for v in ((140, 170) if _E2 else (120, 200)))  # leader phase to set off
+ENTER_GAIN, ENTER_VMAX, ENTER_NEAR = (6.0, 0.8, 0.03) if _E2 else (4.0, 0.6, 0.03)  # 1/s, m/s, m: walk-in command
+ENTER_WAIT = (2.5, 4.0)  # s: earliest set-off (the rope has spun up: ROPE_GRACE_STEPS 2 s)
+
+
+def enter_reset(env, env_ids: torch.Tensor | None, full: bool = False) -> None:
+  """7-9 reset event (after reset_base): the jumper stands y0 ~ U[0, ymax] beside its spot and waits there (its
+  centering command holds it) until enter_hook sends it in. User 2026-11-06: walk in later; this is that skill."""
+  n, dev = env.num_envs, env.device
+  ids = torch.arange(n, device=dev) if env_ids is None else env_ids
+  if not hasattr(env, "_ys_enter"):
+    z = lambda: torch.zeros(n, device=dev)
+    env._ys_enter = {"y0": z(), "t": z(), "ph": z(), "t_near": z(), "go": z().bool(), "near": z().bool()}
+    env._ys_center_hook = enter_hook
+  start = env.__dict__.setdefault("_ys_enter_start", env.common_step_counter)
+  ymax = ENTER_Y if (full or ENTER_RAMP == 0) else ENTER_Y * min(1.0, max(0.1, (env.common_step_counter - start) / (ENTER_RAMP * 24)))
+  u = lambda lo, hi: torch.empty(len(ids), device=dev).uniform_(lo, hi)
+  e, rob = env._ys_enter, env.scene["robot"]
+  near = torch.rand(len(ids), device=dev) < ENTER_NEAR_P
+  e["y0"][ids] = torch.where(near, u(0.0, 0.03), u(min(ENTER_YMIN, ymax), ymax))
+  e["t"][ids], e["ph"][ids] = u(*ENTER_WAIT), u(*ENTER_PH)
+  e["go"][ids], e["near"][ids], e["t_near"][ids] = False, False, 0.0
+  # reset_base's pose again from the default state (its write is not in root_link_pos_w until the next forward: reading
+  # that gave the previous episode's fallen pose, smoke test 63/64 falls per iteration), plus y0
+  pr = env.event_manager.get_term_cfg("reset_base").params["pose_range"]
+  st = rob.data.default_root_state[ids].clone(); st[:, 7:] = 0.0
+  st[:, :3] += env.scene.env_origins[ids] + torch.stack([u(*pr.get(k, (0.0, 0.0))) for k in ("x", "y", "z")], 1)
+  st[:, 1] += e["y0"][ids]  # the jumper faces +x: its left (+y) is the side the rope comes down on, then sweeps away from
+  rob.write_root_state_to_sim(st, ids)
+
+
+def enter_hook(cmd):
+  """JumpClockCommand._center's spot / gain / speed cap: the waiting place until the set-off time and phase, then the
+  spot with the walk-in command (ENTER_GAIN, ENTER_VMAX) until within ENTER_NEAR, then the usual centering."""
+  env, e = cmd._env, cmd._env._ys_enter
+  t = env.episode_length_buf * env.step_dt
+  lead = cmd.phase - env.__dict__.get("_ys_delta", DELTA0)
+  go = ~e["go"] & (t >= e["t"]) & (torch.remainder(lead - e["ph"], 2 * math.pi) < 2 * math.pi * cmd.freq.abs() * env.step_dt)
+  e["go"] |= go
+  d = (env.scene.env_origins[:, :2] - cmd._robot.data.root_link_pos_w[:, :2]).norm(dim=-1)
+  new = e["go"] & ~e["near"] & (d < ENTER_NEAR)
+  e["t_near"] = torch.where(new, t, e["t_near"]); e["near"] |= new
+  off = torch.stack([torch.zeros_like(t), torch.where(e["go"], 0.0, e["y0"])], 1)
+  walk = e["go"] & ~e["near"]
+  return off, torch.where(walk, ENTER_GAIN, J.CENTER_GAIN), torch.where(walk, ENTER_VMAX, 0.3)
+
+
+def stay_g1(env, ckpt: str, settle: float = 1.0) -> torch.Tensor:
+  """7-9 cost >= 0 (negative weight): squared gap between the jumper's actions and the frozen accepted jumper's on the
+  same obs, once it has been at its spot settle s (user: keep the trained motions; only the walk-in is new)."""
+  if "_ys_g1" not in env.__dict__:
+    env._ys_g1 = load_frozen_actor(ckpt, env.device)
+  e, t = env._ys_enter, env.episode_length_buf * env.step_dt
+  on = e["near"] & (t - e["t_near"] > settle)
+  with torch.no_grad():
+    ref = env._ys_g1(env.obs_buf["actor"])
+  return (env.action_manager.action - ref).square().mean(-1) * on
+
+
+def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS, ball_obs: bool = False, cam_age: bool = False, follower: str | None = None, follower_off: float = math.radians(60), gaze_w: float = 0.0, beat: bool = False, follower_cam: bool = False, beat_start: str = "ear", enter: str | None = None, enter_w: float = 1.0, pick: bool = False):
   cfg = J.make_ys_side_jump_env_cfg(play, half_w=J.SIDE_OVERLAP_HALF_W, both=3.0)  # side6's task
   cfg.commands["head_pose"].zero_command_prob = 0.0  # the rope always turns: always jump
   rc = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)  # turners as in the duo evals (no pushes)
@@ -386,6 +491,9 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
   # ducks before the rope: mjlab 1.3.0 slices default_joint_pos from the scene keyframe in entity order
   cfg.scene.entities = {"robot": cfg.scene.entities["robot"], "turner": turner, "partner": partner, "rope": rope}
   cfg.scene.spec_fn = connect_trio
+  if pick:  # 7-10: the rope ends wait in holders (mocaps placed by the scenario script) until the turners take them
+    cfg.scene.entities.update({"hold_p": EntityCfg(spec_fn=lambda: holder_spec("hold_p")), "hold_t": EntityCfg(spec_fn=lambda: holder_spec("hold_t"))})
+    cfg.scene.spec_fn = connect_trio_pick
   cfg.sim.nconmax = 128  # jumper 35 + rope-floor/rope-foot + turners' feet
 
   for k, e in rc.events.items():  # turner/partner copies of the rope task's robot events, and the rope's
@@ -455,6 +563,9 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     cfg.commands["head_pose"] = TrioClockCommandCfg(**{f: getattr(c, f) for f in c.__dataclass_fields__})
   if delta_half:
     cfg.events["sample_delta"] = EventTermCfg(func=sample_delta, mode="reset", params={"half": delta_half})
+  if enter:  # 7-9 walk-in, warm from the accepted jumper `enter` (its actions anchor the in-place motion)
+    cfg.events["enter_reset"] = EventTermCfg(func=enter_reset, mode="reset", params={"full": play})
+    cfg.rewards["stay_g1"] = RewardTermCfg(func=stay_g1, weight=-enter_w, params={"ckpt": enter})
   return cfg
 
 

@@ -607,3 +607,25 @@ register_mjlab_task(
     rl_cfg=YsTrioJumpRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+# stage 7-9 (user 2026-11-06, walk-in): the jumper waits beside the rope and comes in on the leader's phase; warm from
+# G1@12700 (YS_ENTER_FROM), whose actions anchor the in-place motion once it is at its spot (stay_g1, YS_ENTER_W)
+_efrom = _os.environ.get("YS_ENTER_FROM", "logs/rsl_rl/ys_trio_jump/2026-11-06_09-15-55_G1/model_12700.pt")
+_ew = float(_os.environ.get("YS_ENTER_W", "1.0"))
+register_mjlab_task(
+    task_id="Mjlab-YsTrioJumpEnter-Flat-MicroDuck",
+    env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, gaze_w=_gw, enter=_efrom, enter_w=_ew),
+    play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, gaze_w=_gw, enter=_efrom, enter_w=_ew),
+    rl_cfg=YsTrioJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# stage 7-10 (user 2026-11-06, 2 (a)): YsTrioJumpBeat whose rope ends start in holders; the scenario (scripts/ys_trio_scn.py
+# BEAT_PICK) bows both turners on a standing ONNX, moves each rope end from its holder to the beak, then starts rope14
+register_mjlab_task(
+    task_id="Mjlab-YsTrioJumpBeatPick-Flat-MicroDuck",
+    env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, follower=_bfol, follower_off=3.1416, beat=True, follower_cam=_bcam, beat_start=_os.environ.get("YS_BEAT_START", "ear"), pick=True),
+    play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, follower=_bfol, follower_off=3.1416, beat=True, follower_cam=_bcam, beat_start=_os.environ.get("YS_BEAT_START", "ear"), pick=True),
+    rl_cfg=YsTrioJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)

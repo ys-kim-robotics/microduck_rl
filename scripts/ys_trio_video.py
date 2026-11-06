@@ -27,7 +27,8 @@ def record(ckpt, d, secs):
   import mjlab_microduck.tasks.ys_beat as B
   from mjlab_microduck.tasks.ys_rope import ROPE_RADIUS
   from mjlab.utils.lab_api.math import matrix_from_quat
-  TASK = "Mjlab-YsTrioJumpBeat-Flat-MicroDuck"
+  WALK = beat_scn.WALKOUT  # BEAT_PICK_ONNX + BEAT_WALKOUT=1: L and F take the handles at the middle holder and back out
+  TASK = "Mjlab-YsTrioJumpBeatPick-Flat-MicroDuck" if WALK else "Mjlab-YsTrioJumpBeat-Flat-MicroDuck"
   cfg = ys_eval.load_env_cfg(TASK, play=True)
   for k in ("sample_delta", "sample_offset"): cfg.events.pop(k)
   cfg.scene.num_envs, cfg.seed = 1, int(os.environ.get("SEED", 0))  # startup DR (battery, friction, encoder bias, mass) varies with SEED too
@@ -40,6 +41,12 @@ def record(ckpt, d, secs):
   if os.environ.get("ENTER_PH"): beat_scn.ENTER_PH = math.radians(float(os.environ["ENTER_PH"]))
   env._ys_off = B.start_offset(1, env.device); off0 = math.degrees(float(env._ys_off[0]))
   beat_scn.away(env)
+  if WALK:
+    from mjlab.utils.lab_api.math import quat_apply, quat_inv
+    env._ys_pick_onnx = beat_scn.PICK; ids1 = torch.arange(1, device=env.device)
+    REL0 = {w: quat_apply(quat_inv(env.scene[w].data.root_link_quat_w), env.scene[w].data.site_pos_w[:, env.scene[w].find_sites("stem_end")[0][0]] - env.scene[w].data.root_link_pos_w)[0] for w in ("turner", "partner")}
+    WS = beat_scn.new_ws(env, 1)
+    EQI = beat_scn.setup_walkout(env, ids1, REL0, WS); got, gerr = torch.zeros(1, 2, dtype=torch.bool, device=env.device), torch.full((1, 2), math.nan, device=env.device)
   cmd = env.command_manager.get_term("head_pose"); dt = env.step_dt; act = env.action_manager.get_term("partner_joint_pos")
   rob, rope = env.scene["robot"], env.scene["rope"]
   r = env._offline_renderer; m = env.sim.mj_model; o = env.scene.env_origins[0].cpu().numpy()
@@ -82,7 +89,7 @@ def record(ckpt, d, secs):
 
   os.makedirs(d, exist_ok=True)
   out = imageio.get_writer(f"{d}/raw.mp4", fps=FPS, codec="libx264", quality=9, macro_block_size=8)
-  K = ("t", "amp", "lead", "err", "soleL", "soleR", "rope_z", "rope_y", "clrL", "clrR", "inn", "emit", "jfell", "restart", "lab", "el", "az")
+  K = ("t", "wphase", "tstart", "Lfell", "Ffell", "amp", "lead", "err", "soleL", "soleR", "rope_z", "rope_y", "clrL", "clrR", "inn", "emit", "jfell", "restart", "lab", "el", "az")
   rec = {k: [] for k in K}; obs = venv.get_observations(); delta = getattr(env, "_ys_delta", math.radians(60))
   with torch.inference_mode():
     STOP = tuple(float(v) for v in os.environ["STOP"].split(",")) if os.environ.get("STOP") else None  # delay, ramp, force (s)
@@ -91,13 +98,21 @@ def record(ckpt, d, secs):
       beat_scn.enter(env)
       if STOP:  # J's end call at its first hit -> both turners' circle ramps to 0 (ys_trio_scn BEAT_STOP)
         env._ys_amp = torch.full((1,), min(1.0, max(0.0, 1 - (k * dt - t_stop) / max(STOP[1], dt))), device=env.device)
+      if WALK: t_start = beat_scn.walkout_pre(env, WS)
       act_j = pol(obs)
       if STOP and beat_scn.JSTAND and k * dt >= t_stop: act_j = beat_scn.jstand(obs["actor"])  # J stands (BEAT_JSTAND onnx)
       cmd.amp[:] = 1.0; cmd.freq[:] = 1.25; cmd._write(); obs, *_ = venv.step(act_j)
       if STOP and math.isinf(t_hit) and bool(env._ys_in[0]) and k * dt > float(env._ys_tin[0]) + 0.04:
         if float(T.rope_overlap(env)[0]) > 0 or float(rob.data.projected_gravity_b[0, 2]) > -0.5:
           t_hit = k * dt; t_stop = min(t_stop, t_hit + STOP[0])
-      rec["amp"].append(float(env._ys_amp[0]) if STOP else 1.0)
+      if WALK:
+        beat_scn.walkout_post(env, WS, EQI, REL0, env.episode_length_buf == 0, got, gerr); te_ = k * dt; ts_ = float(t_start[0])
+        if abs(te_ - (beat_scn.T_ENTER - 0.5)) < dt / 2: beat_scn.spot_from_turners(env, REL0)  # J lines up on the rope
+        rec["wphase"].append(0 if te_ < beat_scn.W_BITE + 0.2 else 1 if not bool(WS["arr"]["turner"][0]) else 2 if te_ < ts_ else 3); rec["tstart"].append(ts_)
+      else:
+        rec["wphase"].append(3); rec["tstart"].append(0.0)
+      rec["Lfell"].append(bool(env.scene["turner"].data.projected_gravity_b[0, 2] > -0.5)); rec["Ffell"].append(bool(env.scene["partner"].data.projected_gravity_b[0, 2] > -0.5))
+      rec["amp"].append(float(env._ys_amp[0]) if (STOP or WALK) else 1.0)
       t_, inn = k * dt, bool(env._ys_in[0]); lead = float(B.wrap(cmd.phase - delta)[0])
       past = (lead - B.BEEP_PH) % (2 * math.pi)  # J calls on its own clock as it passes BEEP_PH (its right-foot lift)
       rec["emit"].append(t_ - past / B.OMEGA if inn and past < B.OMEGA * dt else math.nan)
@@ -128,6 +143,7 @@ VOICE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ys_voice")  # 
 START_WAV, PECK_WAV, END_WAV = f"{VOICE}/greet_0.wav", f"{VOICE}/peck_2.wav", f"{VOICE}/alarm_0.wav"
 TXT = {
   "ko": dict(steps=["① J의 시작 소리 → 셋이 같은 시계로 출발", "② L·F 줄 돌리기 (J는 옆에서 대기)", "③ J 입장 (줄이 막 지나간 순간)", "④ J는 오른발 들 때마다 '톡' · 걸리면 끝"],
+             wsteps=["① 가운데 거치대에서 L·F가 손잡이를 묾", "② L이 뒷걸음으로 제자리로", "③ F가 뒷걸음으로 제자리로"], tfell="줄 돌리는 오리가 넘어짐 (실패)",
              hit_step="걸림 → 끝", stop_step="⑤ 걸림! J의 끝 소리 → L·F 멈춤", L="L (리더)", F="F (팔로워)", J="J (점퍼)", call="시작 소리!", peck="톡!",
              info="t {t:4.1f} s    연속 {k}번    F 시계 (L 대비) {e:+.0f}°", info0="t {t:4.1f} s    F 시계 (L 대비) {e:+.0f}°", eye="J의 눈: L 머리(●)는 상자 안에", card="0.5배속 슬로모션 + 실시간 그래프", slow="0.5배속",
              gF="J의 발과 줄 (J 위치)", gF_l=("왼발 바닥", "오른발 바닥", "줄 윗면 (발 아래)", "걸림"), gF_y="높이 (mm)", wait="J 대기 중",
@@ -135,6 +151,7 @@ TXT = {
              gC="J 위치의 줄 단면 (L 쪽에서 봄)", gC_x="옆 (mm)", gC_y="높이 (mm)", gC_feet="J 발", gC_head="J 머리 높이",
              gD="세 시계", gD_l=("L 리더", "F 팔로워", "J 점퍼"), gD_v=("{:.0f}°", "L {:+.0f}°", "L +0°"), gD_b="▼ J 소리 위치", font_mpl=NAN_R),
   "en": dict(steps=["① J's start call → all three start one clock", "② L and F turn the rope (J waits aside)", "③ J steps in (right after the rope passes)", "④ J pecks on every right-foot lift · a hit ends it"],
+             wsteps=["① L and F bite their handles at the middle holder", "② L backs out to its place", "③ F backs out to its place"], tfell="a turning duck fell (failure)",
              hit_step="hit → over", stop_step="⑤ hit! J's end call → L and F stop", L="L (leader)", F="F (follower)", J="J (jumper)", call="start call!", peck="peck!",
              info="t {t:4.1f} s    streak {k}    F clock vs L {e:+.0f}°", info0="t {t:4.1f} s    F clock vs L {e:+.0f}°", eye="J's eye: L's head (●) inside the box", card="0.5x slow motion + live graphs", slow="0.5x",
              gF="J's feet and the rope (at J)", gF_l=("left sole", "right sole", "rope top (under the feet)", "hit"), gF_y="height (mm)", wait="J waiting",
@@ -180,11 +197,17 @@ def compose(d, lang, outp):
   def overlay(img, i, s=1.0, info=True, fbig=fB, fmid=fM):
     ti = t[i]; ov = Image.new("RGBA", img.size); dr = ImageDraw.Draw(ov)
     se = ti - emit[emit <= ti].max() if (emit <= ti).any() else 9.0; lj, ll, lf = D["lab"][i]
-    jt = X["J"] + (f"   {X['call']}" if ti < 0.6 else f"   {X['peck']}" if se < 0.25 else "")
-    tag(dr, lj, jt, (255, 220, 60) if (ti < 0.6 or se < 0.25) else (255, 255, 255), fmid, s)
+    tsc = float(D["tstart"][i]) if "tstart" in D.files else 0.0; called = 0 <= ti - tsc < 0.6
+    jt = X["J"] + (f"   {X['call']}" if called else f"   {X['peck']}" if se < 0.25 else "")
+    tag(dr, lj, jt, (255, 220, 60) if (called or se < 0.25) else (255, 255, 255), fmid, s)
     tag(dr, ll, X["L"], (255, 110, 110), fmid, s); tag(dr, lf, X["F"], (120, 255, 140), fmid, s)
+    wph = int(D["wphase"][i]) if "wphase" in D.files else 3; tst = float(D["tstart"][i]) if "tstart" in D.files else 0.0
+    tfell = ("Lfell" in D.files) and (D["Lfell"][: i + 1].any() or D["Ffell"][: i + 1].any())
     over = hit is not None and i >= hit
-    step = (X["stop_step"] if stopm else X["hit_step"]) if over else X["steps"][0 if ti < 0.8 else 1 if not D["inn"][i] else 2 if ti < t_in + 1.6 else 3]
+    if tfell: step = X["tfell"]
+    elif over: step = X["stop_step"] if stopm else X["hit_step"]
+    elif wph < 3: step = X["wsteps"][wph]
+    else: step = X["steps"][0 if ti < tst + 0.8 else 1 if not D["inn"][i] else 2 if ti < t_in + 1.6 else 3]
     bw = dr.textbbox((0, 0), step, font=fbig)[2]; dr.rounded_rectangle((12, 12, 12 + bw + 24, 12 + fbig.size + 22), 10, fill=(170, 30, 30, 200) if over else (0, 0, 0, 160)); dr.text((24, 18), step, font=fbig, fill=(255, 255, 255))
     if info:
       s_ = X["info"].format(t=ti, k=streak(i), e=D["err"][i]) if D["inn"][i] else X["info0"].format(t=ti, e=D["err"][i]); bw = dr.textbbox((0, 0), s_, font=fmid)[2]
@@ -293,8 +316,9 @@ def compose(d, lang, outp):
   call, peck = 0.8 * wav48(START_WAV), 0.7 * wav48(PECK_WAV)
   def put(at, s_):
     j0 = int(at * sr); track[j0: j0 + len(s_)] += s_[: max(0, len(track) - j0)]
+  t_call = float(D["tstart"][np.isfinite(D["tstart"])].max()) if "tstart" in D.files and np.isfinite(D["tstart"]).any() else 0.0
   for base, k in ((0.0, 1.0), (n * dt + CARD2, 2.0)):
-    put(base, call)
+    put(base + k * t_call, call)
     if stopm and hit is not None: put(base + k * t[hit], 0.8 * wav48(END_WAV))
     for ts in emit: put(base + k * ts, peck)
   wav = outp.replace(".mp4", ".wav")
