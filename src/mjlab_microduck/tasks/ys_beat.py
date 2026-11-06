@@ -2,19 +2,20 @@
 
 The follower (back turner, its own clock off by an unknown offset) cannot see the leader past the
 jumper (trio_cams.py: all 68 'visible' frames of the leader's ball went through the jumper's body). The
-jumper beeps when its LEFT foot lands, and its landings are locked to the leader, whose red ball it
-watches: leader phase 154 deg at the left touchdown, per-env std ~4 deg, unchanged with the follower
-60 deg off (beep_probe.py, G1@12700). The leader never beeps.
+jumper calls on its own clock, the one its start sound started for all three: each time it passes BEEP_PH,
+where its right foot lifts (user 2026-11-06: it knows its own command, no force or current sensing). The
+leader never calls. With all three on one clock (monotonic time, robotd) the follower has nothing to
+correct, so CORRECT is off: the follower runs its start-sound clock as is (beat_scn.py, hit = end, 128 envs:
+>= 20 passes 35% off vs 39% on, within noise). Kept for a follower that missed the start sound or restarted.
 
 The follower turns heard beeps into a clock correction: a port of runtime sounds/chorale/beat.rs's
 Follower (tempo held, phase from a window of beats, outliers dropped, a slow drag, hold when silent) with
 two changes: a beep carries no beat number (the nearest beat is assumed), and a circular median replaces
 the mean (one false beep moved an 8-beat mean ~11 deg; beat_mc.py: steady p90 9.6 -> 4.5 deg).
 
-Real counterparts: the jumper reads its left landing off the left leg's present current (read every
-tick, duck-control bus.rs); the beep goes out through plughw:aic3104; the follower detects it in the
-pet-detect mic worker (16 kHz, a Goertzel tone detector) and knows its own speaker + mic latency from
-hearing its own beep (CAL_SD).
+Real counterparts: the jumper schedules the call (runtime/sounds `peck`, one fixed variant) on its clock
+through plughw:aic3104; the follower finds it in the pet-detect mic worker (16 kHz, a matched filter on the
+known waveform) and knows its own speaker + mic latency from hearing its own call (CAL_SD).
 """
 
 import math
@@ -22,8 +23,8 @@ import math
 import torch
 
 OMEGA = 2 * math.pi * 1.25  # rad/s: the rope tempo, held (both turners read it off the same "score")
-MU_LAND = math.radians(154)  # leader phase at the jumper's left touchdown (G1@12700, beep_probe.py)
-DET = 0.02  # s: the landing shows in the leg current at most one control tick late
+BEEP_PH = math.radians(129)  # leader-clock phase of the call: the jumper's right-foot lift (G1@12700, beat_scn.py:
+# 128.6 deg, sd 9 over 128 envs; left touchdown 147, left lift 33)
 LAT_SPK, LAT_MIC = (0.02, 0.04), (0.01, 0.03)  # s, constant per duck: unmeasured, randomized per episode
 AIR, JIT = 0.0025, 0.002  # s: 0.87 m of air; detector timing noise
 MISS, FALSE = 0.10, 0.3  # beeps lost; false beeps per s (rope slap, servos)
@@ -42,9 +43,7 @@ K, RMAX = 2.0, math.radians(90)  # 1/s, rad/s: the drag on the clock (<= 20% tem
 LISTEN = False  # start: hold the handle still until 3 beeps are in, start at that phase (amp 0 -> 1 in 1 s).
 # Off: rope14 never learned to hold still (beat_s0.py B, 3 s still: follower 28%, leader 12% fall)
 START_BIAS = 0.0  # s: the follower's latency calibration off by this much (robustness)
-AIR_MIN, F_ON = 0.15, 2.0  # s, N: a touchdown = the first contact after this long in the air
-HOME_R = 0.15  # m: the jumper beeps only in its spot under the rope (before it walks in there are no beeps,
-# and the follower keeps its camera logic: the correction holds at 0 until beeps come)
+CORRECT = False  # apply the correction to the follower's clock (off: one clock, user 2026-11-06)
 
 
 def start_offset(n: int, device) -> torch.Tensor:
@@ -124,10 +123,10 @@ class Beat:
 
   def __init__(self, env):
     n, dev = env.num_envs, env.device
-    self.env, self.cs, self.dt, self.rob = env, env.scene["feet_ground_contact"], env.step_dt, env.scene["robot"]
+    self.env, self.dt = env, env.step_dt
     self.f = BeatFollower(n, dev)
     z = lambda: torch.zeros(n, device=dev)
-    self.air, self.lat, self.lcal, self.heard = z(), z(), z(), z()
+    self.lat, self.lcal, self.heard = z(), z(), z()
     self.t_arr = torch.full((n,), math.inf, device=dev)  # one beep in flight at most (they are 0.8 s apart)
     self.t_go = torch.full((n,), math.inf, device=dev)  # LISTEN: when the follower started turning
     self.step_id = -1
@@ -135,18 +134,18 @@ class Beat:
   def _reset(self, ids: torch.Tensor) -> None:
     u = lambda lo_hi: torch.empty(len(ids), device=ids.device).uniform_(*lo_hi)
     self.lat[ids] = u(LAT_SPK) + u(LAT_MIC) + AIR
-    self.lcal[ids] = self.lat[ids] + DET / 2 + CAL_ERR + CAL_SD * torch.randn(len(ids), device=ids.device)
+    self.lcal[ids] = self.lat[ids] + CAL_ERR + CAL_SD * torch.randn(len(ids), device=ids.device)
     self.f.reset(ids)
-    self.air[ids], self.heard[ids], self.t_arr[ids], self.t_go[ids] = 0.0, 0.0, math.inf, math.inf
+    self.heard[ids], self.t_arr[ids], self.t_go[ids] = 0.0, math.inf, math.inf
 
   def _sample(self, t_hear: torch.Tensor, now: torch.Tensor) -> torch.Tensor:
-    """Offset sample from a beep heard at t_hear: where the leader 'should' be (landing phase + the
-    calibrated latency) minus the follower's own clock then."""
+    """Offset sample from a call heard at t_hear: where the leader 'should' be (BEEP_PH + the calibrated
+    latency) minus the follower's own clock then."""
     env = self.env
     lead = env.command_manager.get_term("head_pose").phase - getattr(env, "_ys_delta", math.radians(60))
     off = env.__dict__.get("_ys_off")
     local = lead + (0.0 if off is None else off) - OMEGA * (now - t_hear)  # the follower's own clock
-    return wrap(MU_LAND + OMEGA * self.lcal - local)
+    return wrap(BEEP_PH + OMEGA * self.lcal - local)
 
   def step(self):
     env = self.env
@@ -162,19 +161,18 @@ class Beat:
       self.t_arr = torch.where(m, math.inf, self.t_arr)
       m = torch.rand_like(now) < FALSE * self.dt  # a false beep
       self.f.observe(self._sample(now - self.dt * torch.rand_like(now), now), m)
-      on = self.cs.data.force[:, 0].norm(dim=-1) > F_ON  # LEFT foot (sensor order: left, right)
-      land = on & (self.air >= AIR_MIN)
-      self.air = torch.where(on, 0.0, self.air + self.dt)
-      home = (self.rob.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2]).norm(dim=-1) < HOME_R
-      send = land & home & (torch.rand_like(now) >= MISS)  # only a jumper in its spot beeps
-      self.t_arr = torch.where(send, now + DET * torch.rand_like(now) + self.lat + JIT * torch.randn_like(now), self.t_arr)
+      lead = env.command_manager.get_term("head_pose").phase - getattr(env, "_ys_delta", math.radians(60))
+      past = torch.remainder(lead - BEEP_PH, 2 * math.pi)  # rad since the jumper's clock passed BEEP_PH
+      jumping = env.__dict__.get("_ys_in", torch.ones_like(now, dtype=torch.bool))  # its own mode (beat_scn: in its spot)
+      send = (past < OMEGA * self.dt) & jumping & (torch.rand_like(now) >= MISS)
+      self.t_arr = torch.where(send, now - past / OMEGA + self.lat + JIT * torch.randn_like(now), self.t_arr)
       if LISTEN:
         go = (self.f.n >= 3) & self.t_go.isinf()
         self.f.c = torch.where(go, self.f.est(), self.f.c)  # not turning yet: take the phase outright
         self.t_go = torch.where(go, now, self.t_go)
       self.f.drag(self.dt)
       self._amp = ((now - self.t_go) / 1.0).clamp(0, 1) if LISTEN else None
-    return self.f.c, self._amp
+    return (self.f.c if CORRECT else torch.zeros_like(self.f.c)), self._amp
 
 
 if __name__ == "__main__":  # self-check: estimator only, CPU
