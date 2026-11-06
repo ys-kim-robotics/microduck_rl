@@ -31,6 +31,7 @@ BANK_OUT, BANK_IN = os.environ.get("BEAT_BANK_OUT"), os.environ.get("BEAT_BANK_I
 # entry; else: put it in with that state (already jumping: a stand-in for walking in) instead of standing
 
 LOAD = os.environ.get("BEAT_LOAD") == "1"
+REFA = os.environ.get("BEAT_REF_ACTOR")  # a checkpoint whose actor J's actions are compared with (motion kept? RMS rad, in play)
 PICK = os.environ.get("BEAT_PICK_ONNX")  # 7-10 (user: 2 (a), holders): the turners take the handles first, on this standing ONNX
 P_BOW0, P_BOW1, P_GRASP, P_LIFT1, P_START, P_TOL = 1.0, 2.5, 3.0, 4.0, 4.5, 0.010  # s ..., m: bow, bite, lift, start call
 WALKOUT = PICK and os.environ.get("BEAT_WALKOUT") == "1"  # user 2026-11-06: one holder in the middle, both handles level on it;
@@ -38,13 +39,13 @@ WALKOUT = PICK and os.environ.get("BEAT_WALKOUT") == "1"  # user 2026-11-06: one
 W_GAP, W_BITE, W_GAP_T, W_SET = 0.03, 0.8, 0.3, 0.6  # m stem end to the middle; s bite; s between L and F; s holder set
 HOLD_Y = float(os.environ.get("BEAT_HOLD_Y", "-0.5"))  # m (env frame): the holder line, out of the work area (user): the
 # rope sweeps y -0.28..+0.16 at J (axis y -0.08) and J waits at +0.8; L and F come in sideways from it
-W_STILL, W_STILL_V, W_STILL_W, W_MIN_WAIT, J_AFTER = 1.0, 0.02, 0.1, 1.5, 4.0  # s still, m/s, rad/s, s, s: J's start call
+W_STILL, W_STILL_V, W_STILL_W, W_MIN_WAIT, J_AFTER = float(os.environ.get("BEAT_W_STILL", "1.0")), 0.02, 0.1, float(os.environ.get("BEAT_W_MINWAIT", "1.5")), 4.0  # s still, m/s, rad/s, s, s: J's start call
 # once both have stood still W_STILL s (and >= W_MIN_WAIT after arriving); J comes in J_AFTER s after its call
 # velstand has a dead band (|vx| <= 0.15 m/s: no steps) and walks slower than told: -0.4 -> -0.126 m/s backwards, then
 # coasts 39 mm after the command stops (16 envs, flat); sideways 0.5 -> 0.081 m/s (0.3: 0.034), coast 11 mm.
 # So: a fixed command until the coast distance, then stop.
 W_VX, W_VY, W_STOP_F, W_STOP_L = 0.4, 0.5, 0.04, 0.03
-W_WZ, W_TURN_TOL, W_BACK0, W_STOP_FWD = 1.0, math.radians(5), 0.10, 0.025  # rad/s told (90 deg in 1.56 s, err 2-4 deg, 16 envs),
+W_WZ, W_TURN_TOL, W_BACK0, W_STOP_FWD = float(os.environ.get("BEAT_W_WZ", "1.0")), math.radians(5), 0.10, 0.025  # rad/s told (90 deg in 1.56 s, err 2-4 deg, 16 envs),
 # rad done, m backed off the holder first, m it coasts walking forward (0.4 -> 0.42 m in 423 +- 12 mm)  # m/s told, m left when it stops (forward, sideways)
 W_STAY = os.environ.get("BEAT_WALKOUT_STAY") == "1"  # control run: start at the places (bite, then the start call)
 W_WAIT = float(os.environ.get("BEAT_WALKOUT_WAIT", "0.5"))  # s from F's arrival to the start call
@@ -430,7 +431,7 @@ if __name__ == "__main__":
   ref = None; PHS = [math.radians(float(v)) for v in os.environ["BEAT_ENTER_PH"].split(",")] if os.environ.get("BEAT_ENTER_PH") else [ENTER_PH]
   RUNS = [(ph, X) for ph in PHS for X in STARTS]
   for ENTER_PH, X in RUNS:
-    globals()["ENTER_PH"] = ENTER_PH; ins, fj, rs, sole, leads, taus, stops = [], [], [], [], [], [], []
+    globals()["ENTER_PH"] = ENTER_PH; ins, fj, rs, sole, leads, taus, stops, gaps = [], [], [], [], [], [], [], []
     fell = torch.zeros(N, 3, dtype=torch.bool, device=dev); ce, gap, pen, vis = [], [], [], []
     with torch.inference_mode():
       if os.environ.get("SEED"): torch.manual_seed(int(os.environ["SEED"])); torch.cuda.manual_seed_all(int(os.environ["SEED"]))
@@ -442,7 +443,7 @@ if __name__ == "__main__":
         if WALKOUT:
           zN = lambda: torch.zeros(N, device=dev)
           WS = new_ws(env, N)
-          pf_walk = torch.zeros(N, 2, dtype=torch.bool, device=dev); pf_turn = torch.zeros(N, 2, dtype=torch.bool, device=dev); ST = torch.full((N, 2, 3), math.nan, device=dev); SPN = torch.full((N,), math.nan, device=dev)
+          pf_walk = torch.zeros(N, 2, dtype=torch.bool, device=dev); pf_turn = torch.zeros(N, 2, dtype=torch.bool, device=dev); TF = torch.full((N, 2), math.inf, device=dev); TJ = torch.full((N,), math.inf, device=dev); ST = torch.full((N, 2, 3), math.nan, device=dev); SPN = torch.full((N,), math.nan, device=dev)
           EQI = setup_walkout(env, allids, REL, WS); t_start = torch.full((N,), torch.inf, device=dev); rv_sum = zN(); rv_n = zN()
         else:
           EQI = place_holders(env, allids, REL, PSPAN)
@@ -463,8 +464,13 @@ if __name__ == "__main__":
           te = env.episode_length_buf * dt
           if k == 0: t_stop = torch.full((N,), STOP[2], device=dev); hit_t = torch.full((N,), math.inf, device=dev)
           t_stop = torch.where(env.episode_length_buf == 0, STOP[2], t_stop); hit_t = torch.where(env.episode_length_buf == 0, math.inf, hit_t)
-          env._ys_amp = (1 - (te - t_stop) / max(STOP[1], dt)).clamp(0, 1)
+          sa = (1 - (te - t_stop) / max(STOP[1], dt)).clamp(0, 1)  # the stop ramp; with the walk-out, also its start ramp
+          env._ys_amp = torch.minimum(env._ys_amp, sa) if (WALKOUT and torch.is_tensor(env.__dict__.get("_ys_amp"))) else sa
         act_j = pol(obs)
+        if REFA:
+          if "ref" not in globals():
+            from mjlab_microduck.tasks.ys_rope_duo_env_cfg import load_frozen_actor; ref = load_frozen_actor(REFA, dev)
+          gaps.append(((act_j - ref(obs["actor"])) ** 2).mean(-1).sqrt() * (env._ys_in & (env.episode_length_buf * dt > env._ys_tin + 1.0)))
         if WALKIN:  # still waiting: standing on its own beside the rope
           m = (~env._ys_in).nonzero()[:, 0]
           if len(m): act_j[m] = jstand(obs["actor"][m])
@@ -513,6 +519,10 @@ if __name__ == "__main__":
           for c_, e_ in enumerate((pa, tu)):
             dn = e_.data.projected_gravity_b[:, 2] > -0.5; pfell[:, c_] |= dn & (te < tst + 4.0)
             if WALKOUT: pf_walk[:, c_] |= dn & (te < tst); pf_turn[:, c_] |= dn & (te >= tst) & (te < tst + 4.0)
+            if WALKOUT: TF[:, c_] = torch.where(dn & TF[:, c_].isinf(), te - tst, TF[:, c_])  # first fall, s after the start call
+          if WALKOUT:  # J's first hit (as the stop uses it), s after the start call
+            jh = env._ys_in & ((T.rope_overlap(env) > 0) | (rob.data.projected_gravity_b[:, 2] > -0.5)) & TJ.isinf() & (te > env._ys_tin + 0.04) & TF.isinf().all(1)
+            TJ = torch.where(jh, te - tst, TJ)
           rope_e = env.scene["rope"]; rv = rope_e.data.body_link_lin_vel_w[:, rope_e.data.body_link_lin_vel_w.shape[1] // 2].norm(dim=-1)
           if WALKOUT:
             inw = (te >= t_start + 3.0) & (te < t_start + 4.0); rv_sum += rv * inw; rv_n += inw.float()
@@ -583,12 +593,18 @@ if __name__ == "__main__":
           f_ = pf_turn[:, c_].cpu().numpy(); st_ = ST[:, c_].cpu().numpy()
           for nm, j in (("yaw err deg", 0), ("place err mm", 1), ("feet fore-aft gap mm", 2)):
             print(f"    {w_} at the start call {nm}: fell later p50 {np.nanmedian(st_[f_, j]) if f_.any() else float('nan'):.1f} (n {f_.sum()}) vs not p50 {np.nanmedian(st_[~f_, j]):.1f}")
+        for c_, w_ in enumerate(("F", "L")):  # when the falls come: walking / first 4 s / before J's first hit / after it (a real game is over then)
+          f_ = TF[:, c_]; bins = [(f_ < 0), (f_ >= 0) & (f_ < 4), (f_ >= 4) & (f_ < TJ), f_.isfinite() & (f_ >= TJ)]
+          print(f"    {w_} first fall: walking {100 * bins[0].float().mean():.0f}%  start..+4 s {100 * bins[1].float().mean():.0f}%  later, J not hit yet {100 * bins[2].float().mean():.0f}%  after J's hit {100 * bins[3].float().mean():.0f}%"
+                + (f"  (after the hit p50 {float((f_ - TJ)[bins[3]].median()):.1f} s later)" if bins[3].any() else ""))
         sp_ = SPN.cpu().numpy(); fa_ = pf_turn.any(1).cpu().numpy()
         print(f"  stem ends apart at the start call minus 0.60 m: p50 {np.nanmedian(sp_):+.0f} mm, |.| p90 {np.nanpercentile(np.abs(sp_), 90):.0f} mm; fell later p50 {np.nanmedian(sp_[fa_]) if fa_.any() else float('nan'):+.0f} vs not {np.nanmedian(sp_[~fa_]):+.0f}"
               + (f"; ball size targets L {float(WS['r_t']['turner'].median()):.1f} px, F {float(WS['r_t']['partner'].median()):.1f} px" if W_CAM else ""))
         print(f"  start call at t p50 {float(t_start[t_start.isfinite()].median()) if t_start.isfinite().any() else float('nan'):.2f} s ({100 * t_start.isfinite().float().mean():.0f}% got there); J entered at {T_ENTER} s")
       print(f"  PICK: bit the handle F {100 * got[:, 0].float().mean():.0f}% L {100 * got[:, 1].float().mean():.0f}%  (stem end to holder at the bite p50 F {np.nanmedian(gerr[:, 0].cpu()):.1f} L {np.nanmedian(gerr[:, 1].cpu()):.1f} mm, max {np.nanmax(gerr.cpu()):.1f})"
             f"  fell up to start+4 s F {100 * pfell[:, 0].float().mean():.0f}% L {100 * pfell[:, 1].float().mean():.0f}%  rope middle speed at start+3-4 s p50 {float(rvt.median()):.2f} m/s (turning ~2)")
+    if REFA and gaps:
+      g_ = torch.stack(gaps); m_ = g_ > 0; print(f"  action gap to the reference actor while jumping in place: RMS p50 {float(g_[m_].median()):.3f} rad, p90 {float(g_[m_].quantile(0.9)):.3f} rad")
     if LOAD: print_load(torch.stack(taus), torch.stack(ins), rob.joint_names, int(0.5 / dt))
     if STOP:
       SS = torch.stack(stops).cpu().numpy(); print_stop(SS, dt)

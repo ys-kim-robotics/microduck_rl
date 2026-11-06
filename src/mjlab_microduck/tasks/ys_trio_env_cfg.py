@@ -429,7 +429,8 @@ def enter_reset(env, env_ids: torch.Tensor | None, full: bool = False) -> None:
   ids = torch.arange(n, device=dev) if env_ids is None else env_ids
   if not hasattr(env, "_ys_enter"):
     z = lambda: torch.zeros(n, device=dev)
-    env._ys_enter = {"y0": z(), "t": z(), "ph": z(), "t_near": z(), "go": z().bool(), "near": z().bool()}
+    env._ys_enter = {"y0": z(), "t": z(), "ph": z(), "t_near": z(), "go": z().bool(), "near": z().bool(), "t_go": z(),
+                     "d_prev": z(), "pk": z().long(), "bad": z().bool()}
     env._ys_center_hook = enter_hook
   start = env.__dict__.setdefault("_ys_enter_start", env.common_step_counter)
   ymax = ENTER_Y if (full or ENTER_RAMP == 0) else ENTER_Y * min(1.0, max(0.1, (env.common_step_counter - start) / (ENTER_RAMP * 24)))
@@ -438,7 +439,8 @@ def enter_reset(env, env_ids: torch.Tensor | None, full: bool = False) -> None:
   near = torch.rand(len(ids), device=dev) < ENTER_NEAR_P
   e["y0"][ids] = torch.where(near, u(0.0, 0.03), u(min(ENTER_YMIN, ymax), ymax))
   e["t"][ids], e["ph"][ids] = u(*ENTER_WAIT), u(*ENTER_PH)
-  e["go"][ids], e["near"][ids], e["t_near"][ids] = False, False, 0.0
+  e["go"][ids], e["near"][ids], e["t_near"][ids], e["t_go"][ids], e["pk"][ids], e["bad"][ids] = False, False, 0.0, torch.inf, 0, False
+  e["d_prev"][ids] = e["y0"][ids]
   # reset_base's pose again from the default state (its write is not in root_link_pos_w until the next forward: reading
   # that gave the previous episode's fallen pose, smoke test 63/64 falls per iteration), plus y0
   pr = env.event_manager.get_term_cfg("reset_base").params["pose_range"]
@@ -455,7 +457,7 @@ def enter_hook(cmd):
   t = env.episode_length_buf * env.step_dt
   lead = cmd.phase - env.__dict__.get("_ys_delta", DELTA0)
   go = ~e["go"] & (t >= e["t"]) & (torch.remainder(lead - e["ph"], 2 * math.pi) < 2 * math.pi * cmd.freq.abs() * env.step_dt)
-  e["go"] |= go
+  e["go"] |= go; e["t_go"] = torch.where(go, t, e["t_go"])
   d = (env.scene.env_origins[:, :2] - cmd._robot.data.root_link_pos_w[:, :2]).norm(dim=-1)
   new = e["go"] & ~e["near"] & (d < ENTER_NEAR)
   e["t_near"] = torch.where(new, t, e["t_near"]); e["near"] |= new
@@ -464,19 +466,41 @@ def enter_hook(cmd):
   return off, torch.where(walk, ENTER_GAIN, J.CENTER_GAIN), torch.where(walk, ENTER_VMAX, 0.3)
 
 
-def stay_g1(env, ckpt: str, settle: float = 1.0) -> torch.Tensor:
+def enter_approach(env, v_full: float = 0.5) -> torch.Tensor:
+  """7-9 E3 (user (a): hurry in): speed toward the spot (m/s, / v_full, clamped 0..1) from set-off until arrival: E1/E2
+  took 0.50-0.58 s from 12-20 cm and the rope is back at the feet ~0.5 s after the set-off."""
+  e = env._ys_enter; d = (env.scene.env_origins[:, :2] - env.scene["robot"].data.root_link_pos_w[:, :2]).norm(dim=-1)
+  v = (e["d_prev"] - d) / env.step_dt; e["d_prev"] = d
+  return (v / v_full).clamp(0, 1) * (e["go"] & ~e["near"])
+
+
+def enter_clear(env, n_pass: int = 2) -> torch.Tensor:
+  """7-9 E3 (user (a)): +1/dt at the end of each of the first n_pass 0.8 s windows after the set-off with no rope over a
+  sole and the jumper up (hit = end: the first passes are the ones E1/E2 lost, 87-96% at the first pass)."""
+  e = env._ys_enter; t = env.episode_length_buf * env.step_dt
+  on = e["go"] & (e["pk"] < n_pass)
+  e["bad"] |= on & ((rope_overlap(env) > 0) | (env.scene["robot"].data.projected_gravity_b[:, 2] > -0.5))
+  end = on & (t >= e["t_go"] + 0.8 * (e["pk"] + 1).float())
+  r = (end & ~e["bad"]).float() / env.step_dt
+  e["pk"] = torch.where(end, e["pk"] + 1, e["pk"]); e["bad"] = torch.where(end, False, e["bad"])
+  e["pk"] = torch.where(end & (r == 0), n_pass, e["pk"])  # a hit ends the bonuses for that episode
+  return r
+
+
+def stay_g1(env, ckpt: str, settle: float = 1.0, waiting: bool = False) -> torch.Tensor:
   """7-9 cost >= 0 (negative weight): squared gap between the jumper's actions and the frozen accepted jumper's on the
   same obs, once it has been at its spot settle s (user: keep the trained motions; only the walk-in is new)."""
   if "_ys_g1" not in env.__dict__:
     env._ys_g1 = load_frozen_actor(ckpt, env.device)
   e, t = env._ys_enter, env.episode_length_buf * env.step_dt
   on = e["near"] & (t - e["t_near"] > settle)
+  if waiting: on |= ~e["go"] & (t > 1.0)  # E3 (user (b)): also while it hops in place at the waiting place
   with torch.no_grad():
     ref = env._ys_g1(env.obs_buf["actor"])
   return (env.action_manager.action - ref).square().mean(-1) * on
 
 
-def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS, ball_obs: bool = False, cam_age: bool = False, follower: str | None = None, follower_off: float = math.radians(60), gaze_w: float = 0.0, beat: bool = False, follower_cam: bool = False, beat_start: str = "ear", enter: str | None = None, enter_w: float = 1.0, pick: bool = False):
+def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS, ball_obs: bool = False, cam_age: bool = False, follower: str | None = None, follower_off: float = math.radians(60), gaze_w: float = 0.0, beat: bool = False, follower_cam: bool = False, beat_start: str = "ear", enter: str | None = None, enter_w: float = 1.0, pick: bool = False, enter3: bool = False):
   cfg = J.make_ys_side_jump_env_cfg(play, half_w=J.SIDE_OVERLAP_HALF_W, both=3.0)  # side6's task
   cfg.commands["head_pose"].zero_command_prob = 0.0  # the rope always turns: always jump
   rc = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)  # turners as in the duo evals (no pushes)
@@ -565,7 +589,10 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     cfg.events["sample_delta"] = EventTermCfg(func=sample_delta, mode="reset", params={"half": delta_half})
   if enter:  # 7-9 walk-in, warm from the accepted jumper `enter` (its actions anchor the in-place motion)
     cfg.events["enter_reset"] = EventTermCfg(func=enter_reset, mode="reset", params={"full": play})
-    cfg.rewards["stay_g1"] = RewardTermCfg(func=stay_g1, weight=-enter_w, params={"ckpt": enter})
+    cfg.rewards["stay_g1"] = RewardTermCfg(func=stay_g1, weight=-enter_w, params={"ckpt": enter, "waiting": enter3})
+    if enter3:  # E3 (user 2026-11-06 (a)(b)(c)): hurry in, clear the first passes, anchored harder (enter_w 3)
+      cfg.rewards["enter_approach"] = RewardTermCfg(func=enter_approach, weight=2.0)
+      cfg.rewards["enter_clear"] = RewardTermCfg(func=enter_clear, weight=3.0)
   return cfg
 
 

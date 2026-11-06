@@ -629,3 +629,12 @@ register_mjlab_task(
     rl_cfg=YsTrioJumpRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+# stage 7-9 E3 (user 2026-11-06 (a)(b)(c)): + hurry-in and first-passes-clear rewards, stay_g1 x3 also while waiting
+register_mjlab_task(
+    task_id="Mjlab-YsTrioJumpEnter3-Flat-MicroDuck",
+    env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, gaze_w=_gw, enter=_efrom, enter_w=float(_os.environ.get("YS_ENTER_W3", "3.0")), enter3=True),
+    play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, gaze_w=_gw, enter=_efrom, enter_w=float(_os.environ.get("YS_ENTER_W3", "3.0")), enter3=True),
+    rl_cfg=YsTrioJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)

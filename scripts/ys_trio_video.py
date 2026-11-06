@@ -98,7 +98,9 @@ def record(ckpt, d, secs):
       beat_scn.enter(env)
       if STOP:  # J's end call at its first hit -> both turners' circle ramps to 0 (ys_trio_scn BEAT_STOP)
         env._ys_amp = torch.full((1,), min(1.0, max(0.0, 1 - (k * dt - t_stop) / max(STOP[1], dt))), device=env.device)
-      if WALK: t_start = beat_scn.walkout_pre(env, WS)
+      if WALK:
+        sa = env._ys_amp.clone() if STOP else None; t_start = beat_scn.walkout_pre(env, WS)
+        if STOP: env._ys_amp = torch.minimum(env._ys_amp, sa)  # the start ramp and the stop ramp together
       act_j = pol(obs)
       if STOP and beat_scn.JSTAND and k * dt >= t_stop: act_j = beat_scn.jstand(obs["actor"])  # J stands (BEAT_JSTAND onnx)
       cmd.amp[:] = 1.0; cmd.freq[:] = 1.25; cmd._write(); obs, *_ = venv.step(act_j)
