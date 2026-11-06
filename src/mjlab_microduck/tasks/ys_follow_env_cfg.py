@@ -63,9 +63,14 @@ def shifted_head_command(env, command_name: str = "head_pose") -> torch.Tensor:
   return c
 
 
-def _leader_ball(env, me: str = "robot", leader: str = "partner") -> torch.Tensor:
+BLOCK_R = 0.04  # m: a blocker link's reach (occ_geo.py: 3/4/5 cm caught 51/66/77% of the trio's sightings)
+
+
+def _leader_ball(env, me: str = "robot", leader: str = "partner", blockers: tuple = ()) -> torch.Tensor:
   """(N, 3) leader's stem end in the follower's head_camera frame; hidden by the follower's own ball
-  (it hangs right below the camera) or a rope segment across the line of sight."""
+  (it hangs right below the camera), a rope segment across the line of sight, or (blockers, e.g. the
+  jumper in the trio) a body: any link origin within BLOCK_R of the line. ponytail: link-origin spheres,
+  not meshes (trio_cams.py render: all 68 unblocked-by-rope sightings went through the jumper)."""
   rob, pa = env.scene[me], env.scene[leader]
   ids = env.__dict__.setdefault("_ys_fol_ids", {})
   if me not in ids:
@@ -84,6 +89,9 @@ def _leader_ball(env, me: str = "robot", leader: str = "partner") -> torch.Tenso
                    rob.data.site_pos_w[:, own][:, None]], 1) - p0[:, None]
   rad = torch.full(pts.shape[:2], ROPE_RADIUS + 0.5 * T.BALL_R, device=L.device)
   rad[:, -1] = 1.5 * T.BALL_R  # own ball
+  for b in blockers:
+    q = env.scene[b].data.body_link_pos_w - p0[:, None]
+    pts = torch.cat([pts, q], 1); rad = torch.cat([rad, torch.full(q.shape[:2], BLOCK_R, device=L.device)], 1)
   t = ((pts * seg[:, None]).sum(-1) / seg.square().sum(-1, keepdim=True)).clamp(0, 1)
   dist = (pts - t[..., None] * seg[:, None]).norm(dim=-1)
   ok &= ~((dist < rad) & (t > 0.02) & (t < 0.9)).any(-1)

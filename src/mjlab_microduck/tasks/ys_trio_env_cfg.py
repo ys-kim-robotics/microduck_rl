@@ -30,6 +30,8 @@ import mjlab_microduck.tasks.ys_jump_env_cfg as J
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import MicroduckRlCfg
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply_inverse
 from mjlab_microduck.tasks.symmetry import _get_tensors
+import mjlab_microduck.tasks.ys_beat as B
+from mjlab_microduck.tasks.ys_beat import Beat
 from mjlab_microduck.tasks.ys_rope import ROPE_RADIUS
 from mjlab_microduck.tasks.ys_rope_duo_env_cfg import load_frozen_actor
 from mjlab_microduck.tasks.ys_rope_env_cfg import STEM_END_NOM, STEM_LEN, make_ys_rope_bob_env_cfg, set_span
@@ -198,17 +200,32 @@ class TurnerAction(JointPositionAction):
       return super().process_actions(torch.zeros_like(self._raw_actions))
     perm, sign, aperm, asign = _get_tensors(self.device)
     x = obs[self.cfg.obs_group].clone()
-    if self.cfg.mirror:
-      x = x[:, perm] * sign
+    if self.cfg.mirror:  # extra (camera) dims after the 61-D layout mirror by cfg.extra_sign (u -> -u)
+      x = torch.cat([x[:, :61][:, perm] * sign, x[:, 61:] * torch.tensor(self.cfg.extra_sign, device=x.device)], 1)
     sl = turner_slots(self._env)  # a mirrored forward circle = the reversed one (ys_rope_duo)
     if self.cfg.clock_off:  # follower (7-4 stage 3): its own clock is off by an episode offset
       off = self._env.__dict__.get("_ys_off")
+      amp = self._env.__dict__.get("_ys_famp")  # (N,) 0..1 circle size (7-6: hold the handle still, listen)
+      if self.cfg.beat:  # 7-6: ...corrected by ear (ys_beat)
+        if not hasattr(self, "_beat"):
+          self._beat = Beat(self._env)
+        c, a = self._beat.step()
+        off, amp = (c if off is None else off + c), (amp if a is None else a)
       if off is not None:
         co, so = off.cos(), off.sin()
         sl[:, 4], sl[:, 5] = sl[:, 4] * co - sl[:, 5] * so, sl[:, 5] * co + sl[:, 4] * so
+      if amp is not None:
+        sl[:, 4:6] *= amp[:, None]
     x[:, 48:61] = sl
+    lock = self._beat.f.lock if self.cfg.beat else None
+    if lock is not None and x.shape[1] > 61 and B.AFTER_LOCK == "mask":  # 7-6: camera blocked by the jumper
+      x[lock, 61:] = 0.0
     with torch.no_grad():
       a = self._actor(x)
+      if lock is not None and x.shape[1] > 61 and B.AFTER_LOCK == "switch":
+        if not hasattr(self, "_actor2"):
+          self._actor2 = load_frozen_actor(TURNER_CKPT, self.device)
+        a = torch.where(lock[:, None], self._actor2(x[:, :61]), a)
     super().process_actions(a[:, aperm] * asign if self.cfg.mirror else a)
 
 
@@ -218,6 +235,8 @@ class TurnerActionCfg(JointPositionActionCfg):
   obs_group: str = "turner"
   mirror: bool = False
   clock_off: bool = False
+  beat: bool = False
+  extra_sign: tuple = ()
 
   def build(self, env):
     return TurnerAction(self, env)
@@ -227,6 +246,12 @@ def cam_age_obs(env) -> torch.Tensor:
   """(N, 2) s since the jumper's tracker last saw the leader's head / ball (capped 1 s). B1 saw the
   ball 15% of steps, the head 0%. Must come after cam_tip and cam_ball (they advance the tracker)."""
   return torch.stack([env._ys_cam["age"], env._ys_cam_ball["age"]], -1)
+
+
+def follower_ball_obs(env) -> torch.Tensor:
+  """The back follower's tracker (6) on the leader's red ball, through the jumper's body (blocker)."""
+  import mjlab_microduck.tasks.ys_follow_env_cfg as F  # circular at module level
+  return _cam_track(env, "_ys_trio_fol", "stem_end", False, true_fn=lambda e: F._leader_ball(e, "partner", "turner", ("robot",)))
 
 
 CLOCK_FADE_STEPS = 24 * 200  # trio6: env steps (24 per iteration) over which the actor's clock fades out
@@ -343,7 +368,7 @@ def rope_overlap(env: ManagerBasedRlEnv, cap: float = 0.05) -> torch.Tensor:
   return torch.where(env.episode_length_buf > ROPE_GRACE_STEPS, pen.nan_to_num(0.0) / 0.01, 0.0)
 
 
-def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS, ball_obs: bool = False, cam_age: bool = False, follower: str | None = None, follower_off: float = math.radians(60), gaze_w: float = 0.0):
+def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS, ball_obs: bool = False, cam_age: bool = False, follower: str | None = None, follower_off: float = math.radians(60), gaze_w: float = 0.0, beat: bool = False, follower_cam: bool = False):
   cfg = J.make_ys_side_jump_env_cfg(play, half_w=J.SIDE_OVERLAP_HALF_W, both=3.0)  # side6's task
   cfg.commands["head_pose"].zero_command_prob = 0.0  # the rope always turns: always jump
   rc = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)  # turners as in the duo evals (no pushes)
@@ -384,11 +409,14 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     g.terms["actions"].params = {**(g.terms["actions"].params or {}), "action_name": f"{who}_joint_pos"}
     cfg.observations[who] = g  # command slots are overwritten by TurnerAction
   if follower:  # the back turner (partner, mirrored, green ball) follows; the front one (red ball, the duck
-    # the jumper watches) leads on the true clock. Mirrored -> a 61-D clock policy only (the symmetry table;
-    # a wider actor fails on its first layer)
+    # the jumper watches) leads on the true clock. follower_cam: a 67-D camera follower (F1) watching the
+    # leader's red ball, mirrored with it (u -> -u); the jumper in between blocks its view
     a = cfg.actions["partner_joint_pos"]
-    a.checkpoint, a.clock_off = follower, True
+    a.checkpoint, a.clock_off, a.beat = follower, True, beat
     import mjlab_microduck.tasks.ys_follow_env_cfg as F
+    if follower_cam:
+      cfg.observations["partner"].terms["leader_ball"] = ObservationTermCfg(func=follower_ball_obs)
+      a.extra_sign = (-1.0, 1.0, 1.0, -1.0, 1.0, 1.0)
     cfg.events["sample_offset"] = EventTermCfg(func=F.sample_offset, mode="reset", params={"half": follower_off})
 
   for who in ("turner", "partner"):  # a turner down: end as a timeout (no fall penalty for the jumper)
