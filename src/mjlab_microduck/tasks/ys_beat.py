@@ -41,9 +41,27 @@ K, RMAX = 2.0, math.radians(90)  # 1/s, rad/s: the drag on the clock (<= 20% tem
 # is time spent far off (start 180: follower 15/9/11/6%), so the drag is fast
 LISTEN = False  # start: hold the handle still until 3 beeps are in, start at that phase (amp 0 -> 1 in 1 s).
 # Off: rope14 never learned to hold still (beat_s0.py B, 3 s still: follower 28%, leader 12% fall)
+START_BIAS = 0.0  # s: the follower's latency calibration off by this much (robustness)
 AIR_MIN, F_ON = 0.15, 2.0  # s, N: a touchdown = the first contact after this long in the air
 HOME_R = 0.15  # m: the jumper beeps only in its spot under the rope (before it walks in there are no beeps,
 # and the follower keeps its camera logic: the correction holds at 0 until beeps come)
+
+
+def start_offset(n: int, device) -> torch.Tensor:
+  """(n,) the follower's clock offset when both turners start on the jumper's start sound (user, 2026-11-06):
+  the waiting jumper is about as far from both; each turner starts its clock at 0 when it hears the sound,
+  minus its own calibrated latency. Left over: each one's calibration error (CAL_SD) and detection timing
+  (JIT), ~5 ms between them = ~2.3 deg (a 3-beep count-in survives a missed beep: not modelled)."""
+  sd = math.sqrt(CAL_SD**2 + JIT**2)
+  return OMEGA * (sd * (torch.randn(n, device=device) - torch.randn(n, device=device)) + START_BIAS)
+
+
+def start_by_ear(env, env_ids: torch.Tensor | None) -> None:
+  """Reset event: the follower's clock offset after the start sound (start_offset)."""
+  if not hasattr(env, "_ys_off"):
+    env._ys_off = torch.zeros(env.num_envs, device=env.device)
+  ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else env_ids
+  env._ys_off[ids] = start_offset(len(ids), env.device)
 
 
 def wrap(a: torch.Tensor) -> torch.Tensor:

@@ -584,14 +584,15 @@ register_mjlab_task(
 )
 
 # stage 7-6: the follower behind (default F1, camera on the leader's red ball) keeps its camera logic until the
-# jumper is in, then corrects its clock from the jumper's left-landing beeps (ys_beat); start offset +-180 deg.
+# jumper is in, then corrects its clock from the jumper's left-landing beeps (ys_beat). Both turners start on the
+# jumper's start sound (YS_BEAT_START=ear, default: a few deg off) or anywhere in +-180 deg (random).
 # YS_BEAT_FOLLOWER / YS_BEAT_CAM=0 seat another (61-D: no camera) follower
 _bfol = _os.environ.get("YS_BEAT_FOLLOWER", "logs/rsl_rl/ys_rope/2026-11-05_23-28-14_F1/model_19699.pt")
 _bcam = _os.environ.get("YS_BEAT_CAM", "1") == "1"
 register_mjlab_task(
     task_id="Mjlab-YsTrioJumpBeat-Flat-MicroDuck",
-    env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, follower=_bfol, follower_off=3.1416, beat=True, follower_cam=_bcam),
-    play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, follower=_bfol, follower_off=3.1416, beat=True, follower_cam=_bcam),
+    env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, follower=_bfol, follower_off=3.1416, beat=True, follower_cam=_bcam, beat_start=_os.environ.get("YS_BEAT_START", "ear")),
+    play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, follower=_bfol, follower_off=3.1416, beat=True, follower_cam=_bcam, beat_start=_os.environ.get("YS_BEAT_START", "ear")),
     rl_cfg=YsTrioJumpRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
