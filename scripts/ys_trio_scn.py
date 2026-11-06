@@ -10,6 +10,7 @@ YS_BEAT_FOLLOWER/YS_BEAT_CAM choose the follower.
 Hit = end (user 2026-11-06): STREAK = rope passes (0.8 s windows from entry) before the first overlap > 0 or a
 jumper fall; a turner restart censors. BEAT_ENTER_PH="deg,..." (leader phase at the put-in; default ENTER_PH) sweeps
 the entry; BEAT_NOREF=1 skips the start-0 reference run. Also prints the leader phase at J's foot events.
+BEAT_LOAD=1: per-joint actuator torque of J / L / F from J's entry + 0.5 s (p99, max, rms vs the BAM xl330 stall).
 Also importable: away(env), enter(env) for videos."""
 import sys, math, os; sys.path.insert(0, "scripts")
 import numpy as np, torch
@@ -21,6 +22,32 @@ TRACK = ("_ys_cam", "_ys_cam_ball")  # ys_trio_env_cfg._cam_track state of the j
 INPLACE = os.environ.get("BEAT_INPLACE") == "1"  # the jumper jumps in its spot from t 0 (training-like): the 'entry' only starts the count
 BANK_OUT, BANK_IN = os.environ.get("BEAT_BANK_OUT"), os.environ.get("BEAT_BANK_IN")  # INPLACE: save its state at the
 # entry; else: put it in with that state (already jumping: a stand-in for walking in) instead of standing
+
+LOAD = os.environ.get("BEAT_LOAD") == "1"
+KT, R_OHM, V_NOM, I_MAX = 0.366, 2.811, 7.4, 1.75  # bam/params/xl330/m6.json; battery DR 6.5-8.2 V; firmware current
+# limit (bam/dynamixel/actuator.py max_current): |tau| <= KT * I_MAX = 0.64 N m whatever the voltage
+
+
+def print_load(tau, inn, names, settle):
+  """tau (T, N, 3, nj), inn (T, N): torque while the game is on (from J's entry + settle steps)."""
+  on = inn & (torch.cumsum(inn.int(), 0) > settle)
+  stall = V_NOM * KT / R_OHM
+  print(f"  actuator torque |tau| N m in play (J entry + {settle} steps), BAM xl330 stall ~{stall:.2f} N m at {V_NOM} V (6.5-8.2 V: {6.5 * KT / R_OHM:.2f}-{8.2 * KT / R_OHM:.2f})")
+  cap = KT * I_MAX; print(f"  current limit {I_MAX} A -> {cap:.3f} N m cap; sat = % of play time at >= 98% of the cap")
+  print(f"  {'joint':18s}" + "".join(f" {w + ' p99':>8s} {w + ' max':>8s} {w + ' rms':>7s} {w + ' sat':>6s}" for w in ("J", "L", "F")))
+  for j, nm in enumerate(names):
+    if nm.startswith("passive_"):
+      continue
+    row = []
+    for d in range(3):
+      x = tau[..., d, j][on].abs()
+      row.append(f" {torch.quantile(x, 0.99):8.3f} {x.max():8.3f} {x.pow(2).mean().sqrt():7.3f} {100 * (x >= 0.98 * cap).float().mean():5.1f}%")
+    print(f"  {nm:18s}" + "".join(row))
+  for d, w in enumerate(("J", "L", "F")):
+    x = tau[..., d, :][on].abs(); q = torch.quantile(x, 0.99, dim=0)
+    heat = ((x / KT) ** 2 * R_OHM).mean(0)  # W of Joule heat per motor
+    print(f"  {w}: worst p99 {q.max():.3f} N m ({names[int(q.argmax())]}), any joint at the cap {100 * (x.max(-1).values >= 0.98 * cap).float().mean():.1f}% of play, hottest motor I2R {heat.max():.2f} W ({names[int(heat.argmax())]}), all {heat.sum():.1f} W")
+
 
 def patch_cfg():  # the jumper may fall while it waits outside: drop its terminations
   import ys_eval
@@ -104,7 +131,7 @@ if __name__ == "__main__":
   ref = None; PHS = [math.radians(float(v)) for v in os.environ["BEAT_ENTER_PH"].split(",")] if os.environ.get("BEAT_ENTER_PH") else [ENTER_PH]
   RUNS = [(ph, X) for ph in PHS for X in STARTS]
   for ENTER_PH, X in RUNS:
-    globals()["ENTER_PH"] = ENTER_PH; ins, fj, rs, sole, leads = [], [], [], [], []
+    globals()["ENTER_PH"] = ENTER_PH; ins, fj, rs, sole, leads, taus = [], [], [], [], [], []
     fell = torch.zeros(N, 3, dtype=torch.bool, device=dev); ce, gap, pen, vis = [], [], [], []
     with torch.inference_mode():
       if os.environ.get("SEED"): torch.manual_seed(int(os.environ["SEED"])); torch.cuda.manual_seed_all(int(os.environ["SEED"]))
@@ -126,6 +153,7 @@ if __name__ == "__main__":
         ce.append(B.wrap(env._ys_off + act._beat.f.c * B.CORRECT).abs()); pen.append(T.rope_overlap(env))
         ins.append(env._ys_in.clone()); fj.append(rob.data.projected_gravity_b[:, 2] > -0.5); rs.append(re.clone())
         sole.append(J.foot_clearance(rob, cmd._sole) + J.FOOT_Z0); leads.append(cmd.phase - getattr(env, "_ys_delta", math.radians(60)))
+        if LOAD: taus.append(torch.stack([e.data.qfrc_actuator for e in (rob, tu, pa)], 1))  # (N, 3, nj) N m
         vis.append(env._ys_trio_fol["cur"][:, 2].clone() if cam else torch.zeros(N, device=dev))
     ok = ~fell.any(1).cpu().numpy(); t = np.arange(len(ce)) * dt
     G = torch.stack(gap).cpu().numpy()[:, ok]; CE = np.degrees(torch.stack(ce).cpu().numpy())[:, ok]; V = torch.stack(vis).cpu().numpy()[:, ok]
@@ -169,6 +197,7 @@ if __name__ == "__main__":
     for nm, x, up in (("R up", SO[:, :, 1], 1), ("L down", SO[:, :, 0], 0), ("L up", SO[:, :, 0], 1)):
       v = ev(x, up); mu = np.degrees(np.angle(np.exp(1j * np.radians(v)).mean())); sd = np.degrees(np.std(np.angle(np.exp(1j * np.radians(v - mu)))))
       print(f"  leader phase at {nm}: mean {mu:6.1f} deg  sd {sd:4.1f}  (n {len(v)})")
+    if LOAD: print_load(torch.stack(taus), torch.stack(ins), rob.joint_names, int(0.5 / dt))
     ph_s = "MU_LAND" if ENTER_PH is None else f"{math.degrees(ENTER_PH):.0f}"
     print(f"enter {ph_s} start {X}: STREAK (hit=end) median {np.median(stk):4.1f}  mean {stk.mean():4.1f}  >=10 {100 * (stk >= 10).mean():3.0f}%  >=20 {100 * (stk >= 20).mean():3.0f}%"
           f"  hit in passes 1-3 {100 * (hit & (stk < 3)).mean():3.0f}%  1st pass {100 * (hit & (stk == 0)).mean():3.0f}%  no hit to end {100 * (~hit).mean():3.0f}% (max ~{full})", flush=True)
