@@ -34,8 +34,8 @@ LOCK_N, LOCK_OF, LOCK_TOL = 4, 5, math.radians(15)  # 4 of the newest 5 samples 
 # lockless, false beeps before the jumper came in dragged the clock at random (start 0: motion error p50 30-51 deg);
 # 4 in a row: a false beep among them most of the time (lock p50 6-9 s after entry). ponytail: noise alone locks
 # ~0.3% per false beep (~1 per 19 min at 0.3/s); the real beat then unlocks it (NREJ)
-AFTER_LOCK = "keep"  # follower network once locked: keep (F1 + its blocked camera), mask (camera input 0),
-# switch (rope14: clock only)
+AFTER_LOCK = "switch"  # follower network once locked: switch (rope14: clock only), keep (F1 + its blocked
+# camera), mask (camera input 0). beat_scn.py, motion error p50/p90 after entry: switch 6/14, keep 12/31, mask 12/30
 K, RMAX = 2.0, math.radians(90)  # 1/s, rad/s: the drag on the clock (<= 20% tempo). beat_s0.py A: rope14
 # takes even a clock jump (start 120 deg, drag 22.5/45/90 deg/s or a jump: clean 71/73/72/76%); what costs falls
 # is time spent far off (start 180: follower 15/9/11/6%), so the drag is fast
