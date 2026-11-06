@@ -572,13 +572,23 @@ register_mjlab_task(
     runner_cls=MicroduckOnPolicyRunner,
 )
 
-# stage 7-4 (3, integration): B1-style jumper + a follower (YS_FOLLOWER ckpt) as the front turner, rope14 leader behind
-_fol = _os.environ.get("YS_FOLLOWER")
-if _fol:
-    register_mjlab_task(
-        task_id="Mjlab-YsTrioJumpFollow-Flat-MicroDuck",
-        env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, cam_age=bool(_os.environ.get("YS_AGE")), follower=_fol),
-        play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, cam_age=bool(_os.environ.get("YS_AGE")), follower=_fol),
-        rl_cfg=YsTrioJumpRlCfg,
-        runner_cls=MicroduckOnPolicyRunner,
-    )
+# stage 7-4 (integration): B1-style jumper, rope14 leader in FRONT (red ball, the duck the jumper watches), a 61-D
+# follower (YS_FOLLOWER ckpt, default rope14) behind on a clock off by FOFF / a random +-60 deg
+_fol = _os.environ.get("YS_FOLLOWER", "logs/rsl_rl/ys_rope/2026-11-03_23-03-17_rope14_short/model_19200.pt")
+register_mjlab_task(
+    task_id="Mjlab-YsTrioJumpFollow-Flat-MicroDuck",
+    env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, cam_age=bool(_os.environ.get("YS_AGE")), follower=_fol),
+    play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, cam_age=bool(_os.environ.get("YS_AGE")), follower=_fol),
+    rl_cfg=YsTrioJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# stage 7-5 (1): YsTrioJumpBall + gaze (keep the leader's head in the camera's central band, YS_GAZE_W)
+_gw = float(_os.environ.get("YS_GAZE_W", "0.5"))
+register_mjlab_task(
+    task_id="Mjlab-YsTrioJumpGaze-Flat-MicroDuck",
+    env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, gaze_w=_gw),
+    play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, gaze_w=_gw),
+    rl_cfg=YsTrioJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)

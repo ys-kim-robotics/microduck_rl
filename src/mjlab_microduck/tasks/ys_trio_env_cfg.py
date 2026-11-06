@@ -86,10 +86,8 @@ CAM_NOISE = 0.01  # normalized image units (~6 px at 1280)
 CAM_DROP = 0.05
 
 
-def _cam_true(env, site: str = "head_imu", occlude: bool = False) -> torch.Tensor:
-  """(N, 3) u, v in [-1, 1] (right, up) of a turner site (head_imu: its head; stem_end: the red ball) in
-  the jumper's head_camera site frame (x forward, y left, z up: probed), valid = in front and in the
-  frame (and, occlude, not behind a rope link)."""
+def _cam_vec(env, site: str):
+  """(d, p0, p1): a leader (front turner) site in the jumper's head_camera frame, and both world points."""
   rob, tu = env.scene["robot"], env.scene["turner"]
   ids = env.__dict__.setdefault("_ys_cam_ids", {})
   if site not in ids:
@@ -97,7 +95,14 @@ def _cam_true(env, site: str = "head_imu", occlude: bool = False) -> torch.Tenso
   i, j = ids[site]
   p0, p1 = rob.data.site_pos_w[:, i], tu.data.site_pos_w[:, j]
   R = matrix_from_quat(rob.data.site_quat_w[:, i])
-  d = (R.transpose(1, 2) @ (p1 - p0)[..., None])[..., 0]
+  return (R.transpose(1, 2) @ (p1 - p0)[..., None])[..., 0], p0, p1
+
+
+def _cam_true(env, site: str = "head_imu", occlude: bool = False) -> torch.Tensor:
+  """(N, 3) u, v in [-1, 1] (right, up) of a turner site (head_imu: its head; stem_end: the red ball) in
+  the jumper's head_camera site frame (x forward, y left, z up: probed), valid = in front and in the
+  frame (and, occlude, not behind a rope link)."""
+  d, p0, p1 = _cam_vec(env, site)
   x = d[:, 0].clamp(min=1e-3)
   u, v = -d[:, 1] / x / CAM_TAN_H, d[:, 2] / x / CAM_TAN_V
   ok = (d[:, 0] > 0.02) & (u.abs() <= 1) & (v.abs() <= 1)
@@ -224,12 +229,6 @@ def cam_age_obs(env) -> torch.Tensor:
   return torch.stack([env._ys_cam["age"], env._ys_cam_ball["age"]], -1)
 
 
-def trio_follower_ball_obs(env) -> torch.Tensor:
-  """The front turner as follower: the leader (partner)'s ball through its own camera (6)."""
-  import mjlab_microduck.tasks.ys_follow_env_cfg as F  # circular at module level
-  return _cam_track(env, "_ys_trio_fol", "stem_end", False, true_fn=lambda e: F._leader_ball(e, "turner", "partner"))
-
-
 CLOCK_FADE_STEPS = 24 * 200  # trio6: env steps (24 per iteration) over which the actor's clock fades out
 
 
@@ -295,6 +294,19 @@ def head_back(env: ManagerBasedRlEnv, tol: float = 0.015, cap: float = 0.06) -> 
   return (d[:, 0] - HEAD_X0 - tol).clamp(0, cap) / 0.01
 
 
+GAZE_V, GAZE_H = math.radians(14), math.radians(24)  # free band: frame half-angles 18.6 / 31 deg minus the
+# leader head's own swing (trio6, camera level: -12..+9 deg vertical p10-p90)
+
+
+def gaze(env: ManagerBasedRlEnv, v_tol: float = GAZE_V, h_tol: float = GAZE_H, cap: float = math.radians(30)) -> torch.Tensor:
+  """(>0, weight < 0) per 10 deg the leader's head sits outside the central band of the jumper's camera.
+  head_back alone was met by pitching the head up: camera +3 deg (trio6) -> +35 (B1), the leader's head
+  36 deg below the axis, out of frame 100% (trio_cams.py, 2026-11-06). Behind the camera = both caps."""
+  d, _, _ = _cam_vec(env, "head_imu")
+  el, az = torch.atan2(d[:, 2], d[:, 0]), torch.atan2(-d[:, 1], d[:, 0])
+  return ((el.abs() - v_tol).clamp(0, cap) + (az.abs() - h_tol).clamp(0, cap)) / math.radians(10)
+
+
 def connect_trio(spec: mujoco.MjSpec) -> None:
   for a, b in (("rope/rope_start", "partner/stem_end"), ("rope/rope_end", "turner/stem_end")):
     eq = spec.add_equality(type=mujoco.mjtEq.mjEQ_CONNECT, objtype=mujoco.mjtObj.mjOBJ_SITE, name1=a, name2=b)
@@ -331,7 +343,7 @@ def rope_overlap(env: ManagerBasedRlEnv, cap: float = 0.05) -> torch.Tensor:
   return torch.where(env.episode_length_buf > ROPE_GRACE_STEPS, pen.nan_to_num(0.0) / 0.01, 0.0)
 
 
-def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS, ball_obs: bool = False, cam_age: bool = False, follower: str | None = None, follower_off: float = math.radians(60)):
+def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS, ball_obs: bool = False, cam_age: bool = False, follower: str | None = None, follower_off: float = math.radians(60), gaze_w: float = 0.0):
   cfg = J.make_ys_side_jump_env_cfg(play, half_w=J.SIDE_OVERLAP_HALF_W, both=3.0)  # side6's task
   cfg.commands["head_pose"].zero_command_prob = 0.0  # the rope always turns: always jump
   rc = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)  # turners as in the duo evals (no pushes)
@@ -371,12 +383,11 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
       g.terms[t].params = {**(g.terms[t].params or {}), "asset_cfg": SceneEntityCfg(who)}
     g.terms["actions"].params = {**(g.terms["actions"].params or {}), "action_name": f"{who}_joint_pos"}
     cfg.observations[who] = g  # command slots are overwritten by TurnerAction
-  if follower:  # 7-4 stage 3: the front turner (unmirrored, the duck the jumper watches) follows the leader
-    a = cfg.actions["turner_joint_pos"]
+  if follower:  # the back turner (partner, mirrored, green ball) follows; the front one (red ball, the duck
+    # the jumper watches) leads on the true clock. Mirrored -> a 61-D clock policy only (the symmetry table;
+    # a wider actor fails on its first layer)
+    a = cfg.actions["partner_joint_pos"]
     a.checkpoint, a.clock_off = follower, True
-    cfg.observations["turner"].terms["leader_ball"] = ObservationTermCfg(func=trio_follower_ball_obs)
-    if torch.load(follower, map_location="cpu", weights_only=False)["actor_state_dict"]["mlp.0.weight"].shape[1] == 68:  # F3+: + age
-      cfg.observations["turner"].terms["leader_ball_age"] = ObservationTermCfg(func=lambda env: env._ys_trio_fol["age"][:, None])
     import mjlab_microduck.tasks.ys_follow_env_cfg as F
     cfg.events["sample_offset"] = EventTermCfg(func=F.sample_offset, mode="reset", params={"half": follower_off})
 
@@ -399,6 +410,8 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
   if cam_age:  # B2+: actor 73:75, critic 90:92
     for grp in ("actor", "critic"):
       cfg.observations[grp].terms["cam_age"] = ObservationTermCfg(func=cam_age_obs)
+  if gaze_w:
+    cfg.rewards["gaze"] = RewardTermCfg(func=gaze, weight=-gaze_w)
   if head_w:
     cfg.rewards["head_back"] = RewardTermCfg(func=head_back, weight=-head_w, params={"tol": head_tol})
   if no_clock:
