@@ -638,3 +638,14 @@ register_mjlab_task(
     rl_cfg=YsTrioJumpRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+# stage 7-12 (3) (user 2026-11-07 evening): Enter3 + routed behavior cloning: settled at the spot -> E5 (YS_BC_EXPERT),
+# waiting / running in -> the student's start (YS_BC_ANCHOR), the transition -> PPO alone (ys_trio_env_cfg.bc_gate)
+from .ys_trio_env_cfg import YsTrioJumpBcRlCfg  # noqa: E402
+register_mjlab_task(
+    task_id="Mjlab-YsTrioJumpEnterBc-Flat-MicroDuck",
+    env_cfg=make_ys_trio_jump_env_cfg(delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, gaze_w=_gw, enter=_efrom, enter_w=float(_os.environ.get("YS_ENTER_W3", "3.0")), enter3=True, bc=True),
+    play_env_cfg=make_ys_trio_jump_env_cfg(play=True, delta_half=0.349, cam_obs=True, rope_windows=True, no_clock=True, head_w=_hw, head_tol=_ht, clock_fade=0, ball_obs=True, gaze_w=_gw, enter=_efrom, enter_w=float(_os.environ.get("YS_ENTER_W3", "3.0")), enter3=True, bc=True),
+    rl_cfg=YsTrioJumpBcRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)

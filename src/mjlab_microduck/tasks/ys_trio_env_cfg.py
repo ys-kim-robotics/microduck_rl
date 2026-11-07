@@ -451,6 +451,14 @@ def _mode(n: int, dev) -> torch.Tensor:
   return torch.randint(0, 3, (n,), device=dev) if ENTER_MODE == "mix" else torch.full((n,), MODES[ENTER_MODE], device=dev)
 
 
+# 7-12 entry side (user 2026-11-07 evening: where you come in from changes the odds), YS_ENTER_SIDE: "+" = J's left (the rope
+# comes over the top toward J, down in front of it at 0-60 deg, then away along the floor: front door, waits 12-20 cm);
+# "-" = the far side (the rope sweeps along the floor TOWARD J out to -28 cm at 180-260 deg and rises in front of it: back
+# door; J's spot is 8 cm off the rope axis toward +y, so J waits 36-44 cm out and sets off as the rope rises past it,
+# 250-290 deg: ~0.62 s until it sweeps the floor again at 180); "mix" = per entry
+ENTER_SIDE = _os.environ.get("YS_ENTER_SIDE", "+")
+ENTER_YNEG = tuple(float(v) for v in _os.environ.get("YS_ENTER_YNEG", "0.36,0.44").split(","))
+ENTER_PH_NEG = tuple(math.radians(float(v)) for v in _os.environ.get("YS_ENTER_PH_NEG", "250,290").split(","))
 ENTER_TURN_D, FWD_Y, FWD_PASSES, FWD_TURN_RATE, TURN_GAIN, TURN_WMAX = 0.12, -0.05, 3, 0.6, 6.0, 3.0  # m, m, -, rad/s, 1/s, rad/s
 FOOT_HX = 0.027  # m: sole half-length (J._CORNERS)
 
@@ -469,6 +477,18 @@ def _face(st: torch.Tensor, turn: torch.Tensor) -> None:
 ENTER_WAIT = (2.5, 4.0)  # s: earliest set-off (the rope has spun up: ROPE_GRACE_STEPS 2 s)
 
 
+def _draw(e, ids, near, ymax, dev) -> None:
+  """one entry's draw: side (+1 / -1), signed waiting place y0, set-off phase, scenario, facing (A/B face the spot)."""
+  u = lambda lo, hi: torch.empty(len(ids), device=dev).uniform_(lo, hi)
+  sd = torch.full((len(ids),), -1.0 if ENTER_SIDE == "-" else 1.0, device=dev)
+  if ENTER_SIDE == "mix": sd = torch.where(torch.rand(len(ids), device=dev) < 0.5, 1.0, -1.0)
+  sd = torch.where(near, 1.0, sd); e["side"][ids] = sd
+  e["y0"][ids] = torch.where(near, u(0.0, 0.03), torch.where(sd > 0, u(min(ENTER_YMIN, ymax), ymax), -u(*ENTER_YNEG)))
+  e["ph"][ids] = torch.where(sd > 0, u(*ENTER_PH), u(*ENTER_PH_NEG))
+  e["mode"][ids] = _mode(len(ids), dev); e["fw"][ids] = (e["mode"][ids] > 0) & ~near
+  e["d_prev"][ids] = e["y0"][ids].abs()
+
+
 def enter_reset(env, env_ids: torch.Tensor | None, full: bool = False) -> None:
   """7-9 reset event (after reset_base): the jumper stands y0 ~ U[0, ymax] beside its spot and waits there (its
   centering command holds it) until enter_hook sends it in. User 2026-11-06: walk in later; this is that skill."""
@@ -477,27 +497,24 @@ def enter_reset(env, env_ids: torch.Tensor | None, full: bool = False) -> None:
   if not hasattr(env, "_ys_enter"):
     z = lambda: torch.zeros(n, device=dev)
     env._ys_enter = {"y0": z(), "t": z(), "ph": z(), "t_near": z(), "go": z().bool(), "near": z().bool(), "t_go": z(),
-                     "d_prev": z(), "pk": z().long(), "bad": z().bool(), "t_hit": z(), "fw": z().bool(), "t_turn": z(), "ent": z().bool(), "mode": z().long(), "d": z()}
+                     "d_prev": z(), "pk": z().long(), "bad": z().bool(), "t_hit": z(), "fw": z().bool(), "t_turn": z(), "ent": z().bool(), "mode": z().long(), "d": z(), "side": z()}
     env._ys_center_hook = enter_hook
   start = env.__dict__.setdefault("_ys_enter_start", env.common_step_counter)
   ymax = ENTER_Y if (full or ENTER_RAMP == 0) else ENTER_Y * min(1.0, max(0.1, (env.common_step_counter - start) / (ENTER_RAMP * 24)))
   u = lambda lo, hi: torch.empty(len(ids), device=dev).uniform_(lo, hi)
   e, rob = env._ys_enter, env.scene["robot"]
   near = torch.rand(len(ids), device=dev) < ENTER_NEAR_P
-  e["y0"][ids] = torch.where(near, u(0.0, 0.03), u(min(ENTER_YMIN, ymax), ymax))
-  e["t"][ids], e["ph"][ids] = u(*ENTER_WAIT), u(*ENTER_PH)
+  _draw(e, ids, near, ymax, dev); e["t"][ids] = u(*ENTER_WAIT)
   e["go"][ids], e["near"][ids], e["t_near"][ids], e["t_go"][ids], e["pk"][ids], e["bad"][ids] = False, False, 0.0, torch.inf, 0, False
-  e["d_prev"][ids] = e["y0"][ids]
   e["t_hit"][ids] = torch.inf
-  e["mode"][ids] = _mode(len(ids), dev)
-  e["ent"][ids] = ~near; e["fw"][ids] = (e["mode"][ids] > 0) & ~near; e["t_turn"][ids] = torch.inf
+  e["ent"][ids] = ~near; e["t_turn"][ids] = torch.inf
   # reset_base's pose again from the default state (its write is not in root_link_pos_w until the next forward: reading
   # that gave the previous episode's fallen pose, smoke test 63/64 falls per iteration), plus y0
   pr = env.event_manager.get_term_cfg("reset_base").params["pose_range"]
   st = rob.data.default_root_state[ids].clone(); st[:, 7:] = 0.0
   st[:, :3] += env.scene.env_origins[ids] + torch.stack([u(*pr.get(k, (0.0, 0.0))) for k in ("x", "y", "z")], 1)
   st[:, 1] += e["y0"][ids]  # the jumper faces +x: its left (+y) is the side the rope comes down on, then sweeps away from
-  _face(st, -0.5 * math.pi * e["fw"][ids].float())  # A/B: facing the spot (-y)
+  _face(st, -0.5 * math.pi * e["side"][ids] * e["fw"][ids].float())  # A/B: facing the spot
   rob.write_root_state_to_sim(st, ids)
 
 
@@ -509,16 +526,16 @@ def enter_hook(cmd):
   lead = cmd.phase - env.__dict__.get("_ys_delta", DELTA0)
   go = ~e["go"] & (t >= e["t"]) & (torch.remainder(lead - e["ph"], 2 * math.pi) < 2 * math.pi * cmd.freq.abs() * env.step_dt)
   e["go"] |= go; e["t_go"] = torch.where(go, t, e["t_go"])
-  fw, h = e["fw"], -0.5 * math.pi
+  fw, h = e["fw"], -0.5 * math.pi * e["side"]  # A/B run-in heading: facing the spot
   fwA, fwB = fw & (e["mode"] == 1), fw & (e["mode"] == 2)
   # B: forward-facing until FWD_PASSES passes at FWD_Y, then a slow turn while the spot slides to 0
   e["t_turn"] = torch.where(fwB & e["near"] & e["t_turn"].isinf(), t + 0.8 * FWD_PASSES, e["t_turn"])
-  yB = (h + FWD_TURN_RATE * (t - e["t_turn"]).clamp(min=0)).clamp(max=0.0)
+  yB = h * (1 - FWD_TURN_RATE * (t - e["t_turn"]).clamp(min=0) / (0.5 * math.pi)).clamp(min=0)
   sy = torch.where(fwB, FWD_Y * yB / h, 0.0)
   spot = torch.stack([torch.zeros_like(t), torch.where(e["go"], sy, e["y0"])], 1)
   d = (env.scene.env_origins[:, :2] + torch.stack([torch.zeros_like(t), sy], 1) - cmd._robot.data.root_link_pos_w[:, :2]).norm(dim=-1)
   e["d"] = d
-  new =e["go"] & ~e["near"] & (d < ENTER_NEAR)
+  new = e["go"] & ~e["near"] & (d < ENTER_NEAR)
   e["t_near"] = torch.where(new, t, e["t_near"]); e["near"] |= new
   walk = e["go"] & ~e["near"]
   g = ENTER_DASH / d.clamp(min=ENTER_NEAR) if ENTER_DASH else ENTER_GAIN
@@ -550,15 +567,53 @@ def enter_again(env, env_ids) -> None:
     return
   u = lambda lo, hi: torch.empty(len(ids), device=env.device).uniform_(lo, hi)
   ymax = ENTER_Y if ENTER_RAMP == 0 else ENTER_Y * min(1.0, max(0.1, (env.common_step_counter - env._ys_enter_start) / (ENTER_RAMP * 24)))
-  e["y0"][ids] = u(min(ENTER_YMIN, ymax), ymax); e["t"][ids] = t[ids] + u(*ENTER_AGAIN_WAIT); e["ph"][ids] = u(*ENTER_PH)
+  _draw(e, ids, torch.zeros(len(ids), dtype=torch.bool, device=env.device), ymax, env.device); e["t"][ids] = t[ids] + u(*ENTER_AGAIN_WAIT)
   e["go"][ids], e["near"][ids], e["t_near"][ids], e["t_go"][ids], e["pk"][ids], e["bad"][ids] = False, False, 0.0, torch.inf, 0, False
-  e["d_prev"][ids], e["t_hit"][ids], e["t_turn"][ids] = e["y0"][ids], torch.inf, torch.inf
-  e["mode"][ids] = _mode(len(ids), env.device); e["fw"][ids] = e["mode"][ids] > 0
+  e["t_hit"][ids], e["t_turn"][ids] = torch.inf, torch.inf
   st = rob.data.default_root_state[ids].clone(); st[:, 7:] = 0.0
   st[:, :3] += env.scene.env_origins[ids]; st[:, 1] += e["y0"][ids]
-  _face(st, -0.5 * math.pi * e["fw"][ids].float())
+  _face(st, -0.5 * math.pi * e["side"][ids] * e["fw"][ids].float())
   rob.write_root_state_to_sim(st, ids)
   rob.write_joint_state_to_sim(rob.data.default_joint_pos[ids].clone(), torch.zeros_like(rob.data.default_joint_pos[ids]), env_ids=ids)
+  env.sim.forward()  # this step's obs read the new pose (step events run after the step's forward)
+
+
+ENTER_BANK = _os.environ.get("YS_ENTER_BANK")  # (2) (user 2026-11-07): the entry policy's arrival states (s10/bank_rec.py)
+BANK_TRACK = ("_ys_cam", "_ys_cam_ball")  # the jumper's camera trackers (_cam_track state)
+
+
+def bank_put(env, env_ids) -> None:
+  """(2) step event, J at its spot from the reset (YS_ENTER_NEAR_P=1): the in-place jumper learns to take over from
+  where the entry policy (N1c) leaves it. N1c entering then E5 from arrival: >=10 passes 0-2% though E5 in place does
+  74%: the arrival states are not ones E5 has seen. Each env, once due, is put into a random recorded arrival state
+  (root, joints, camera-tracker memory) when the leader phase reaches that state's own phase; due again
+  ENTER_AGAIN_PASSES passes later or 0.5 s after a hit. Sim-only training trick: the actor never sees it."""
+  e, rob = env._ys_enter, env.scene["robot"]; t = env.episode_length_buf * env.step_dt; dev = env.device
+  if "_ys_bank" not in env.__dict__:
+    env._ys_bank = torch.load(ENTER_BANK, map_location=dev, weights_only=False)
+    env._ys_bank_i = torch.randint(0, env._ys_bank["ph"].shape[0], (env.num_envs,), device=dev)
+    env._ys_bank_due = torch.empty(env.num_envs, device=dev).uniform_(*ENTER_WAIT)
+  bk, due = env._ys_bank, env._ys_bank_due
+  fresh = env.episode_length_buf <= 1
+  due[fresh] = torch.empty(int(fresh.sum()), device=dev).uniform_(*ENTER_WAIT)
+  hit = e["go"] & e["t_hit"].isinf() & ((rope_overlap(env) > 0) | (rob.data.projected_gravity_b[:, 2] > -0.5))
+  e["t_hit"] = torch.where(hit, t, e["t_hit"]); due[:] = torch.where(hit, torch.minimum(due, t + 0.5), due)
+  cmd = env.command_manager.get_term("head_pose")
+  lead = cmd.phase - env.__dict__.get("_ys_delta", DELTA0)
+  ph = bk["ph"][env._ys_bank_i]
+  ids = ((t >= due) & (torch.remainder(lead - ph, 2 * math.pi) < 2 * math.pi * cmd.freq.abs() * env.step_dt)).nonzero().flatten()
+  if len(ids) == 0:
+    return
+  i = env._ys_bank_i[ids]
+  rob.write_root_state_to_sim(torch.cat([bk["pos"][i] + env.scene.env_origins[ids], bk["quat"][i], bk["lin"][i], bk["ang"][i]], 1), ids)
+  rob.write_joint_state_to_sim(bk["q"][i].clone(), bk["qd"][i].clone(), env_ids=ids)
+  for kf, v in bk.items():
+    key, _, f = kf.partition(".")
+    if f and key in env.__dict__ and f in env.__dict__[key]: env.__dict__[key][f][ids] = v[i].to(env.__dict__[key][f].dtype)
+  e["go"][ids], e["near"][ids], e["t_go"][ids], e["t_near"][ids], e["pk"][ids], e["bad"][ids] = True, True, t[ids], t[ids], 0, False
+  e["t_hit"][ids], e["fw"][ids], e["mode"][ids] = torch.inf, False, 0
+  due[ids] = t[ids] + 0.8 * ENTER_AGAIN_PASSES + torch.rand(len(ids), device=dev)
+  env._ys_bank_i[ids] = torch.randint(0, bk["ph"].shape[0], (len(ids),), device=dev)
   env.sim.forward()  # this step's obs read the new pose (step events run after the step's forward)
 
 
@@ -595,6 +650,7 @@ def enter_late(env, after: float = 0.6) -> torch.Tensor:
   arrived or not. N1@3000 (A/B) backed away from the turning rope against a +0.8 m/s command (19 -> 37 cm in 3 s):
   outside the rope its jump rewards cost nothing. At -1/cm staying out outweighs a hit (rope_overlap -3/cm, a few steps)."""
   e, t = env._ys_enter, env.episode_length_buf * env.step_dt
+  after = after + (e["y0"].abs() - 0.20).clamp(min=0) / 0.5  # the far side's 36-44 cm run: ~1 s
   return (e["d"] - ENTER_NEAR).clamp(min=0) / 0.01 * (e["go"] & (t - e["t_go"] > after))
 
 
@@ -612,7 +668,72 @@ def stay_g1(env, ckpt: str, settle: float = 1.0, waiting: bool = False) -> torch
   return (env.action_manager.action - ref).square().mean(-1) * on
 
 
-def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS, ball_obs: bool = False, cam_age: bool = False, follower: str | None = None, follower_off: float = math.radians(60), gaze_w: float = 0.0, beat: bool = False, follower_cam: bool = False, beat_start: str = "ear", enter: str | None = None, enter_w: float = 1.0, pick: bool = False, enter3: bool = False):
+# (3) distillation (user 2026-11-07 evening): one student (from N1c), PPO + behavior cloning, routed per frame. Settled
+# at the spot facing L (>= BC_SETTLE s after arriving): taught by E5 (its clock slots zeroed: E5 is clock-free). Waiting or
+# running in: anchored to N1c, the student's start (velstand run-3 lesson, distill.py: BC on one slice rewrites the
+# shared weights unless the rest is anchored). The first BC_SETTLE s at the spot, and B facing -y, belong to PPO alone.
+BC_SETTLE = 1.0
+
+
+def bc_gate(env) -> torch.Tensor:
+  """(N, 2) [E5 teaches, N1c anchors]: sim-only routing for PpoWithJumpBc in its own obs group ("bc": stored in the
+  rollout, never an actor or critic input)."""
+  e = env.__dict__.get("_ys_enter")
+  if e is None:
+    return torch.zeros(env.num_envs, 2, device=env.device)
+  t = env.episode_length_buf * env.step_dt
+  teach = e["go"] & e["near"] & (t - e["t_near"] > BC_SETTLE) & (_yaw(env.scene["robot"]).abs() < 0.3)
+  return torch.stack([teach, ~e["go"] | ~e["near"]], -1).float()
+
+
+from mjlab_microduck.tasks.distill import PpoWithExpertBc, PpoWithExpertBcCfg, _with_flat, default_bc_cfg  # noqa: E402
+
+
+class PpoWithJumpBc(PpoWithExpertBc):
+  """(3) PpoWithExpertBc routed by the "bc" obs group (bc_gate) instead of the tilt: expert = E5 on settled frames
+  (clock_slice zeroed in its input), anchor = N1c on entry frames, everything else PPO only."""
+
+  def _bc_update(self) -> dict[str, float]:
+    cfg = self.bc_cfg
+    obs_td = self.storage.observations.flatten(0, 1)
+    gate = obs_td["bc"]; teach, anchor = gate[:, 0] > 0.5, gate[:, 1] > 0.5
+    stats = {"jump_bc_teach_frac": teach.float().mean().item(), "jump_bc_anchor_frac": anchor.float().mean().item()}
+    if teach.sum().item() < cfg["min_samples"]:
+      teach = torch.zeros_like(teach)
+    idx = (teach | (anchor & (self.anchor is not None))).nonzero().flatten()
+    if idx.numel() == 0:
+      stats["expert_bc"] = 0.0
+      return stats
+    groups = list(self.actor.obs_groups)
+    obs_td, teach = obs_td[idx], teach[idx]
+    weight = torch.where(teach, float(cfg["coef"]), float(cfg.get("anchor_coef", 0.0)))
+    with torch.no_grad():
+      target = torch.zeros(idx.numel(), self.storage.actions.shape[-1], device=self.device)
+      if teach.any():
+        td = obs_td[teach].clone(); flat = torch.cat([td[g] for g in groups], -1).clone()
+        lo, hi = cfg["clock_slice"]; flat[:, lo:hi] = 0.0
+        target[teach] = self.expert(_with_flat(td, groups, flat))
+      if (~teach).any():
+        target[~teach] = self.anchor(obs_td[~teach])
+    n = idx.numel(); mb = max(cfg.get("min_mini_batch", 1), n // cfg["mini_batches"]); total, steps = 0.0, 0
+    for _ in range(cfg["epochs"]):
+      perm = torch.randperm(n, device=self.device)
+      for st in range(0, n, mb):
+        sel = perm[st:st + mb]
+        loss = (weight[sel] * (self.actor(obs_td[sel]) - target[sel]).pow(2).mean(dim=1)).mean()
+        self.bc_optimizer.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm); self.bc_optimizer.step()
+        total += loss.item(); steps += 1
+    stats["expert_bc"] = total / max(steps, 1)
+    return stats
+
+
+@dataclass
+class PpoWithJumpBcCfg(PpoWithExpertBcCfg):
+  class_name: str = "mjlab_microduck.tasks.ys_trio_env_cfg.PpoWithJumpBc"
+
+
+def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_obs: bool = False, cam_obs: bool = False, rope_windows: bool = False, no_clock: bool = False, head_w: float = 0.0, head_tol: float = 0.015, clock_fade: int = CLOCK_FADE_STEPS, ball_obs: bool = False, cam_age: bool = False, follower: str | None = None, follower_off: float = math.radians(60), gaze_w: float = 0.0, beat: bool = False, follower_cam: bool = False, beat_start: str = "ear", enter: str | None = None, enter_w: float = 1.0, pick: bool = False, enter3: bool = False, bc: bool = False):
   cfg = J.make_ys_side_jump_env_cfg(play, half_w=J.SIDE_OVERLAP_HALF_W, both=3.0)  # side6's task
   cfg.commands["head_pose"].zero_command_prob = 0.0  # the rope always turns: always jump
   rc = make_ys_rope_bob_env_cfg(play=True, stay=True, reverse=True)  # turners as in the duo evals (no pushes)
@@ -707,6 +828,8 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     # while waiting, so anchoring there anchors a faller); E3b: from E1@13199, anchor at the spot only
     if float(_os.environ.get("YS_EARLY_W", "0")) > 0:  # E5: the spin-up's overlap, extra (x YS_EARLY_W of rope_overlap's -3)
       cfg.rewards["rope_overlap_early"] = RewardTermCfg(func=rope_overlap_early, weight=-3.0 * float(_os.environ["YS_EARLY_W"]))
+    if ENTER_BANK:  # (2): put into the entry policy's arrival states
+      cfg.events["bank_put"] = EventTermCfg(func=bank_put, mode="step")
     if _os.environ.get("YS_ENTER_AGAIN") == "1":  # E6: several walk-ins per episode
       cfg.events["enter_again"] = EventTermCfg(func=enter_again, mode="step")
     if enter3:  # E3 (user 2026-11-06 (a)(b)(c)): hurry in, clear the first passes, anchored harder (enter_w 3)
@@ -714,7 +837,16 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
       cfg.rewards["enter_clear"] = RewardTermCfg(func=enter_clear, weight=3.0)
       if float(_os.environ.get("YS_ENTER_LATE_W", "0")) > 0:  # N1b: staying out of the rope costs
         cfg.rewards["enter_late"] = RewardTermCfg(func=enter_late, weight=-float(_os.environ["YS_ENTER_LATE_W"]))
+  if bc:  # (3): the BC routing (sim-only obs group, see bc_gate)
+    from mjlab.managers import ObservationGroupCfg
+    cfg.observations["bc"] = ObservationGroupCfg(terms={"gate": ObservationTermCfg(func=bc_gate)}, concatenate_terms=True, enable_corruption=False)
   return cfg
 
 
 YsTrioJumpRlCfg = replace(MicroduckRlCfg, experiment_name="ys_trio_jump")
+_alg = MicroduckRlCfg.algorithm  # (3): the same PPO, + routed BC (expert E5, anchor N1c: YS_BC_EXPERT / YS_BC_ANCHOR)
+YsTrioJumpBcRlCfg = replace(YsTrioJumpRlCfg, algorithm=PpoWithJumpBcCfg(
+  **{f: getattr(_alg, f) for f in _alg.__dataclass_fields__ if f not in ("class_name", "bc_cfg")},
+  bc_cfg={**default_bc_cfg(), "checkpoint_path": _os.environ.get("YS_BC_EXPERT", "logs/rsl_rl/ys_trio_jump/2026-11-07_01-53-39_E5/model_13199.pt"),
+          "anchor_checkpoint_path": _os.environ.get("YS_BC_ANCHOR"), "coef": 1.0, "anchor_coef": float(_os.environ.get("YS_BC_ANCHOR_W", "0.5")),
+          "clock_slice": (51, 55)}))
