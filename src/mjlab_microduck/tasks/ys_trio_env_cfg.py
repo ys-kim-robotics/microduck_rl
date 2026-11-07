@@ -463,18 +463,76 @@ def rope_foot_touch(env) -> torch.Tensor:
     rope = [i for i in range(m.ngeom) if bn(i).startswith("rope/rope_")]
     env._ys_touch_ids = (torch.tensor(feet, device=env.device), torch.tensor(rope, device=env.device))
   feet, rope = env._ys_touch_ids
-  n = int(torch.as_tensor(d.nacon[0])); out = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-  if n == 0:
-    return out
-  g = torch.as_tensor(d.contact.geom[:n]).long(); w = torch.as_tensor(d.contact.worldid[:n]).long(); dist = torch.as_tensor(d.contact.dist[:n])
+  g = torch.as_tensor(d.contact.geom).long(); w = torch.as_tensor(d.contact.worldid).long(); dist = torch.as_tensor(d.contact.dist)
+  live = torch.arange(g.shape[0], device=g.device) < torch.as_tensor(d.nacon)[0]  # no host sync (training speed)
   isf, isr = torch.isin(g, feet), torch.isin(g, rope)
-  pair = ((isf[:, 0] & isr[:, 1]) | (isf[:, 1] & isr[:, 0])) & (dist <= 0)
-  out[w[pair]] = True
+  pair = ((isf[:, 0] & isr[:, 1]) | (isf[:, 1] & isr[:, 0])) & (dist <= 0) & live
+  out = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+  out[w.clamp(0, env.num_envs - 1)[pair]] = True
   return out
 
 
 def rope_hit_real(env) -> torch.Tensor:
   return rope_foot_touch(env) | rope_leg_pass(env)
+
+
+# The user's rule (2026-11-07 night, "middle"): caught = a real touch (foot contact or leg pass) lasting >= 60 ms, or
+# the rope held back > 30 deg within 0.5 s of a touch; a brief brush is allowed. Lag = the rope's middle-link angle
+# minus the clock (rope_phase_obs) against its quiet pattern ROPE_REF (per 10-deg clock bin; set by the turners: N2Cf2
+# and N2Af runs agree within 3.4 deg) and the env's own offset (running mean over quiet steps: _ys_delta moves it).
+ROPE_REF = torch.tensor([-0.0871, 0.1829, 0.4355, 0.6508, 0.8393, 0.9842, 1.0824, 1.1496, 1.1848, 1.2271, 1.2601, 1.2395,
+                         1.1836, 1.0318, 0.8050, 0.5412, 0.2295, -0.0781, -0.3880, -0.6580, -0.8896, -1.1058, -1.3264, -1.4981,
+                         -1.6188, -1.6974, -1.7398, -1.7275, -1.6682, -1.5439, -1.3938, -1.2354, -1.0317, -0.8151, -0.5823, -0.3369])
+HIT_RULE = __import__("os").environ.get("YS_HIT_RULE", "proxy")  # "caught": the rule above in training and evals
+CAUGHT_STEPS, CAUGHT_LAG, QUIET_S = 3, math.radians(30), 0.5
+
+
+def _wrap(a):
+  return torch.remainder(a + math.pi, 2 * math.pi) - math.pi
+
+
+def rope_state(env) -> dict:
+  """once per env step: touch, its run length (steps), s since the last touch, rope lag (rad), caught."""
+  n, dev = env.num_envs, env.device
+  st = env.__dict__.get("_ys_hit")
+  if st is None:
+    st = env._ys_hit = dict(step=-1, run=torch.zeros(n, dtype=torch.long, device=dev), since=torch.full((n,), 9.0, device=dev),
+                            off=torch.zeros(n, device=dev), nq=torch.zeros(n, device=dev), lag=torch.zeros(n, device=dev),
+                            touch=torch.zeros(n, dtype=torch.bool, device=dev), caught=torch.zeros(n, dtype=torch.bool, device=dev))
+  if st["step"] == env.common_step_counter:
+    return st
+  st["step"] = env.common_step_counter
+  fresh = env.episode_length_buf <= 1
+  st["run"][fresh], st["since"][fresh], st["nq"][fresh], st["off"][fresh] = 0, 9.0, 0.0, 0.0
+  touch = rope_hit_real(env)
+  st["run"] = torch.where(touch, st["run"] + 1, 0); st["since"] = torch.where(touch, 0.0, st["since"] + env.step_dt)
+  cmd = env.command_manager.get_term("head_pose")
+  c, sn = rope_phase_obs(env).unbind(-1); rel = torch.atan2(sn, c)
+  b = (torch.remainder(cmd.phase, 2 * math.pi) / math.radians(10)).long().clamp(0, 35)
+  d = _wrap(rel - ROPE_REF.to(dev)[b])
+  quiet = (st["since"] > QUIET_S) & (env.episode_length_buf * env.step_dt > 3.0)
+  st["nq"] = st["nq"] + quiet.float(); a = torch.where(quiet, (1.0 / st["nq"].clamp(min=1)).clamp(min=0.02), 0.0)
+  st["off"] = _wrap(st["off"] + a * _wrap(d - st["off"]))
+  st["lag"] = _wrap(d - st["off"]).abs() * (st["nq"] > 20)
+  st["touch"] = touch
+  st["caught"] = (st["since"] < QUIET_S) & ((st["run"] >= CAUGHT_STEPS) | (st["lag"] > CAUGHT_LAG))
+  return st
+
+
+def rope_caught(env) -> torch.Tensor:
+  return rope_state(env)["caught"]
+
+
+def rope_bad(env) -> torch.Tensor:
+  """the hit test the entry machinery uses: the user's rule with YS_HIT_RULE=caught, else the old proxy."""
+  return rope_caught(env) if HIT_RULE == "caught" else rope_overlap(env) > 0
+
+
+def rope_hit_cost(env) -> torch.Tensor:
+  """(>= 0, weight < 0) training penalty for the user's rule: 0.3 per step of a brief touch (allowed but not free),
+  3.0 per step once caught. rope_overlap's spin-up grace kept."""
+  st = rope_state(env)
+  return (0.3 * st["touch"].float() + 2.7 * st["caught"].float()) * (env.episode_length_buf > ROPE_GRACE_STEPS)
 
 
 import os as _os
@@ -620,7 +678,7 @@ def enter_again(env, env_ids) -> None:
   ENTER_AGAIN_PASSES passes at its spot or 0.5 s after a hit, and walks in again: ~3-4 entries per episode. Episodes that
   started at the spot (the ENTER_NEAR_P draw) stay there. Sim-only training trick: the actor never sees it."""
   e, rob = env._ys_enter, env.scene["robot"]; t = env.episode_length_buf * env.step_dt
-  new_hit = e["go"] & e["t_hit"].isinf() & ((rope_overlap(env) > 0) | (rob.data.projected_gravity_b[:, 2] > -0.5))
+  new_hit = e["go"] & e["t_hit"].isinf() & (rope_bad(env) | (rob.data.projected_gravity_b[:, 2] > -0.5))
   e["t_hit"] = torch.where(new_hit, t, e["t_hit"])
   stay = 0.8 * ENTER_AGAIN_PASSES + (0.8 * (FWD_PASSES - 1) + 0.5 * math.pi / FWD_TURN_RATE) * (e["mode"] == 2)  # B: through its turn
   out = e["ent"] & e["go"] & ((e["near"] & (t - e["t_near"] > stay)) | (t - e["t_hit"] > 0.5))
@@ -658,7 +716,7 @@ def bank_put(env, env_ids) -> None:
   bk, due = env._ys_bank, env._ys_bank_due
   fresh = env.episode_length_buf <= 1
   due[fresh] = torch.empty(int(fresh.sum()), device=dev).uniform_(*ENTER_WAIT)
-  hit = e["go"] & e["t_hit"].isinf() & ((rope_overlap(env) > 0) | (rob.data.projected_gravity_b[:, 2] > -0.5))
+  hit = e["go"] & e["t_hit"].isinf() & (rope_bad(env) | (rob.data.projected_gravity_b[:, 2] > -0.5))
   e["t_hit"] = torch.where(hit, t, e["t_hit"]); due[:] = torch.where(hit, torch.minimum(due, t + 0.5), due)
   cmd = env.command_manager.get_term("head_pose")
   lead = cmd.phase - env.__dict__.get("_ys_delta", DELTA0)
@@ -699,7 +757,7 @@ def enter_clear(env, n_pass: int = 2) -> torch.Tensor:
   sole and the jumper up (hit = end: the first passes are the ones E1/E2 lost, 87-96% at the first pass)."""
   e = env._ys_enter; t = env.episode_length_buf * env.step_dt
   on = e["go"] & (e["pk"] < n_pass)
-  e["bad"] |= on & ((rope_overlap(env) > 0) | (env.scene["robot"].data.projected_gravity_b[:, 2] > -0.5))
+  e["bad"] |= on & (rope_bad(env) | (env.scene["robot"].data.projected_gravity_b[:, 2] > -0.5))
   end = on & (t >= e["t_go"] + 0.8 * (e["pk"] + 1).float())
   r = (end & ~e["bad"]).float() / env.step_dt
   e["pk"] = torch.where(end, e["pk"] + 1, e["pk"]); e["bad"] = torch.where(end, False, e["bad"])
@@ -895,6 +953,8 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     fell.time_out = True
     cfg.terminations[f"{who}_fell"] = fell
   cfg.rewards["rope_overlap"] = RewardTermCfg(func=rope_overlap, weight=-3.0)
+  if HIT_RULE == "caught":  # the user's rule (rope_state) replaces the proxy penalty
+    del cfg.rewards["rope_overlap"]; cfg.rewards["rope_hit"] = RewardTermCfg(func=rope_hit_cost, weight=-3.0)
   if rope_obs:  # sim-only (privileged): appended last, slots 61:63 (actor), 76:78 (critic)
     for grp in ("actor", "critic"):
       cfg.observations[grp].terms["rope_phase"] = ObservationTermCfg(func=rope_phase_obs)

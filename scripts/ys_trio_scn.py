@@ -541,7 +541,7 @@ if __name__ == "__main__":
           if len(m): act_j[m] = jstand(obs["actor"][m])
         cmd.amp[:] = 1.0; cmd.freq[:] = 1.25; cmd._write(); obs, *_ = venv.step(act_j)
         if STOP:
-          te = env.episode_length_buf * dt; ov_now = (T.rope_overlap(env) > 0) | (rob.data.projected_gravity_b[:, 2] > -0.5)
+          te = env.episode_length_buf * dt; ov_now = T.rope_bad(env) | (rob.data.projected_gravity_b[:, 2] > -0.5)
           new = env._ys_in & ov_now & hit_t.isinf() & (te > env._ys_tin + 0.04)
           hit_t = torch.where(new, te, hit_t); t_stop = torch.minimum(t_stop, hit_t + STOP[0])
           rope_e = env.scene["rope"]; rv = rope_e.data.body_link_lin_vel_w[:, rope_e.data.body_link_lin_vel_w.shape[1] // 2].norm(dim=-1)
@@ -588,7 +588,7 @@ if __name__ == "__main__":
             for kk in ("_ys_cam", "_ys_cam_ball"):
               cur = env.__dict__[kk]["cur"]; CP.setdefault(kk, []).append(torch.stack([cur[:, 2], cur[:, 0].abs(), cur[:, 1].abs(), win.float()], 1))
           if WALKOUT:  # J's first hit (as the stop uses it), s after the start call
-            jh = env._ys_in & ((T.rope_overlap(env) > 0) | (rob.data.projected_gravity_b[:, 2] > -0.5)) & TJ.isinf() & (te > env._ys_tin + 0.04) & TF.isinf().all(1)
+            jh = env._ys_in & (T.rope_bad(env) | (rob.data.projected_gravity_b[:, 2] > -0.5)) & TJ.isinf() & (te > env._ys_tin + 0.04) & TF.isinf().all(1)
             TJ = torch.where(jh, te - tst, TJ)
           rope_e = env.scene["rope"]; rv = rope_e.data.body_link_lin_vel_w[:, rope_e.data.body_link_lin_vel_w.shape[1] // 2].norm(dim=-1)
           if WALKOUT:
