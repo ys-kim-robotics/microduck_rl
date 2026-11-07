@@ -459,6 +459,10 @@ def _mode(n: int, dev) -> torch.Tensor:
 ENTER_SIDE = _os.environ.get("YS_ENTER_SIDE", "+")
 ENTER_YNEG = tuple(float(v) for v in _os.environ.get("YS_ENTER_YNEG", "0.36,0.44").split(","))
 ENTER_PH_NEG = tuple(math.radians(float(v)) for v in _os.environ.get("YS_ENTER_PH_NEG", "250,290").split(","))
+# 7-12 B (user 2026-11-07: B jumps its first passes FORWARD on two feet): the side jump's per-foot windows (left, then
+# right 160 ms later) also paid B facing forward, so N1c's B lifted one foot at the sweep (98% hit at ~185 deg, right
+# sole 41 mm up, left down). YS_B_TWOFOOT=1: while B faces forward both feet share the right foot's window.
+B_TWOFOOT = _os.environ.get("YS_B_TWOFOOT", "0") == "1"
 ENTER_TURN_D, FWD_Y, FWD_PASSES, FWD_TURN_RATE, TURN_GAIN, TURN_WMAX = 0.12, -0.05, 3, 0.6, 6.0, 3.0  # m, m, -, rad/s, 1/s, rad/s
 FOOT_HX = 0.027  # m: sole half-length (J._CORNERS)
 
@@ -545,6 +549,8 @@ def enter_hook(cmd):
   # A: -y until the last ENTER_TURN_D (from ENTER_NEAR), then face L
   yref = torch.where(fwB, yB, torch.where(fwA & ~e["near"], h * ((d - ENTER_NEAR) / ENTER_TURN_D).clamp(0, 1), 0.0))
   dy = torch.remainder(yref - _yaw(cmd._robot) + math.pi, 2 * math.pi) - math.pi
+  if B_TWOFOOT:  # B facing forward: both feet in one window (ys_jump_env_cfg.foot_window)
+    env._ys_two_foot = fwB & (_yaw(cmd._robot).abs() > 0.3)
   wz = torch.where(fw & e["go"], (TURN_GAIN * dy).clamp(-TURN_WMAX, TURN_WMAX), (J.CENTER_GAIN * dy).clamp(-0.5, 0.5))  # waiting: the usual hold
   return (*out, wz)
 

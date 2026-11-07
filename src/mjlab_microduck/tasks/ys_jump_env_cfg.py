@@ -189,8 +189,13 @@ AIR_HALF_W = math.pi * 0.18  # rad: air phase = 18% of the cycle (144 ms; a 25-3
 
 
 def foot_window(cmd) -> torch.Tensor:
-  """(N, 2) signed phase distance of each foot to its own air-phase centre (side jump: offset feet)."""
-  off = torch.tensor(cmd.cfg.foot_offset, device=cmd.device)
+  """(N, 2) signed phase distance of each foot to its own air-phase centre (side jump: offset feet).
+  7-12 B (ys_trio_env_cfg, YS_B_TWOFOOT): envs flagged in env._ys_two_foot (B facing forward: the rope sweeps under
+  both soles at once) put both feet in the second foot's window = a two-foot hop at the sweep."""
+  off = torch.tensor(cmd.cfg.foot_offset, device=cmd.device).expand(cmd.num_envs, 2)
+  tf = getattr(cmd._env, "_ys_two_foot", None)
+  if tf is not None:
+    off = torch.where(tf[:, None], off[:, 1:2].expand(-1, 2), off)
   return torch.remainder(cmd.window()[:, None] - off + math.pi, 2 * math.pi) - math.pi
 
 
