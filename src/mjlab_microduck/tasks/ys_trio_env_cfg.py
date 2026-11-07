@@ -484,7 +484,11 @@ ROPE_REF = torch.tensor([-0.0871, 0.1829, 0.4355, 0.6508, 0.8393, 0.9842, 1.0824
                          1.1836, 1.0318, 0.8050, 0.5412, 0.2295, -0.0781, -0.3880, -0.6580, -0.8896, -1.1058, -1.3264, -1.4981,
                          -1.6188, -1.6974, -1.7398, -1.7275, -1.6682, -1.5439, -1.3938, -1.2354, -1.0317, -0.8151, -0.5823, -0.3369])
 HIT_RULE = __import__("os").environ.get("YS_HIT_RULE", "proxy")  # "caught": the rule above in training and evals
-CAUGHT_STEPS, CAUGHT_LAG, QUIET_S = 3, math.radians(30), 0.5
+# CAUGHT_LAG: the user's "held back > 30 deg" was inside the rope's own wobble: with nothing touching, a 0.5 s window
+# peaks above 30 deg 49-63% of the time (after a 20-40 ms brush 71-74%), so brushes counted as catches and their
+# random 3.0/step taught N3Cf to brush more (1-step touches 42 -> 60%, in place >= 20 passes 25 -> 9%). 90 deg is
+# past the quiet window's 97-99th percentile (1-3%; after a >= 60 ms touch 21-26%): only a real drag counts.
+CAUGHT_STEPS, CAUGHT_LAG, QUIET_S = 3, math.radians(float(__import__("os").environ.get("YS_CAUGHT_LAG", "90"))), 0.5
 
 
 def _wrap(a):
