@@ -421,6 +421,62 @@ def rope_overlap(env: ManagerBasedRlEnv, cap: float = 0.05) -> torch.Tensor:
   return torch.where(env.episode_length_buf > ROPE_GRACE_STEPS, pen.nan_to_num(0.0) / 0.01, 0.0)
 
 
+# 7-12 hit review (user 2026-11-07 night: "judged hits while the rope keeps turning?"): rope_overlap is a proxy (the
+# rope in fixed bands beside J's ROOT, above the sole, below 17 cm). Against the actual geometry (s10/hit_review.py,
+# N2Cf2 / N2Af): of the steps it calls a hit 37-39% are a real foot touch, 14% pass the leg, 47-49% neither (the feet
+# move off the nominal bands), and it misses ~2000 real touches per 128 x 20 s. rope_hit_real: a physical foot-rope
+# contact (the sim feet collide with the rope; a 20 g rope dragged by the turners slides off and keeps turning) or the
+# rope within LEG_R of the actual leg polyline (hip-knee-ankle-foot: the sim legs have no rope collision; the real ones do).
+LEG_R = 0.015  # m leg half-thickness
+_LEGS = (("upper_leg_left", "leg", "ankle_left"), ("upper_leg_right", "leg_2", "ankle_right"))
+
+
+def _seg_dist(p, a, b) -> torch.Tensor:
+  ab = b - a; t = (((p - a) * ab).sum(-1) / (ab * ab).sum(-1).clamp(min=1e-9)).clamp(0, 1)
+  return (p - (a + t[:, None] * ab)).norm(dim=-1)
+
+
+def rope_leg_pass(env) -> torch.Tensor:
+  """(N,) the rope (at each foot's x) within LEG_R + rope radius of that leg's hip-knee-ankle-foot polyline."""
+  rob, rope = env.scene["robot"], env.scene["rope"]
+  if "_ys_leg_ids" not in env.__dict__:
+    names = list(rob.body_names); env._ys_leg_ids = [[names.index(b) for b in leg] for leg in _LEGS]
+  feet = env.command_manager.get_term("head_pose")._sole; out = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+  for f in range(2):
+    c = rob.data.geom_pos_w[:, feet[f]]; sec = rope_section(rope.data.body_link_pos_w, c[:, 0]); ok = torch.isfinite(sec[:, 0])
+    pr = torch.stack([c[:, 0], sec[:, 0].nan_to_num(9.0), sec[:, 1].nan_to_num(9.0)], -1)
+    pts = [rob.data.body_link_pos_w[:, i] for i in env._ys_leg_ids[f]] + [c]
+    d = torch.stack([_seg_dist(pr, pts[i], pts[i + 1]) for i in range(3)], -1).amin(-1)
+    out |= ok & (d < LEG_R + ROPE_RADIUS)
+  return out
+
+
+def rope_foot_touch(env) -> torch.Tensor:
+  """(N,) J's foot and the rope in physical contact (dist <= 0), read off the simulator's contact list (a contact
+  sensor on rope bodies reported nothing; the list has the pairs: 426 foot-rope contacts in 16 envs x 8 s)."""
+  import mujoco
+  d, m = env.sim.data, env.sim.mj_model
+  if "_ys_touch_ids" not in env.__dict__:
+    gn = lambda i: mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, i) or ""
+    bn = lambda i: mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[i]) or ""
+    feet = [i for i in range(m.ngeom) if gn(i) in ("robot/left_foot_collision", "robot/right_foot_collision")]
+    rope = [i for i in range(m.ngeom) if bn(i).startswith("rope/rope_")]
+    env._ys_touch_ids = (torch.tensor(feet, device=env.device), torch.tensor(rope, device=env.device))
+  feet, rope = env._ys_touch_ids
+  n = int(torch.as_tensor(d.nacon[0])); out = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+  if n == 0:
+    return out
+  g = torch.as_tensor(d.contact.geom[:n]).long(); w = torch.as_tensor(d.contact.worldid[:n]).long(); dist = torch.as_tensor(d.contact.dist[:n])
+  isf, isr = torch.isin(g, feet), torch.isin(g, rope)
+  pair = ((isf[:, 0] & isr[:, 1]) | (isf[:, 1] & isr[:, 0])) & (dist <= 0)
+  out[w[pair]] = True
+  return out
+
+
+def rope_hit_real(env) -> torch.Tensor:
+  return rope_foot_touch(env) | rope_leg_pass(env)
+
+
 import os as _os
 _E2 = _os.environ.get("YS_ENTER_V", "2") == "2"
 # E1: waiting place U[0, 0.25] m widened over 200 iterations, set-off at leader phase 120-200 deg, 4/s, 0.6 m/s: no falls,
