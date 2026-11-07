@@ -477,7 +477,7 @@ def enter_reset(env, env_ids: torch.Tensor | None, full: bool = False) -> None:
   if not hasattr(env, "_ys_enter"):
     z = lambda: torch.zeros(n, device=dev)
     env._ys_enter = {"y0": z(), "t": z(), "ph": z(), "t_near": z(), "go": z().bool(), "near": z().bool(), "t_go": z(),
-                     "d_prev": z(), "pk": z().long(), "bad": z().bool(), "t_hit": z(), "fw": z().bool(), "t_turn": z(), "ent": z().bool(), "mode": z().long()}
+                     "d_prev": z(), "pk": z().long(), "bad": z().bool(), "t_hit": z(), "fw": z().bool(), "t_turn": z(), "ent": z().bool(), "mode": z().long(), "d": z()}
     env._ys_center_hook = enter_hook
   start = env.__dict__.setdefault("_ys_enter_start", env.common_step_counter)
   ymax = ENTER_Y if (full or ENTER_RAMP == 0) else ENTER_Y * min(1.0, max(0.1, (env.common_step_counter - start) / (ENTER_RAMP * 24)))
@@ -517,7 +517,8 @@ def enter_hook(cmd):
   sy = torch.where(fwB, FWD_Y * yB / h, 0.0)
   spot = torch.stack([torch.zeros_like(t), torch.where(e["go"], sy, e["y0"])], 1)
   d = (env.scene.env_origins[:, :2] + torch.stack([torch.zeros_like(t), sy], 1) - cmd._robot.data.root_link_pos_w[:, :2]).norm(dim=-1)
-  new = e["go"] & ~e["near"] & (d < ENTER_NEAR)
+  e["d"] = d
+  new =e["go"] & ~e["near"] & (d < ENTER_NEAR)
   e["t_near"] = torch.where(new, t, e["t_near"]); e["near"] |= new
   walk = e["go"] & ~e["near"]
   g = ENTER_DASH / d.clamp(min=ENTER_NEAR) if ENTER_DASH else ENTER_GAIN
@@ -587,6 +588,14 @@ def enter_clear(env, n_pass: int = 2) -> torch.Tensor:
   e["pk"] = torch.where(end, e["pk"] + 1, e["pk"]); e["bad"] = torch.where(end, False, e["bad"])
   e["pk"] = torch.where(end & (r == 0), n_pass, e["pk"])  # a hit ends the bonuses for that episode
   return r
+
+
+def enter_late(env, after: float = 0.6) -> torch.Tensor:
+  """N1 cost >= 0 (negative weight): cm J stands off its spot (beyond ENTER_NEAR) from `after` s past the set-off on,
+  arrived or not. N1@3000 (A/B) backed away from the turning rope against a +0.8 m/s command (19 -> 37 cm in 3 s):
+  outside the rope its jump rewards cost nothing. At -1/cm staying out outweighs a hit (rope_overlap -3/cm, a few steps)."""
+  e, t = env._ys_enter, env.episode_length_buf * env.step_dt
+  return (e["d"] - ENTER_NEAR).clamp(min=0) / 0.01 * (e["go"] & (t - e["t_go"] > after))
 
 
 def stay_g1(env, ckpt: str, settle: float = 1.0, waiting: bool = False) -> torch.Tensor:
@@ -703,6 +712,8 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     if enter3:  # E3 (user 2026-11-06 (a)(b)(c)): hurry in, clear the first passes, anchored harder (enter_w 3)
       cfg.rewards["enter_approach"] = RewardTermCfg(func=enter_approach, weight=2.0)
       cfg.rewards["enter_clear"] = RewardTermCfg(func=enter_clear, weight=3.0)
+      if float(_os.environ.get("YS_ENTER_LATE_W", "0")) > 0:  # N1b: staying out of the rope costs
+        cfg.rewards["enter_late"] = RewardTermCfg(func=enter_late, weight=-float(_os.environ["YS_ENTER_LATE_W"]))
   return cfg
 
 
