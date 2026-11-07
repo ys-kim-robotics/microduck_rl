@@ -390,13 +390,14 @@ def connect_trio_pick(spec: mujoco.MjSpec) -> None:
 def rope_section(pts: torch.Tensor, xq: torch.Tensor) -> torch.Tensor:
   """rope polyline (N, L, 3) where it crosses x = xq (N,) -> (N, 2) y, z (nan where it does not)."""
   x = pts[..., 0] - xq[:, None]
-  out = torch.full((pts.shape[0], 2), math.nan, device=pts.device)
-  for i in range(pts.shape[1] - 1):
-    a, b = x[:, i], x[:, i + 1]
-    s = -a / torch.where(b != a, b - a, torch.full_like(a, 1e-9))
-    hit = (s >= 0) & (s <= 1) & out[:, 0].isnan()
-    out[hit] = (pts[:, i, 1:] + s[:, None] * (pts[:, i + 1, 1:] - pts[:, i, 1:]))[hit]
-  return out
+  a, b = x[:, :-1], x[:, 1:]  # all segments at once: the first one crossing x = xq (a per-segment loop with masked
+  s = -a / torch.where(b != a, b - a, torch.full_like(a, 1e-9))  # writes synced the GPU 11 times per call)
+  hit = (s >= 0) & (s <= 1)
+  i = hit.float().argmax(-1)  # first crossing
+  idx = i[:, None, None].expand(-1, 1, 2)
+  p0, p1 = pts[:, :-1, 1:].gather(1, idx)[:, 0], pts[:, 1:, 1:].gather(1, idx)[:, 0]
+  out = p0 + s.gather(1, i[:, None]) * (p1 - p0)
+  return torch.where(hit.any(-1, keepdim=True), out, torch.full_like(out, math.nan))
 
 
 def rope_overlap(env: ManagerBasedRlEnv, cap: float = 0.05) -> torch.Tensor:
@@ -463,13 +464,12 @@ def rope_foot_touch(env) -> torch.Tensor:
     rope = [i for i in range(m.ngeom) if bn(i).startswith("rope/rope_")]
     env._ys_touch_ids = (torch.tensor(feet, device=env.device), torch.tensor(rope, device=env.device))
   feet, rope = env._ys_touch_ids
-  g = torch.as_tensor(d.contact.geom).long(); w = torch.as_tensor(d.contact.worldid).long(); dist = torch.as_tensor(d.contact.dist)
-  live = torch.arange(g.shape[0], device=g.device) < torch.as_tensor(d.nacon)[0]  # no host sync (training speed)
+  g = d.contact.geom[:].long(); w = d.contact.worldid[:].long(); dist = d.contact.dist[:]
+  live = torch.arange(g.shape[0], device=g.device) < d.nacon[:][0]  # everything stays on the GPU (no host sync)
   isf, isr = torch.isin(g, feet), torch.isin(g, rope)
   pair = ((isf[:, 0] & isr[:, 1]) | (isf[:, 1] & isr[:, 0])) & (dist <= 0) & live
-  out = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-  out[w.clamp(0, env.num_envs - 1)[pair]] = True
-  return out
+  out = torch.zeros(env.num_envs, device=env.device).scatter_reduce_(0, w.clamp(0, env.num_envs - 1), pair.float(), reduce="amax")
+  return out > 0
 
 
 def rope_hit_real(env) -> torch.Tensor:
@@ -502,8 +502,9 @@ def rope_state(env) -> dict:
   if st["step"] == env.common_step_counter:
     return st
   st["step"] = env.common_step_counter
-  fresh = env.episode_length_buf <= 1
-  st["run"][fresh], st["since"][fresh], st["nq"][fresh], st["off"][fresh] = 0, 9.0, 0.0, 0.0
+  fresh = env.episode_length_buf <= 1  # torch.where, not masked writes: no host sync
+  st["run"] = torch.where(fresh, 0, st["run"]); st["since"] = torch.where(fresh, 9.0, st["since"])
+  st["nq"] = torch.where(fresh, 0.0, st["nq"]); st["off"] = torch.where(fresh, 0.0, st["off"])
   touch = rope_hit_real(env)
   st["run"] = torch.where(touch, st["run"] + 1, 0); st["since"] = torch.where(touch, 0.0, st["since"] + env.step_dt)
   cmd = env.command_manager.get_term("head_pose")
