@@ -529,8 +529,13 @@ def rope_caught(env) -> torch.Tensor:
 
 
 def rope_bad(env) -> torch.Tensor:
-  """the hit test the entry machinery uses: the user's rule with YS_HIT_RULE=caught, else the old proxy."""
-  return rope_caught(env) if HIT_RULE == "caught" else rope_overlap(env) > 0
+  """the hit test the entry machinery uses: the user's rule with YS_HIT_RULE=caught / hybrid, else the old proxy."""
+  return rope_caught(env) if HIT_RULE in ("caught", "hybrid") else rope_overlap(env) > 0
+
+
+def rope_caught_cost(env) -> torch.Tensor:
+  """(>= 0, weight < 0) hybrid: 3.0 per caught step on top of the proxy's dense shaping (spin-up grace kept)."""
+  return 3.0 * rope_caught(env).float() * (env.episode_length_buf > ROPE_GRACE_STEPS)
 
 
 def rope_hit_cost(env) -> torch.Tensor:
@@ -960,6 +965,10 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
   cfg.rewards["rope_overlap"] = RewardTermCfg(func=rope_overlap, weight=-3.0)
   if HIT_RULE == "caught":  # the user's rule (rope_state) replaces the proxy penalty
     del cfg.rewards["rope_overlap"]; cfg.rewards["rope_hit"] = RewardTermCfg(func=rope_hit_cost, weight=-3.0)
+  elif HIT_RULE == "hybrid":  # N5: trained with the user's rule alone (N3Cf, N4Cf) in place >= 20 passes fell to 13 / 2%
+    # (N2Cf2 on the proxy: 30%, same eval): its 0.3 / 3.0 per step was much sparser than the proxy's cm-graded cost
+    # (episode -0.19 vs -0.5). Keep the proxy as dense shaping, add the caught cost; evals use the user's rule.
+    cfg.rewards["rope_caught"] = RewardTermCfg(func=rope_caught_cost, weight=-3.0)
   if rope_obs:  # sim-only (privileged): appended last, slots 61:63 (actor), 76:78 (critic)
     for grp in ("actor", "critic"):
       cfg.observations[grp].terms["rope_phase"] = ObservationTermCfg(func=rope_phase_obs)
