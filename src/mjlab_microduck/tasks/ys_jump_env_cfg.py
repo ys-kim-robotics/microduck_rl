@@ -90,13 +90,14 @@ class JumpClockCommand(hc.HeadCircleCommand):
     w, x, y, z = self._robot.data.root_link_quat_w.unbind(-1)
     yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
     hook = self._env.__dict__.get("_ys_center_hook")  # 7-9 walk-in (ys_trio_env_cfg.enter_hook): spot offset, gain, max speed
-    off, g, vm = hook(self) if hook else (0.0, CENTER_GAIN, 0.3)
+    r = hook(self) if hook else (0.0, CENTER_GAIN, 0.3)
+    off, g, vm = r[:3]  # 7-12 A/B: a 4th item is the yaw-rate command
     dx, dy = (self._env.scene.env_origins[:, :2] + off - self._robot.data.root_link_pos_w[:, :2]).unbind(-1)
     c, s = yaw.cos(), yaw.sin()
     v = self._env.command_manager.get_term("twist").vel_command_b
     v[:, 0] = (g * (c * dx + s * dy)).clamp(-vm, vm)
     v[:, 1] = (g * (-s * dx + c * dy)).clamp(-vm, vm)
-    v[:, 2] = (-CENTER_GAIN * yaw).clamp(-0.5, 0.5)
+    v[:, 2] = r[3] if len(r) > 3 else (-CENTER_GAIN * yaw).clamp(-0.5, 0.5)
 
   def _update_metrics(self) -> None:
     # per-foot peak in its own window (side jump: offset feet); a hop scores the lower foot's peak
