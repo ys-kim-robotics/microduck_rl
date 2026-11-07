@@ -674,6 +674,44 @@ def stay_g1(env, ckpt: str, settle: float = 1.0, waiting: bool = False) -> torch
   return (env.action_manager.action - ref).square().mean(-1) * on
 
 
+# 7-12 duck (user 2026-11-07 night: "what if J comes in with its head down?"), YS_DUCK=1: while running in (set off,
+# not at the spot yet) the head-up / gaze / head-forward terms are off and `duck` pays the camera pitched DUCK_PITCH
+# down. Only the feet meet the rope in sim, so any gain is through the body (the head is ~38% of the mass: a lower
+# centre of mass for the dash); on the real robot it also keeps the head under the rope. J times the run on its clock.
+DUCK = _os.environ.get("YS_DUCK", "0") == "1"
+DUCK_PITCH = math.radians(float(_os.environ.get("YS_DUCK_PITCH", "-35")))
+
+
+def _entering(env) -> torch.Tensor:
+  e = env.__dict__.get("_ys_enter")
+  return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device) if e is None else e["go"] & ~e["near"]
+
+
+def cam_pitch(env) -> torch.Tensor:
+  """(N,) head camera axis pitch, rad (up +), as J.head_up measures it."""
+  rob = env.scene["robot"]
+  if not hasattr(env, "_ys_cam_site"):
+    env._ys_cam_site = rob.find_sites(["head_camera"])[0][0]
+  w, x, y, z = rob.data.site_quat_w[:, env._ys_cam_site].unbind(-1)
+  return torch.asin((2 * (x * z - w * y)).clamp(-1, 1))
+
+
+def duck(env, std: float = 0.5) -> torch.Tensor:  # wide as head_up (pitch_std 0.5): J looks level-up now, a 0.15 Gaussian at -35 deg pays ~0
+  return torch.exp(-((cam_pitch(env) - DUCK_PITCH) / std).square()) * _entering(env)
+
+
+def head_up_free(env, **kw) -> torch.Tensor:
+  return J.head_up(env, **kw) * ~_entering(env)
+
+
+def gaze_free(env, **kw) -> torch.Tensor:
+  return gaze(env, **kw) * ~_entering(env)
+
+
+def head_back_free(env, **kw) -> torch.Tensor:
+  return head_back(env, **kw) * ~_entering(env)
+
+
 # (3) distillation (user 2026-11-07 evening): one student (from N1c), PPO + behavior cloning, routed per frame. Settled
 # at the spot facing L (>= BC_SETTLE s after arriving): taught by E5 (its clock slots zeroed: E5 is clock-free). Waiting or
 # running in: anchored to N1c, the student's start (velstand run-3 lesson, distill.py: BC on one slice rewrites the
@@ -843,6 +881,10 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
       cfg.rewards["enter_clear"] = RewardTermCfg(func=enter_clear, weight=3.0)
       if float(_os.environ.get("YS_ENTER_LATE_W", "0")) > 0:  # N1b: staying out of the rope costs
         cfg.rewards["enter_late"] = RewardTermCfg(func=enter_late, weight=-float(_os.environ["YS_ENTER_LATE_W"]))
+  if enter and DUCK:  # head down while running in
+    for k, f in (("head_up", head_up_free), ("gaze", gaze_free), ("head_back", head_back_free)):
+      if k in cfg.rewards: cfg.rewards[k].func = f
+    cfg.rewards["duck"] = RewardTermCfg(func=duck, weight=2.0)
   if bc:  # (3): the BC routing (sim-only obs group, see bc_gate)
     from mjlab.managers import ObservationGroupCfg
     cfg.observations["bc"] = ObservationGroupCfg(terms={"gate": ObservationTermCfg(func=bc_gate)}, concatenate_terms=True, enable_corruption=False)
