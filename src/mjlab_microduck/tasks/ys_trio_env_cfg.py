@@ -847,13 +847,20 @@ def enter_clear(env, n_pass: int = 2) -> torch.Tensor:
   return r
 
 
-def enter_late(env, after: float = 0.6) -> torch.Tensor:
+def enter_late(env, after: float = 0.6, keep: float = 0.10) -> torch.Tensor:
   """N1 cost >= 0 (negative weight): cm J stands off its spot (beyond ENTER_NEAR) from `after` s past the set-off on,
   arrived or not. N1@3000 (A/B) backed away from the turning rope against a +0.8 m/s command (19 -> 37 cm in 3 s):
-  outside the rope its jump rewards cost nothing. At -1/cm staying out outweighs a hit (rope_overlap -3/cm, a few steps)."""
+  outside the rope its jump rewards cost nothing. At -1/cm staying out outweighs a hit (rope_overlap -3/cm, a few steps).
+  7-14 NOCENTER_AFTER: once arrived, cm beyond `keep` from where it arrived (capped at 10 cm). P1 / P2 collapsed on the
+  spot-based cost (falls 0.9 -> 7 per log, episode 819 -> 263 steps): with no position command it was unescapable, and
+  baseline v3 drifts 5 cm (p90 8 cm) in 2 s without one."""
   e, t = env._ys_enter, env.episode_length_buf * env.step_dt
   after = after + (e["y0"].abs() - 0.20).clamp(min=0) / 0.5  # the far side's 36-44 cm run: ~1 s
-  return (e["d"] - ENTER_NEAR).clamp(min=0) / 0.01 * (e["go"] & (t - e["t_go"] > after))
+  c = (e["d"] - ENTER_NEAR).clamp(min=0)
+  if NOCENTER_AFTER:
+    xy = env.scene["robot"].data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2]
+    c = torch.where(e["near"], ((xy - e["axy"]).norm(dim=-1) - keep).clamp(0.0, 0.10), c)
+  return c / 0.01 * (e["go"] & (t - e["t_go"] > after))
 
 
 def stay_g1(env, ckpt: str, settle: float = 1.0, waiting: bool = False) -> torch.Tensor:

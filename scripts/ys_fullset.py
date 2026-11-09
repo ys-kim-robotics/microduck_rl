@@ -232,7 +232,8 @@ def episode(on_step=None):
     if on_step is not None and on_step(k, M): break
     if on_step is None and (~alive | ((M["call"] >= 0) & (k > M["call"] + KSTOP + int(AFTER / dt)))).all(): break
   M["k_end"] = k
-  if DIAG: np.savez(DIAG, tr=torch.stack(TR).cpu().numpy(), jdown=M["jdown"].cpu().numpy(), start=M["start"].cpu().numpy(), go=M["go"].cpu().numpy(), y0=E["y0"].cpu().numpy())
+  if DIAG: np.savez(DIAG, tr=torch.stack(TR).cpu().numpy(), jdown=M["jdown"].cpu().numpy(), start=M["start"].cpu().numpy(), go=M["go"].cpu().numpy(), y0=E["y0"].cpu().numpy(),
+                   arr=M["arr"].cpu().numpy(), call=M["call"].cpu().numpy(), spot=env._ys_spot_rel.cpu().numpy())  # 7-14: + arrival, end call, the spot (m, rad)
   return M
 
 
