@@ -10,10 +10,10 @@ import mujoco
 import numpy as np
 
 ROPE_LEN = 0.85  # m; span 0.7 + a ~0.2 m arc (STAGES-ys.md stage 5 sizing)
-ROPE_MASS = 0.02  # kg
+ROPE_MASS = float(__import__("os").environ.get("YS_ROPE_MASS", "0.02"))  # kg (7-13 check 9: YS_ROPE_MASS to vary it)
 ROPE_LINKS = 12
 ROPE_RADIUS = 0.003  # m
-ROPE_DAMPING = 5e-4  # N·m·s/rad per ball joint: 1e-4 held on CPU (5a) but blew up 3/16 in the robot scene (5c-2); 5e-4 held 16/16
+ROPE_DAMPING = float(__import__("os").environ.get("YS_ROPE_DAMPING", "5e-4"))  # N·m·s/rad per ball joint (7-13 check 9: YS_ROPE_DAMPING): 1e-4 held on CPU (5a) but blew up 3/16 in the robot scene (5c-2); 5e-4 held 16/16
 ROPE_ARMATURE = 1e-6  # kg·m²: ~0.4x a link's own inertia; 0 blew up, 1e-5 visibly stiffened the rope (5a)
 
 
