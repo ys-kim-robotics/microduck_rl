@@ -1,0 +1,11 @@
+[package]
+name = "odo_replay"
+version = "0.1.0"
+edition = "2021"
+
+# the runtime repo checked out next to microduck_rl (~/YS/personal/microduck/runtime)
+[dependencies]
+odometry = { path = "../../../runtime/odometry" }
+duck-ipc-proto = { path = "../../../runtime/duck-ipc-proto" }
+
+[workspace]
