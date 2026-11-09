@@ -16,7 +16,8 @@ import mujoco
 import torch
 from tensordict import TensorDict
 from mjlab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
-from mjlab.managers import RewardTermCfg, SceneEntityCfg
+from mjlab.managers import EventTermCfg, RewardTermCfg, SceneEntityCfg
+import mjlab_microduck.tasks.ys_rope as R
 
 from mjlab_microduck.tasks import MicroduckOnPolicyRunner  # defined before this module is imported
 from mjlab_microduck.tasks.symmetry import _get_tensors
@@ -137,6 +138,9 @@ def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: 
   fell.params = {**fell.params, "asset_cfg": SceneEntityCfg("partner")}
   fell.time_out = True
   cfg.terminations["partner_fell"] = fell
+  if R.ROPE_DR:  # 7-14 (user 2026-11-09): the rope's mass drawn per env (YS_ROPE_DR="lo,hi" kg)
+    cfg.events["rope_mass_dr"] = EventTermCfg(func=R.rope_mass_scale, mode="startup",
+                                              params={"asset_cfg": SceneEntityCfg("rope", body_names=("rope_.*",)), "mass_range": R.ROPE_DR})
   return cfg
 
 

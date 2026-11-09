@@ -6,14 +6,18 @@ torques the handle. Built into an MjSpec so the same rope serves the CPU physics
 handle = mocap body) and later the training scene (handle = the duck's jaw).
 """
 
+import math
+import os
+
 import mujoco
 import numpy as np
+from mjlab.managers.event_manager import RecomputeLevel, requires_model_fields
 
 ROPE_LEN = 0.85  # m; span 0.7 + a ~0.2 m arc (STAGES-ys.md stage 5 sizing)
-ROPE_MASS = float(__import__("os").environ.get("YS_ROPE_MASS", "0.02"))  # kg (7-13 check 9: YS_ROPE_MASS to vary it)
+ROPE_MASS = float(os.environ.get("YS_ROPE_MASS", "0.02"))  # kg (7-13 check 9: YS_ROPE_MASS to vary it)
 ROPE_LINKS = 12
 ROPE_RADIUS = 0.003  # m
-ROPE_DAMPING = float(__import__("os").environ.get("YS_ROPE_DAMPING", "5e-4"))  # N·m·s/rad per ball joint (7-13 check 9: YS_ROPE_DAMPING): 1e-4 held on CPU (5a) but blew up 3/16 in the robot scene (5c-2); 5e-4 held 16/16
+ROPE_DAMPING = float(os.environ.get("YS_ROPE_DAMPING", "5e-4"))  # N·m·s/rad per ball joint (7-13 check 9: YS_ROPE_DAMPING): 1e-4 held on CPU (5a) but blew up 3/16 in the robot scene (5c-2); 5e-4 held 16/16
 ROPE_ARMATURE = 1e-6  # kg·m²: ~0.4x a link's own inertia; 0 blew up, 1e-5 visibly stiffened the rope (5a)
 
 
@@ -47,6 +51,25 @@ def add_rope(spec, anchor, end, name="rope", length=ROPE_LEN, mass=ROPE_MASS, li
     parent = body
   parent.add_site(name=f"{name}_end", pos=d * seg, size=[0.004, 0, 0])
   return f"{name}_start", f"{name}_end"
+
+
+ROPE_DR = tuple(float(v) for v in os.environ["YS_ROPE_DR"].split(",")) if os.environ.get("YS_ROPE_DR") else None  # 7-14: "lo,hi" kg
+
+
+@requires_model_fields("body_mass", "body_inertia", recompute=RecomputeLevel.set_const)
+def rope_mass_scale(env, env_ids, asset_cfg, mass_range=(0.01, 0.04)):
+  """7-14 startup event (user 2026-11-09: L / F and J should cope with whatever rope comes): the whole rope's mass, one draw
+  per env, log-uniform in mass_range (kg; median at the geometric mean), every link scaled alike (mjlab's pseudo_inertia
+  draws per body, which averages the rope's total out). Mass and inertia scale together (density), CoM unchanged."""
+  import torch
+  ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else env_ids.to(env.device)
+  bi = torch.as_tensor(env.scene[asset_cfg.name].indexing.body_ids[asset_cfg.body_ids], device=env.device).long(); ids = ids.long()
+  m0, i0 = env.sim.get_default_field("body_mass")[bi], env.sim.get_default_field("body_inertia")[bi]
+  lo, hi = (math.log(m / float(m0.sum())) for m in mass_range)
+  s = torch.exp(torch.empty(len(ids), device=env.device).uniform_(lo, hi))
+  g = torch.meshgrid(ids, bi, indexing="ij")
+  env.sim.model.body_mass[g] = m0[None] * s[:, None]
+  env.sim.model.body_inertia[g] = i0[None] * s[:, None, None]
 
 
 def demo():

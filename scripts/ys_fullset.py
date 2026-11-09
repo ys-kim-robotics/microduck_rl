@@ -35,6 +35,9 @@ NOCENTER = os.environ.get("NOCENTER") == "1"  # no position correction once J is
 DRIFT = float(os.environ.get("DRIFT", "0"))  # m/sqrt(s): random walk on J's position estimate from its set-off (odometry drift)
 CLOCKOFF = os.environ.get("CLOCKOFF")  # 7-13 check 3, deg: L / F turn the rope this much behind J's clock (late start by ear); J's
 # set-off still reads its own clock (it does not know the offset)
+ODO = os.environ.get("ODO") == "1"  # 7-14: J's position estimate = the runtime's contact odometry (scripts/ys_odo_replay, unchanged runtime
+# code) on the encoders (bias included) and the trunk quaternion, live from J's start call, from where J truly stood then; its
+# command and its arrival test use that estimate (with NOCENTER=1: no position command once it believes it has arrived)
 BELIEF = [float(v) for v in os.environ.get("BELIEF", "0,0").split(",")]  # 7-13 check 4: "cm,deg": J believes its spot is cm off (random
 # direction) and the rope axis deg off (random sign), from the start: placed by hand; its command uses that belief
 TASK, MODE, CK = ("Mjlab-YsTrioJumpBeat-Flat-MicroDuck" if NOWALK else "Mjlab-YsTrioJumpBeatPick-Flat-MicroDuck"), sys.argv[1], sys.argv[2]
@@ -116,7 +119,7 @@ def hook(c):
   dl = T.DELTA0 if CLOCKOFF else env.__dict__.get("_ys_delta", T.DELTA0)  # CLOCKOFF: J sets off on its own clock
   e["go"] |= (t >= e["t"]) & (torch.remainder(c.phase - dl - e["ph"], 2 * math.pi) < 2 * math.pi * c.freq.abs() * dt)
   y = torch.where(e["go"], 0.0, e["y0"])
-  d = (sr[:, :2] - (rob.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2])).norm(dim=-1); e["d"] = d
+  d = (sr[:, :2] - (rob.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2] - (e["drift"] if ODO else 0.0))).norm(dim=-1); e["d"] = d
   e["near"] |= e["go"] & (d < T.ENTER_NEAR); walk = e["go"] & ~e["near"]
   g = T.ENTER_DASH / d.clamp(min=T.ENTER_NEAR) if T.ENTER_DASH else T.ENTER_GAIN
   fwA, h = e["fw"] & (e["mode"] == 1), -0.5 * math.pi * e["side"]
@@ -127,10 +130,35 @@ def hook(c):
   return tgt, torch.where(walk, g, gc), torch.where(walk, max(T.ENTER_VMAX, T.ENTER_DASH), 0.3), wz
 
 
+if ODO:
+  import subprocess
+  _ODO = subprocess.Popen([os.path.join(os.path.dirname(os.path.abspath(__file__)), "ys_odo_replay/target/release/odo_replay")],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+  _JN = ["left_hip_yaw", "left_hip_roll", "left_hip_pitch", "left_knee", "left_ankle", "neck_pitch", "head_pitch", "head_yaw", "head_roll",
+         "mouth", "right_hip_yaw", "right_hip_roll", "right_hip_pitch", "right_knee", "right_ankle"]  # duck_ipc_proto::JOINT_NAMES
+  _COL = torch.tensor([rob.joint_names.index(n) if n != "mouth" else 0 for n in _JN], device=dev)
+  _P0, _O0 = torch.full((N, 2), math.nan, device=dev), torch.full((N, 2), math.nan, device=dev)  # true / odometry xy at the first tick
+
+
+def odo_step(k, M):
+  """ODO: one 20 ms tick of the runtime odometry for every J past its start call; E["drift"] = true - estimate."""
+  on = ((M["dead"] < 0) & (M["start"] >= 0)).nonzero().flatten()
+  if len(on) == 0: return
+  pos = rob.data.root_link_pos_w[on, :2]
+  _P0[on] = torch.where(_P0[on].isnan(), pos, _P0[on])
+  j = rob.data.joint_pos_biased[on][:, _COL].clone(); j[:, _JN.index("mouth")] = 0.0
+  x = torch.cat([j, rob.data.root_link_quat_w[on]], 1).cpu().numpy(); ids = on.cpu().numpy()
+  _ODO.stdin.write("".join(f"{n} {k} " + " ".join(f"{v:.7f}" for v in r) + "\n" for n, r in zip(ids, x))); _ODO.stdin.flush()
+  est = torch.tensor([[float(v) for v in _ODO.stdout.readline().split()[2:4]] for _ in ids], device=dev)
+  _O0[on] = torch.where(_O0[on].isnan(), est, _O0[on])  # the odometry keeps running across games (video): from this game's first tick
+  E["drift"][on] = pos - (_P0[on] + est - _O0[on])
+
+
 def episode(on_step=None):
   """One full game for all N envs. on_step(k, M) after each step (video), returns True to end early. -> M (marks)."""
   global E
   venv.reset(); env.__dict__.pop("_ys_spot_rel", None)
+  if ODO: _P0[:] = math.nan; _O0[:] = math.nan
   env._ys_off = torch.zeros(N, device=dev) if NOEAR else B.start_offset(N, dev)  # F's start error by ear (ys_trio_scn "ear")
   WS = SC.new_ws(env, N); EQI = None if NOWALK else SC.setup_walkout(env, ALL, REL, WS)
   got, gerr = torch.zeros(N, 2, dtype=torch.bool, device=dev), torch.full((N, 2), math.nan, device=dev)
@@ -169,6 +197,7 @@ def episode(on_step=None):
     if vel.any(): a[vel] = jstand(obs["actor"][vel])
     WAITM[:] = (M["start"] >= 0) & ~E["go"]  # CLIP=wait's mask
     cmd.amp[:] = 1.0; cmd.freq[:] = 1.25; cmd._write(); obs, *_ = venv.step(a)
+    if ODO: odo_step(k, M)
     re = env.episode_length_buf == 0; M["dead"] = torch.where(re & (M["dead"] < 0), k, M["dead"]); alive = M["dead"] < 0  # a turner fell: restarted
     if not NOWALK: SC.walkout_post(env, WS, EQI, REL, re, got, gerr)
     prev = env.__dict__.get("_ys_spot_rel"); new = SC.spot_from_turners(env, REL)  # J lines up on the rope it sees, kept from its set-off

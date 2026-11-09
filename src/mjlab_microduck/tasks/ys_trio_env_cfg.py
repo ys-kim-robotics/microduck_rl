@@ -34,10 +34,11 @@ from mjlab_microduck.tasks.symmetry import _get_tensors
 import mjlab_microduck.tasks.ys_beat as B
 from mjlab_microduck.tasks.ys_beat import Beat
 from mjlab_microduck.tasks.ys_rope import ROPE_RADIUS
+import mjlab_microduck.tasks.ys_rope as R
 from mjlab_microduck.tasks.ys_rope_duo_env_cfg import load_frozen_actor
 from mjlab_microduck.tasks.ys_rope_env_cfg import STEM_END_NOM, STEM_LEN, make_ys_rope_bob_env_cfg, set_span
 
-TURNER_CKPT = "logs/rsl_rl/ys_rope/2026-11-03_23-03-17_rope14_short/model_19200.pt"
+TURNER_CKPT = __import__("os").environ.get("YS_TURNER_CKPT", "logs/rsl_rl/ys_rope/2026-11-03_23-03-17_rope14_short/model_19200.pt")  # 7-14: YS_TURNER_CKPT
 SPAN = 0.60  # rope14
 TURNER_AMP = 0.12 / hc.TIP_M_PER_RAD  # the duo evals' 12 cm circle
 DELTA0 = math.radians(60)  # jumper clock - turner phase (ys_trio sweep, side6 facing -x)
@@ -155,13 +156,27 @@ def _cam_track(env, key: str, site: str, occlude: bool, true_fn=None) -> torch.T
 
 def cam_tip_obs(env) -> torch.Tensor:
   """trio4+: the leader's head through the jumper's tracker (6)."""
-  return _cam_track(env, "_ys_cam", "head_imu", False)
+  return _cam_drop(env, _cam_track(env, "_ys_cam", "head_imu", False))
 
 
 def cam_ball_obs(env) -> torch.Tensor:
   """stage 7-4 (2): the leader's red ball (the rope's attach point) through the same tracker (6), hidden
   by rope links crossing the line of sight. In frame ~32% of the time (trio6 posture)."""
-  return _cam_track(env, "_ys_cam_ball", "stem_end", True)
+  return _cam_drop(env, _cam_track(env, "_ys_cam_ball", "stem_end", True))
+
+
+def _cam_drop(env, x: torch.Tensor) -> torch.Tensor:
+  """7-14 (2-3): episodes drawn by cam_drop_reset see no tracker at all (zeros = never seen), as a 61-D runtime would."""
+  m = env.__dict__.get("_ys_camdrop")
+  return x if m is None else x * (~m)[:, None].float()
+
+
+def cam_drop_reset(env, env_ids, p: float = 0.5) -> None:
+  """7-14 reset event: this episode's J has no camera tracker with probability p."""
+  if "_ys_camdrop" not in env.__dict__:
+    env._ys_camdrop = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+  ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else env_ids
+  env._ys_camdrop[ids] = torch.rand(len(ids), device=env.device) < p
 
 
 def widen_checkpoint(src: str, dst: str, add: dict) -> None:
@@ -637,6 +652,13 @@ PLACE_RANGE = {"sx": (-0.032, 0.009), "sy": (-0.018, 0.083), "th": (-7.0, 7.0), 
 STEM_REL = (0.1687, 0.0, 0.1045)  # m: each turner's stem end in its root frame at rest (s13/rel.py; fullset.py's REL)
 CLIP = _os.environ.get("YS_CLIP", "")  # all: every joint's PD target inside its range; head+yaw: head_roll, left_hip_yaw only
 SKY_W, SKY_TOL = float(_os.environ.get("YS_SKY_W", "0")), math.radians(float(_os.environ.get("YS_SKY_TOL", "20")))
+# 7-14 (user 2026-11-09, plan "첫째"): J holds its place without position commands after arrival (1-1), believes its spot
+# off by up to BELIEF cm / deg per entry (4-1), keeps where it arrived (stay reward), and may lose its camera (2-3)
+NOCENTER_AFTER = _os.environ.get("YS_NOCENTER_AFTER") == "1"  # vx, vy commands 0 once at the spot (heading kept: IMU)
+BELIEF = tuple(float(v) for v in _os.environ.get("YS_BELIEF", "0,0").split(","))  # "cm,deg": per entry, uniform in a disc / +-deg
+STAY_ARRIVE = _os.environ.get("YS_STAY_ARRIVE") == "1"  # stay_put about the point J arrived at (it cannot know the true spot)
+CAM_DROP = float(_os.environ.get("YS_CAM_DROP", "0"))  # per episode probability of no camera tracker
+J_DELAY = tuple(int(v) for v in _os.environ["YS_J_DELAY"].split(",")) if _os.environ.get("YS_J_DELAY") else None  # 7-14 (7-2): J's command delay "lo,hi" physics steps
 
 
 def _draw(e, ids, near, ymax, dev) -> None:
@@ -649,6 +671,9 @@ def _draw(e, ids, near, ymax, dev) -> None:
   e["ph"][ids] = torch.where(sd > 0, u(*ENTER_PH), u(*ENTER_PH_NEG))
   e["mode"][ids] = _mode(len(ids), dev); e["fw"][ids] = (e["mode"][ids] > 0) & ~near
   e["d_prev"][ids] = e["y0"][ids].abs()
+  if BELIEF[0] or BELIEF[1]:  # 7-14 (4-1): where J believes its spot is, off by <= BELIEF cm (uniform in the disc) and the axis +-deg
+    r, a = BELIEF[0] / 100 * torch.rand(len(ids), device=dev).sqrt(), 2 * math.pi * torch.rand(len(ids), device=dev)
+    e["bel"][ids] = torch.stack([r * a.cos(), r * a.sin(), math.radians(BELIEF[1]) * (2 * torch.rand(len(ids), device=dev) - 1)], 1)
 
 
 def enter_reset(env, env_ids: torch.Tensor | None, full: bool = False) -> None:
@@ -659,7 +684,8 @@ def enter_reset(env, env_ids: torch.Tensor | None, full: bool = False) -> None:
   if not hasattr(env, "_ys_enter"):
     z = lambda: torch.zeros(n, device=dev)
     env._ys_enter = {"y0": z(), "t": z(), "ph": z(), "t_near": z(), "go": z().bool(), "near": z().bool(), "t_go": z(),
-                     "d_prev": z(), "pk": z().long(), "bad": z().bool(), "t_hit": z(), "fw": z().bool(), "t_turn": z(), "ent": z().bool(), "mode": z().long(), "d": z(), "side": z()}
+                     "d_prev": z(), "pk": z().long(), "bad": z().bool(), "t_hit": z(), "fw": z().bool(), "t_turn": z(), "ent": z().bool(), "mode": z().long(), "d": z(), "side": z(),
+                     "bel": torch.zeros(n, 3, device=dev), "axy": torch.zeros(n, 2, device=dev)}
     env._ys_center_hook = enter_hook
   start = env.__dict__.setdefault("_ys_enter_start", env.common_step_counter)
   ymax = ENTER_Y if (full or ENTER_RAMP == 0) else ENTER_Y * min(1.0, max(0.1, (env.common_step_counter - start) / (ENTER_RAMP * 24)))
@@ -695,6 +721,8 @@ def enter_hook(cmd):
   yB = h * (1 - FWD_TURN_RATE * (t - e["t_turn"]).clamp(min=0) / (0.5 * math.pi)).clamp(min=0)
   sy = torch.where(fwB, FWD_Y * yB / h, 0.0)
   sr = env.__dict__.get("_ys_spot_rel") if PLACE else None  # 7-13 (다): the frame of the spot the turners make (else the origin's)
+  if BELIEF[0] or BELIEF[1]:  # 7-14 (4-1): the command steers by the spot J believes in
+    sr = (torch.zeros(len(t), 3, device=t.device) if sr is None else sr) + e["bel"]
   th = torch.zeros_like(t) if sr is None else sr[:, 2]
   loc = lambda y: (0.0 if sr is None else sr[:, :2]) + torch.stack([-th.sin() * y, th.cos() * y], 1)  # (0, y) in that frame
   spot = loc(torch.where(e["go"], sy, e["y0"]))
@@ -702,9 +730,11 @@ def enter_hook(cmd):
   e["d"] = d
   new = e["go"] & ~e["near"] & (d < ENTER_NEAR)
   e["t_near"] = torch.where(new, t, e["t_near"]); e["near"] |= new
+  e["axy"] = torch.where(new[:, None], cmd._robot.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2], e["axy"])  # 7-14: where it arrived
   walk = e["go"] & ~e["near"]
   g = ENTER_DASH / d.clamp(min=ENTER_NEAR) if ENTER_DASH else ENTER_GAIN
-  out = (spot, torch.where(walk, g, J.CENTER_GAIN), torch.where(walk, max(ENTER_VMAX, ENTER_DASH), 0.3))
+  hold = torch.where(e["near"], 0.0, J.CENTER_GAIN) if NOCENTER_AFTER else J.CENTER_GAIN  # 7-14 (1-1): no position command once there
+  out = (spot, torch.where(walk, g, hold), torch.where(walk, max(ENTER_VMAX, ENTER_DASH), 0.3))
   if ENTER_MODE == "side":
     return out if sr is None else (*out, (J.CENTER_GAIN * _wrap(th - _yaw(cmd._robot))).clamp(-0.5, 0.5))
   # A: -y until the last ENTER_TURN_D (from ENTER_NEAR), then face L
@@ -942,6 +972,17 @@ def stay_put_spot(env, pos_std: float = 0.02, yaw_std: float = 0.1) -> torch.Ten
   return torch.exp(-dxy / pos_std**2 - _wrap(_yaw(rob) - th).square() / yaw_std**2)
 
 
+def stay_put_arrive(env, pos_std: float = 0.05, yaw_std: float = 0.3) -> torch.Tensor:
+  """7-14: once at its spot, stay_put about the point J arrived at (two widths: the wide one keeps a gradient while it drifts
+  5-20 cm), heading along the axis it believes in; before that stay_put_spot. With a belief error J cannot know the true
+  spot (no camera), so a reward about it would be partly unescapable; drifting away from where it stands is escapable."""
+  e, rob, sr = env._ys_enter, env.scene["robot"], env.__dict__.get("_ys_spot_rel")
+  th = (torch.zeros(env.num_envs, device=env.device) if sr is None else sr[:, 2]) + e["bel"][:, 2]
+  d2 = (rob.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2] - e["axy"]).square().sum(-1)
+  arr = (0.5 * torch.exp(-d2 / pos_std**2) + 0.5 * torch.exp(-d2 / (3 * pos_std) ** 2)) * torch.exp(-_wrap(_yaw(rob) - th).square() / yaw_std**2)
+  return torch.where(e["near"], arr, stay_put_spot(env, pos_std, yaw_std))
+
+
 def sky_cost(env, tol: float = SKY_TOL, cap: float = 0.5 * math.pi, ramp_it: int = 100) -> torch.Tensor:
   """7-13 (③, >= 0, weight < 0) per 10 deg the head camera looks above tol, its elevation taken from the trunk's heading
   (atan2: up and back past the vertical keeps counting, to tol + cap). User 2026-11-09: A waits looking at the sky (neck +
@@ -1147,6 +1188,15 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
       cfg.actions["joint_pos"] = LimitJointPositionActionCfg(**{k: getattr(a, k) for k in a.__dataclass_fields__}, limit_joints=".*" if CLIP == "all" else "head_roll|left_hip_yaw")
     if SKY_W:  # 7-13 ③: looking at the sky costs
       cfg.rewards["sky"] = RewardTermCfg(func=sky_cost, weight=-SKY_W)
+    if STAY_ARRIVE:  # 7-14: stay about the arrival point
+      cfg.rewards["stay_put"].func = stay_put_arrive
+    if CAM_DROP:  # 7-14 (2-3)
+      cfg.events["cam_drop_reset"] = EventTermCfg(func=cam_drop_reset, mode="reset", params={"p": CAM_DROP})
+  if J_DELAY:  # 7-14 (7-2): J only (the actuator cfg objects are shared with L / F: copies, 7-13 check 7)
+    e_ = cfg.scene.entities["robot"]
+    cfg.scene.entities["robot"] = replace(e_, articulation=replace(e_.articulation, actuators=tuple(replace(a, delay_min_lag=J_DELAY[0], delay_max_lag=J_DELAY[1]) for a in e_.articulation.actuators)))
+  if R.ROPE_DR:  # 7-14 (9-3): the rope's mass per env (YS_ROPE_DR="lo,hi" kg)
+    cfg.events["rope_mass_dr"] = EventTermCfg(func=R.rope_mass_scale, mode="startup", params={"asset_cfg": SceneEntityCfg("rope", body_names=("rope_.*",)), "mass_range": R.ROPE_DR})
   if enter and DUCK:  # head down while running in
     for k, f in (("head_up", head_up_free), ("gaze", gaze_free), ("head_back", head_back_free)):
       if k in cfg.rewards: cfg.rewards[k].func = f
