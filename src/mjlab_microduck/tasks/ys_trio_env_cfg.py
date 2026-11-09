@@ -29,7 +29,7 @@ from mjlab.managers import EventTermCfg, ObservationTermCfg, RewardTermCfg, Scen
 import mjlab_microduck.tasks.ys_head_circle_env_cfg as hc
 import mjlab_microduck.tasks.ys_jump_env_cfg as J
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import MicroduckRlCfg
-from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply_inverse
+from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply, quat_apply_inverse
 from mjlab_microduck.tasks.symmetry import _get_tensors
 import mjlab_microduck.tasks.ys_beat as B
 from mjlab_microduck.tasks.ys_beat import Beat
@@ -263,6 +263,29 @@ class TurnerActionCfg(JointPositionActionCfg):
 
   def build(self, env):
     return TurnerAction(self, env)
+
+
+class LimitJointPositionAction(JointPositionAction):
+  """7-13 (user 2026-11-09: commands past the joint limits are wrong in themselves): PD targets clamped to the model's joint
+  range for the joints matching cfg.limit_joints, as a runtime clamp would (s12/fullset.py CLIP). The policy's last-action
+  observation keeps its raw actions."""
+
+  def process_actions(self, actions: torch.Tensor):
+    super().process_actions(actions)
+    if not hasattr(self, "_lim"):
+      import re
+      m = torch.tensor([re.fullmatch(self.cfg.limit_joints, nm) is not None for nm in self._target_names], device=self.device)
+      free = torch.tensor([-math.inf, math.inf], device=self.device)
+      self._lim = torch.where(m[None, :, None], self._entity.data.joint_pos_limits[:, self._target_ids], free)
+    self._processed_actions = torch.max(torch.min(self._processed_actions, self._lim[..., 1]), self._lim[..., 0])
+
+
+@dataclass(kw_only=True)
+class LimitJointPositionActionCfg(JointPositionActionCfg):
+  limit_joints: str = ".*"
+
+  def build(self, env):
+    return LimitJointPositionAction(self, env)
 
 
 def cam_age_obs(env) -> torch.Tensor:
@@ -603,6 +626,17 @@ def _face(st: torch.Tensor, turn: torch.Tensor) -> None:
 
 
 ENTER_WAIT = (2.5, 4.0)  # s: earliest set-off (the rope has spun up: ROPE_GRACE_STEPS 2 s)
+# 7-13 (user 2026-11-09): J trained on the full game's start and placement, a mild push, PD targets inside the joint range
+# and a cost on looking at the sky. All off unless set (env vars), so the earlier tasks and evals are unchanged.
+START_SEQ = _os.environ.get("YS_START_SEQ") == "1"  # (나) the rope still until J's start call, the circle 0 -> full over
+CALL_T, CALL_RAMP, CALL_AFTER = (0.2, 1.0), 1.0, 4.0  # CALL_RAMP s; J sets off >= CALL_AFTER s after its call (fullset J_AFTER)
+PLACE = _os.environ.get("YS_PLACE") == "1"  # (다) L / F where the walk-out leaves them; J's spot from where they stand
+# full game (s12 clip runs, n 1785, p5..p95): spot x / y (m) and rope-axis heading (deg) from the nominal, stem ends apart
+# minus 0.60 m (m), L's / F's yaw off facing each other along the axis (deg)
+PLACE_RANGE = {"sx": (-0.032, 0.009), "sy": (-0.018, 0.083), "th": (-7.0, 7.0), "dd": (-0.013, 0.033), "yl": (-12.0, 12.0), "yf": (-16.0, -1.0)}
+STEM_REL = (0.1687, 0.0, 0.1045)  # m: each turner's stem end in its root frame at rest (s13/rel.py; fullset.py's REL)
+CLIP = _os.environ.get("YS_CLIP", "")  # all: every joint's PD target inside its range; head+yaw: head_roll, left_hip_yaw only
+SKY_W, SKY_TOL = float(_os.environ.get("YS_SKY_W", "0")), math.radians(float(_os.environ.get("YS_SKY_TOL", "20")))
 
 
 def _draw(e, ids, near, ymax, dev) -> None:
@@ -660,8 +694,11 @@ def enter_hook(cmd):
   e["t_turn"] = torch.where(fwB & e["near"] & e["t_turn"].isinf(), t + 0.8 * FWD_PASSES, e["t_turn"])
   yB = h * (1 - FWD_TURN_RATE * (t - e["t_turn"]).clamp(min=0) / (0.5 * math.pi)).clamp(min=0)
   sy = torch.where(fwB, FWD_Y * yB / h, 0.0)
-  spot = torch.stack([torch.zeros_like(t), torch.where(e["go"], sy, e["y0"])], 1)
-  d = (env.scene.env_origins[:, :2] + torch.stack([torch.zeros_like(t), sy], 1) - cmd._robot.data.root_link_pos_w[:, :2]).norm(dim=-1)
+  sr = env.__dict__.get("_ys_spot_rel") if PLACE else None  # 7-13 (다): the frame of the spot the turners make (else the origin's)
+  th = torch.zeros_like(t) if sr is None else sr[:, 2]
+  loc = lambda y: (0.0 if sr is None else sr[:, :2]) + torch.stack([-th.sin() * y, th.cos() * y], 1)  # (0, y) in that frame
+  spot = loc(torch.where(e["go"], sy, e["y0"]))
+  d = (env.scene.env_origins[:, :2] + loc(sy) - cmd._robot.data.root_link_pos_w[:, :2]).norm(dim=-1)
   e["d"] = d
   new = e["go"] & ~e["near"] & (d < ENTER_NEAR)
   e["t_near"] = torch.where(new, t, e["t_near"]); e["near"] |= new
@@ -669,9 +706,9 @@ def enter_hook(cmd):
   g = ENTER_DASH / d.clamp(min=ENTER_NEAR) if ENTER_DASH else ENTER_GAIN
   out = (spot, torch.where(walk, g, J.CENTER_GAIN), torch.where(walk, max(ENTER_VMAX, ENTER_DASH), 0.3))
   if ENTER_MODE == "side":
-    return out
+    return out if sr is None else (*out, (J.CENTER_GAIN * _wrap(th - _yaw(cmd._robot))).clamp(-0.5, 0.5))
   # A: -y until the last ENTER_TURN_D (from ENTER_NEAR), then face L
-  yref = torch.where(fwB, yB, torch.where(fwA & ~e["near"], h * ((d - ENTER_NEAR) / ENTER_TURN_D).clamp(0, 1), 0.0))
+  yref = th + torch.where(fwB, yB, torch.where(fwA & ~e["near"], h * ((d - ENTER_NEAR) / ENTER_TURN_D).clamp(0, 1), 0.0))
   dy = torch.remainder(yref - _yaw(cmd._robot) + math.pi, 2 * math.pi) - math.pi
   if B_TWOFOOT:  # B facing forward: both feet in one window (ys_jump_env_cfg.foot_window)
     env._ys_two_foot = fwB & (_yaw(cmd._robot).abs() > 0.3)
@@ -701,8 +738,12 @@ def enter_again(env, env_ids) -> None:
   e["go"][ids], e["near"][ids], e["t_near"][ids], e["t_go"][ids], e["pk"][ids], e["bad"][ids] = False, False, 0.0, torch.inf, 0, False
   e["t_hit"][ids], e["t_turn"][ids] = torch.inf, torch.inf
   st = rob.data.default_root_state[ids].clone(); st[:, 7:] = 0.0
-  st[:, :3] += env.scene.env_origins[ids]; st[:, 1] += e["y0"][ids]
-  _face(st, -0.5 * math.pi * e["side"][ids] * e["fw"][ids].float())
+  st[:, :3] += env.scene.env_origins[ids]
+  sr = env.__dict__.get("_ys_spot_rel") if PLACE else None  # 7-13 (다): put back beside the spot the turners make
+  th = 0.0 if sr is None else sr[ids, 2]
+  if sr is None: st[:, 1] += e["y0"][ids]
+  else: st[:, :2] += sr[ids, :2] + torch.stack([-th.sin() * e["y0"][ids], th.cos() * e["y0"][ids]], 1)
+  _face(st, th - 0.5 * math.pi * e["side"][ids] * e["fw"][ids].float())
   rob.write_root_state_to_sim(st, ids)
   rob.write_joint_state_to_sim(rob.data.default_joint_pos[ids].clone(), torch.zeros_like(rob.data.default_joint_pos[ids]), env_ids=ids)
   env.sim.forward()  # this step's obs read the new pose (step events run after the step's forward)
@@ -757,7 +798,8 @@ def rope_overlap_early(env, t0: float = 0.3, t1: float = 3.0) -> torch.Tensor:
 def enter_approach(env, v_full: float = 0.5) -> torch.Tensor:
   """7-9 E3 (user (a): hurry in): speed toward the spot (m/s, / v_full, clamped 0..1) from set-off until arrival: E1/E2
   took 0.50-0.58 s from 12-20 cm and the rope is back at the feet ~0.5 s after the set-off."""
-  e = env._ys_enter; d = (env.scene.env_origins[:, :2] - env.scene["robot"].data.root_link_pos_w[:, :2]).norm(dim=-1)
+  sr = env.__dict__.get("_ys_spot_rel") if PLACE else None  # 7-13 (다): toward the spot the turners make
+  e = env._ys_enter; d = (env.scene.env_origins[:, :2] + (0.0 if sr is None else sr[:, :2]) - env.scene["robot"].data.root_link_pos_w[:, :2]).norm(dim=-1)
   v = (e["d_prev"] - d) / env.step_dt; e["d_prev"] = d
   return (v / v_full).clamp(0, 1) * (e["go"] & ~e["near"])
 
@@ -834,6 +876,85 @@ def gaze_free(env, **kw) -> torch.Tensor:
 
 def head_back_free(env, **kw) -> torch.Tensor:
   return head_back(env, **kw) * ~_entering(env)
+
+
+def start_seq_reset(env, env_ids) -> None:
+  """7-13 (나) reset event after enter_reset: J's start call CALL_T s after the reset, its earliest set-off CALL_AFTER s
+  after the call; the turners hold the rope still until the call (env._ys_amp, read by TurnerAction)."""
+  n, dev = env.num_envs, env.device
+  ids = torch.arange(n, device=dev) if env_ids is None else env_ids
+  if "_ys_call" not in env.__dict__:
+    env._ys_call, env._ys_amp = torch.zeros(n, device=dev), torch.zeros(n, device=dev)
+  env._ys_call[ids] = torch.empty(len(ids), device=dev).uniform_(*CALL_T)
+  env._ys_enter["t"][ids] = env._ys_call[ids] + CALL_AFTER
+  env._ys_amp[ids] = 0.0
+
+
+def start_seq_step(env, env_ids) -> None:
+  """7-13 (나) step event: both turners' circle size, 0 until J's call, full CALL_RAMP s later (fullset.py's start ramp)."""
+  env._ys_amp = ((env.episode_length_buf * env.step_dt - env._ys_call) / CALL_RAMP).clamp(0, 1)
+
+
+def place_reset(env, env_ids) -> None:
+  """7-13 (다) reset event after the turners' and the rope's: L, F and the rope moved as one piece so the spot lands at (sx,
+  sy) with the rope axis at heading th (PLACE_RANGE: the full game's walk-out), the stem ends then put dd further apart
+  along the axis, and each duck turned about its own stem end by its yaw error (the rope end stays put). J's spot
+  (env._ys_spot_rel, the frame enter_hook works in) starts as the drawn one; spot_step follows the turners after that."""
+  n, dev = env.num_envs, env.device
+  ids = torch.arange(n, device=dev) if env_ids is None else env_ids
+  if "_ys_spot_rel" not in env.__dict__:
+    env._ys_spot_rel = torch.zeros(n, 3, device=dev)
+  u = lambda k: torch.empty(len(ids), device=dev).uniform_(*PLACE_RANGE[k])
+  sx, sy, dd, th = u("sx"), u("sy"), u("dd"), torch.deg2rad(u("th"))
+  c, s = th.cos(), th.sin()
+  move = lambda p: torch.stack([sx + c * p[:, 0] - s * p[:, 1], sy + s * p[:, 0] + c * p[:, 1]], 1)  # nominal xy -> drawn
+  rot = lambda a, v: torch.stack([a.cos() * v[0] - a.sin() * v[1], a.sin() * v[0] + a.cos() * v[1]], 1)
+  qyaw = lambda q: torch.atan2(2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2))
+  for who, sgn, err in (("turner", 1.0, u("yl")), ("partner", -1.0, u("yf"))):
+    ent = env.scene[who]; st = ent.data.default_root_state[ids].clone(); st[:, 7:] = 0.0
+    yaw0 = qyaw(st[:, 3:7]); turn = th + torch.deg2rad(err)
+    stem = move(st[:, :2] + rot(yaw0, STEM_REL)) + sgn * 0.5 * dd[:, None] * torch.stack([c, s], 1)
+    st[:, :2] = stem - rot(yaw0 + turn, STEM_REL); _face(st, turn)
+    st[:, 2] += torch.empty(len(ids), device=dev).uniform_(*env.event_manager.get_term_cfg(f"{who}_reset_base").params["pose_range"].get("z", (0.0, 0.0)))
+    st[:, :3] += env.scene.env_origins[ids]
+    ent.write_root_state_to_sim(st, ids)
+  rope = env.scene["rope"]; st = rope.data.default_root_state[ids].clone(); st[:, 7:] = 0.0
+  st[:, :2] = move(st[:, :2]); _face(st, th); st[:, :3] += env.scene.env_origins[ids]
+  rope.write_root_state_to_sim(st, ids)
+  env._ys_spot_rel[ids] = torch.stack([sx, sy, th], 1)
+
+
+def spot_step(env, env_ids) -> None:
+  """7-13 (다) step event: J's spot as the turners make it (scripts/ys_trio_scn.spot_from_turners), kept from its set-off."""
+  ctr = [(env.scene[w].data.root_link_pos_w + quat_apply(env.scene[w].data.root_link_quat_w, torch.tensor(STEM_REL, device=env.device).expand(env.num_envs, 3)))[:, :2]
+         for w in ("turner", "partner")]
+  ax = (ctr[0] - ctr[1]) / (ctr[0] - ctr[1]).norm(dim=-1, keepdim=True).clamp(min=1e-6)
+  spot = (ctr[0] + ctr[1]) / 2 + JUMPER_Y * torch.stack([-ax[:, 1], ax[:, 0]], 1) - env.scene.env_origins[:, :2]
+  new = torch.cat([spot, torch.atan2(ax[:, 1], ax[:, 0])[:, None]], 1)
+  env._ys_spot_rel = torch.where(env._ys_enter["go"][:, None], env._ys_spot_rel, new)
+
+
+def stay_put_spot(env, pos_std: float = 0.02, yaw_std: float = 0.1) -> torch.Tensor:
+  """7-13 (다) stay_put about J's spot as the turners make it, heading along F->L (the env origin facing +x before)."""
+  sr, rob = env.__dict__.get("_ys_spot_rel"), env.scene["robot"]
+  o, th = (0.0, 0.0) if sr is None else (sr[:, :2], sr[:, 2])
+  dxy = (rob.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2] - o).square().sum(-1)
+  return torch.exp(-dxy / pos_std**2 - _wrap(_yaw(rob) - th).square() / yaw_std**2)
+
+
+def sky_cost(env, tol: float = SKY_TOL, cap: float = 0.5 * math.pi, ramp_it: int = 100) -> torch.Tensor:
+  """7-13 (③, >= 0, weight < 0) per 10 deg the head camera looks above tol, its elevation taken from the trunk's heading
+  (atan2: up and back past the vertical keeps counting, to tol + cap). User 2026-11-09: A waits looking at the sky (neck +
+  head pitch -133 deg vs standing): gaze, the only term against looking up, is off for A until it faces L. Ramped in over
+  ramp_it iterations from its first call (the warm start's critic never saw it)."""
+  rob = env.scene["robot"]
+  if not hasattr(env, "_ys_cam_site"):
+    env._ys_cam_site = rob.find_sites(["head_camera"])[0][0]
+  k0 = env.__dict__.setdefault("_ys_sky_k0", env.common_step_counter)
+  w, x, y, z = rob.data.site_quat_w[:, env._ys_cam_site].unbind(-1)
+  fx, fy, fz = 1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)  # camera x axis, world (as J.head_up)
+  yaw = _yaw(rob); el = torch.atan2(fz, fx * yaw.cos() + fy * yaw.sin())
+  return min(1.0, (env.common_step_counter - k0) / (ramp_it * 24)) * (el - tol).clamp(0, cap) / math.radians(10)
 
 
 # (3) distillation (user 2026-11-07 evening): one student (from N1c), PPO + behavior cloning, routed per frame. Settled
@@ -1011,6 +1132,21 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
       cfg.rewards["enter_clear"] = RewardTermCfg(func=enter_clear, weight=3.0)
       if float(_os.environ.get("YS_ENTER_LATE_W", "0")) > 0:  # N1b: staying out of the rope costs
         cfg.rewards["enter_late"] = RewardTermCfg(func=enter_late, weight=-float(_os.environ["YS_ENTER_LATE_W"]))
+    if START_SEQ:  # 7-13 (나): the rope still until J's start call, the 1 s ramp, J sets off >= 4 s after the call
+      cfg.events["start_seq_reset"] = EventTermCfg(func=start_seq_reset, mode="reset")
+      cfg.events["start_seq_step"] = EventTermCfg(func=start_seq_step, mode="step")
+    if PLACE:  # 7-13 (다): L / F placed as the walk-out leaves them, J's spot from where they stand
+      cfg.events["place_reset"] = EventTermCfg(func=place_reset, mode="reset")
+      cfg.events["spot_step"] = EventTermCfg(func=spot_step, mode="step")
+      cfg.rewards["stay_put"].func = stay_put_spot
+    if _os.environ.get("YS_PUSH") == "mild":  # 7-13 (가): the full game's mild push (s12/fullset.py PUSH=mild)
+      cfg.events["push_robot"].interval_range_s = (2.0, 4.0)
+      cfg.events["push_robot"].params["velocity_range"] = {"x": (-0.1, 0.1), "y": (-0.1, 0.1)}
+    if CLIP:  # 7-13 ① every joint / ② head_roll + left_hip_yaw: PD targets inside the joint range
+      a = cfg.actions["joint_pos"]
+      cfg.actions["joint_pos"] = LimitJointPositionActionCfg(**{k: getattr(a, k) for k in a.__dataclass_fields__}, limit_joints=".*" if CLIP == "all" else "head_roll|left_hip_yaw")
+    if SKY_W:  # 7-13 ③: looking at the sky costs
+      cfg.rewards["sky"] = RewardTermCfg(func=sky_cost, weight=-SKY_W)
   if enter and DUCK:  # head down while running in
     for k, f in (("head_up", head_up_free), ("gaze", gaze_free), ("head_back", head_back_free)):
       if k in cfg.rewards: cfg.rewards[k].func = f
