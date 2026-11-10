@@ -91,23 +91,23 @@ CAM_NOISE = 0.01  # normalized image units (~6 px at 1280)
 CAM_DROP = 0.05
 
 
-def _cam_vec(env, site: str):
-  """(d, p0, p1): a leader (front turner) site in the jumper's head_camera frame, and both world points."""
-  rob, tu = env.scene["robot"], env.scene["turner"]
+def _cam_vec(env, site: str, who: str = "turner"):
+  """(d, p0, p1): a turner site (who: the leader by default) in the jumper's head_camera frame, and both world points."""
+  rob, tu = env.scene["robot"], env.scene[who]
   ids = env.__dict__.setdefault("_ys_cam_ids", {})
-  if site not in ids:
-    ids[site] = (rob.find_sites("head_camera")[0][0], tu.find_sites(site)[0][0])
-  i, j = ids[site]
+  if (who, site) not in ids:
+    ids[(who, site)] = (rob.find_sites("head_camera")[0][0], tu.find_sites(site)[0][0])
+  i, j = ids[(who, site)]
   p0, p1 = rob.data.site_pos_w[:, i], tu.data.site_pos_w[:, j]
   R = matrix_from_quat(rob.data.site_quat_w[:, i])
   return (R.transpose(1, 2) @ (p1 - p0)[..., None])[..., 0], p0, p1
 
 
-def _cam_true(env, site: str = "head_imu", occlude: bool = False) -> torch.Tensor:
+def _cam_true(env, site: str = "head_imu", occlude: bool = False, who: str = "turner") -> torch.Tensor:
   """(N, 3) u, v in [-1, 1] (right, up) of a turner site (head_imu: its head; stem_end: the red ball) in
   the jumper's head_camera site frame (x forward, y left, z up: probed), valid = in front and in the
   frame (and, occlude, not behind a rope link)."""
-  d, p0, p1 = _cam_vec(env, site)
+  d, p0, p1 = _cam_vec(env, site, who)
   x = d[:, 0].clamp(min=1e-3)
   u, v = -d[:, 1] / x / CAM_TAN_H, d[:, 2] / x / CAM_TAN_V
   ok = (d[:, 0] > 0.02) & (u.abs() <= 1) & (v.abs() <= 1)
@@ -328,7 +328,25 @@ def faded_head_command(env, command_name: str = "head_pose", fade_steps: int = C
   a = max(0.0, 1.0 - env.common_step_counter / fade_steps) if fade_steps else 0.0
   if CLOCK_IN:  # 7-12: J's own clock back (v2: all three run on J's start call), faded in over CLOCK_IN steps (eval: 1)
     a = min(1.0, (env.common_step_counter + 1 - env.__dict__.setdefault("_ys_clock0", env.common_step_counter)) / CLOCK_IN)
-  return a * env.command_manager.get_command(command_name)
+  c = env.command_manager.get_command(command_name)
+  if CLOCK_ROPE is not None:  # 7-15 재학습 8: the slots carry the rope's phase as the procedure would measure it: J's clock shifted by
+    # the episode's rope offset (sample_delta; 0 when the eval fixes it) plus the procedure's error (clock_err_reset)
+    s_ = (env.__dict__.get("_ys_delta", DELTA0) - DELTA0) + env.__dict__.get("_ys_clock_err", 0.0)
+    s_ = torch.as_tensor(s_, device=c.device).expand(c.shape[0]); c = c.clone(); p_, y_ = c[:, hc.HEAD_PITCH].clone(), c[:, hc.HEAD_YAW].clone()
+    c[:, hc.HEAD_PITCH], c[:, hc.HEAD_YAW] = p_ * s_.cos() + y_ * s_.sin(), y_ * s_.cos() - p_ * s_.sin()  # amp cos / sin of (phase - s)
+  return a * c
+
+
+CLOCK_ROPE = float(__import__("os").environ["YS_CLOCK_ROPE"]) if __import__("os").environ.get("YS_CLOCK_ROPE") else None  # deg: the
+# procedure's rope-phase error (sd, per episode); None: J's own clock as before
+
+
+def clock_err_reset(env, env_ids, sd_deg: float) -> None:
+  """7-15 재학습 8: the procedure's error in the rope phase it measures, drawn per episode (per game in the eval)."""
+  if not hasattr(env, "_ys_clock_err"):
+    env._ys_clock_err = torch.zeros(env.num_envs, device=env.device)
+  ids = slice(None) if env_ids is None else env_ids
+  env._ys_clock_err[ids] = math.radians(sd_deg) * torch.randn_like(env._ys_clock_err[ids])
 
 
 class TrioClockCommand(J.JumpClockCommand):
@@ -1199,6 +1217,8 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
       cfg.rewards["stay_put"].func = stay_put_arrive
     if CAM_DROP:  # 7-14 (2-3)
       cfg.events["cam_drop_reset"] = EventTermCfg(func=cam_drop_reset, mode="reset", params={"p": CAM_DROP})
+  if CLOCK_ROPE is not None:  # 7-15 재학습 8: the procedure's rope-phase error per episode (kept in the eval: ys_fullset pops sample_delta only)
+    cfg.events["clock_err_reset"] = EventTermCfg(func=clock_err_reset, mode="reset", params={"sd_deg": CLOCK_ROPE})
   if J_DELAY:  # 7-14 (7-2): J only (the actuator cfg objects are shared with L / F: copies, 7-13 check 7)
     e_ = cfg.scene.entities["robot"]
     cfg.scene.entities["robot"] = replace(e_, articulation=replace(e_.articulation, actuators=tuple(replace(a, delay_min_lag=J_DELAY[0], delay_max_lag=J_DELAY[1]) for a in e_.articulation.actuators)))

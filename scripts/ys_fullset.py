@@ -23,6 +23,7 @@ import ys_eval, mjlab_microduck.tasks  # noqa
 import mjlab_microduck.tasks.ys_trio_env_cfg as T
 import mjlab_microduck.tasks.ys_jump_env_cfg as J
 import mjlab_microduck.tasks.ys_beat as B
+import ys_camfix  # noqa: E402 (C_NOM for WAITLOOK's aim; CamFix for CAM_FIX)
 from mjlab.utils.lab_api.math import quat_apply, quat_inv
 
 NOWALK = os.environ.get("NOWALK") == "1"  # control: no handle walk-out (L and F turn from their places, the rope on the stems
@@ -37,6 +38,10 @@ CLOCKOFF = os.environ.get("CLOCKOFF")  # 7-13 check 3, deg: L / F turn the rope 
 # set-off still reads its own clock (it does not know the offset)
 HOLD = [math.radians(float(v)) for v in os.environ["ODO_HOLD"].split(",")] if os.environ.get("ODO_HOLD") else None  # 7-15 (1-2): "c,w" deg: while J's
 # clock phase is within c +- w (its flight, s16/odo/clock2.py), the odometry output keeps its last velocity (runtime untouched)
+WAITLOOK = os.environ.get("WAITLOOK")  # 7-15 (1-4 + user): J waits on velstand until HANDOVER s before its earliest set-off: "stand"
+# head straight, "L" head turned to L's ball, "LF" to F's ball then L's (needs CAM_FIX: the fix then uses both while J waits)
+HANDOVER, LOOK0, LOOKF, RAMPED = 1.0, 0.3, float(os.environ.get("LOOK_SPLIT", "1.8")), float(os.environ.get("LOOK_FROM", "1.1"))  # s: own policy back before the earliest
+# set-off; after the call: head turns, L -> F (LF), frames used (the circle is full from about 1 s: s16/wait, 117 / 103 mm at 1.0-1.8 s)
 CAMFIX = os.environ.get("CAM_FIX") == "1"  # 7-15 (1-3): + J's camera fix of the odometry position (scripts/ys_camfix.py; needs ODO=1)
 ODO = os.environ.get("ODO") == "1"  # 7-14: J's position estimate = the runtime's contact odometry (scripts/ys_odo_replay, unchanged runtime
 # code) on the encoders (bias included) and the trunk quaternion, live from J's start call, from where J truly stood then; its
@@ -103,9 +108,31 @@ with torch.inference_mode():
   REL = {w: quat_apply(quat_inv(env.scene[w].data.root_link_quat_w), env.scene[w].data.site_pos_w[:, env.scene[w].find_sites("stem_end")[0][0]] - env.scene[w].data.root_link_pos_w).median(0).values for w in ("turner", "partner")}
 
 
-def jstand(x):  # J obs -> velstand actions (61-D, command block 0: stand still), one env at a time (the ONNX is batch 1)
-  z = x[:, :61].clone(); z[:, 48:61] = 0.0; z = z.cpu().numpy().astype(np.float32)
+def jstand(x, head=None):  # J obs -> velstand actions (61-D, command block 0: stand still; head: (n, 4) its head command), one env
+  z = x[:, :61].clone(); z[:, 48:61] = 0.0  # at a time (the ONNX is batch 1)
+  if head is not None: z[:, 51:55] = head
+  z = z.cpu().numpy().astype(np.float32)
   return torch.from_numpy(np.concatenate([vs.run(None, {"obs": z[i: i + 1]})[0] for i in range(len(z))])).to(x.device)
+
+
+def look(te):
+  """WAITLOOK: (N, 4) velstand head command [neck_pitch, head_pitch, head_yaw, head_roll] turning J's head to the ball the procedure
+  expects (L's / F's circle centre: its spot -+ the nominal half axis, ys_camfix C_NOM), from J's estimated place and IMU yaw."""
+  sr = env.__dict__.get("_ys_spot_rel")
+  if sr is None: return torch.zeros(N, 4, device=dev)  # before the turners' spot exists (start of the game)
+  h = sr[:, 2]; ax, nr = torch.stack([h.cos(), h.sin()], 1), torch.stack([-h.sin(), h.cos()], 1)
+  c0, c1 = ys_camfix.C_NOM; rel = te - (E["t"] - J_AFTER); end = J_AFTER - HANDOVER - 0.3
+  tL = (rel >= LOOK0) & (rel < (LOOKF if WAITLOOK == "LF" else end)) & (WAITLOOK != "stand"); tF = (rel >= LOOKF) & (rel < end) & (WAITLOOK == "LF")
+  tgt = torch.where(tF[:, None], sr[:, :2] - (-c0 * ax + c1 * nr), sr[:, :2] - (c0 * ax + c1 * nr))
+  me = rob.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2] - (E["drift"] if ODO else 0.0)
+  b = T._wrap(torch.atan2(tgt[:, 1] - me[:, 1], tgt[:, 0] - me[:, 0]) - T._yaw(rob))
+  out = torch.zeros(N, 4, device=dev); on_ = tF | tL
+  out[:, 2] = torch.where(on_, b.clamp(-LOOK_YAW, LOOK_YAW), 0.0); out[:, 1] = torch.where(on_, LOOK_PITCH, 0.0)
+  return out
+
+
+LOOK_YAW, LOOK_PITCH = 1.35, float(os.environ.get("LOOK_PITCH", "-0.3"))  # rad: velstand's head commands were trained to +-1.40 / +-1.10;
+# pitch -0.3 (head up): L's ball in J's tracker 86% of the wait vs 78% at 0, 65% at +0.3 (16 games, s16/wait/looktest.py)
 
 
 def noclock(o):  # the handover jumper (E5 line) was trained clock-free: its head-command slots read 0
@@ -163,9 +190,15 @@ def odo_step(k, M):
   world = _P0[on] + est - _O0[on]
   sp = env.__dict__.get("_ys_spot_rel"); cb = env.__dict__.get("_ys_cam_ball")
   if CAMFIX and sp is not None and cb is not None:
-    spw = torch.cat([sp[:, :2] + env.scene.env_origins[:, :2], sp[:, 2:]], 1).cpu().numpy()
+    spw = torch.cat([sp[:, :2] + env.scene.env_origins[:, :2], sp[:, 2:]], 1).cpu().numpy(); cur, curF, wt = cb["cur"], None, None
+    if WAITLOOK:  # frames only once the circle is full (it ramps up over 1 s after the call); F's ball tracked too (LF)
+      ramp = (env.episode_length_buf * dt - (E["t"] - J_AFTER) < RAMPED)[:, None]; cur = torch.where(ramp, torch.zeros_like(cur), cur)
+      if WAITLOOK == "LF":
+        curF = T._cam_track(env, "_ys_cam_fball", "stem_end", True, true_fn=lambda e: T._cam_true(e, "stem_end", True, who="partner"))[:, :3]
+        curF = torch.where(ramp, torch.zeros_like(curF), curF).cpu().numpy()
+      wt = (~E["go"][on]).cpu().numpy()
     corr = _CF.step(k, ids, x[:, :15], x[:, 15:], torch.cat([world, est3[:, 2:]], 1).cpu().numpy(), cmd.phase[on].cpu().numpy(),
-                    cb["cur"].cpu().numpy(), env._ys_cam_clock["lag"].cpu().numpy(), spw)
+                    cur.cpu().numpy(), env._ys_cam_clock["lag"].cpu().numpy(), spw, curF, wt)
     world = world + torch.as_tensor(corr, dtype=world.dtype, device=dev)
   E["drift"][on] = pos - world
 
@@ -211,7 +244,9 @@ def episode(on_step=None):
     a = pol(obs)
     if pol2 is not None: a = torch.where(sw[:, None], pol2(noclock(obs)), a)
     vel = ((M["start"] < 0) & ~torch.tensor(JPOL0, device=dev)) | (k >= kstop)  # J stands: before its call (JPOL0: its own policy), after the stop
-    if vel.any(): a[vel] = jstand(obs["actor"][vel])
+    if WAITLOOK:  # 7-15: J stands (and looks) while it waits, its own policy HANDOVER s before the earliest set-off
+      te_ = env.episode_length_buf * dt; vel = vel | ((M["start"] >= 0) & ~E["go"] & (te_ < E["t"] - HANDOVER))
+    if vel.any(): a[vel] = jstand(obs["actor"][vel], look(env.episode_length_buf * dt)[vel] if WAITLOOK else None)
     WAITM[:] = (M["start"] >= 0) & ~E["go"]  # CLIP=wait's mask
     cmd.amp[:] = 1.0; cmd.freq[:] = 1.25; cmd._write(); obs, *_ = venv.step(a)
     if ODO: odo_step(k, M)
@@ -435,7 +470,8 @@ for gi in range(1, NG + 1):
         elif kc >= 0 and 0 <= k - kc < 30: nm_, c_ = nm_ + "   끝 소리!", (255, 120, 60)
         elif te - st["peck"] < 0.25: nm_, c_ = nm_ + "   톡!", (255, 220, 60)
       tag(dr, xy, nm_, FS, c_)
-    info = f"t {te:4.1f} s" + (f"   시작 소리 후 {(k - ks) * dt:4.1f} s" if ks >= 0 else "") + (f"   출발 후 {(k - kg) * dt:4.2f} s   자리까지 {100 * float(E['d'][0]):4.1f} cm" if kg >= 0 else "")
+    info = f"t {te:4.1f} s" + (f"   시작 소리 후 {(k - ks) * dt:4.1f} s" if ks >= 0 else "") + (f"   출발 후 {(k - kg) * dt:4.2f} s   자리까지 {100 * float(E['d'][0]):4.1f} cm" if kg >= 0 else "") \
+      + (f"   J 위치 추정 오차 {100 * float(E['drift'][0].norm()):4.1f} cm" if ODO and ks >= 0 else "")  # ODO: 자리까지 = what J believes
     box(dr, (12, H_ - 54), info, FS, (0, 0, 0, 150), (220, 235, 255))
     fr = np.asarray(Image.alpha_composite(im, ov).convert("RGB")); put(fr); st["last"] = fr
     return (kc >= 0 and k > kc + KSTOP + int(AFTER / dt))
