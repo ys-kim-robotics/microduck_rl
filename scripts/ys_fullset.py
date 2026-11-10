@@ -35,6 +35,8 @@ NOCENTER = os.environ.get("NOCENTER") == "1"  # no position correction once J is
 DRIFT = float(os.environ.get("DRIFT", "0"))  # m/sqrt(s): random walk on J's position estimate from its set-off (odometry drift)
 CLOCKOFF = os.environ.get("CLOCKOFF")  # 7-13 check 3, deg: L / F turn the rope this much behind J's clock (late start by ear); J's
 # set-off still reads its own clock (it does not know the offset)
+HOLD = [math.radians(float(v)) for v in os.environ["ODO_HOLD"].split(",")] if os.environ.get("ODO_HOLD") else None  # 7-15 (1-2): "c,w" deg: while J's
+# clock phase is within c +- w (its flight, s16/odo/clock2.py), the odometry output keeps its last velocity (runtime untouched)
 ODO = os.environ.get("ODO") == "1"  # 7-14: J's position estimate = the runtime's contact odometry (scripts/ys_odo_replay, unchanged runtime
 # code) on the encoders (bias included) and the trunk quaternion, live from J's start call, from where J truly stood then; its
 # command and its arrival test use that estimate (with NOCENTER=1: no position command once it believes it has arrived)
@@ -138,6 +140,7 @@ if ODO:
          "mouth", "right_hip_yaw", "right_hip_roll", "right_hip_pitch", "right_knee", "right_ankle"]  # duck_ipc_proto::JOINT_NAMES
   _COL = torch.tensor([rob.joint_names.index(n) if n != "mouth" else 0 for n in _JN], device=dev)
   _P0, _O0 = torch.full((N, 2), math.nan, device=dev), torch.full((N, 2), math.nan, device=dev)  # true / odometry xy at the first tick
+  _OFF, _H = torch.zeros(N, 2, device=dev), torch.full((N, 2, 2), math.nan, device=dev)  # HOLD: offset on the output, last two outputs
 
 
 def odo_step(k, M):
@@ -150,6 +153,10 @@ def odo_step(k, M):
   x = torch.cat([j, rob.data.root_link_quat_w[on]], 1).cpu().numpy(); ids = on.cpu().numpy()
   _ODO.stdin.write("".join(f"{n} {k} " + " ".join(f"{v:.7f}" for v in r) + "\n" for n, r in zip(ids, x))); _ODO.stdin.flush()
   est = torch.tensor([[float(v) for v in _ODO.stdout.readline().split()[2:4]] for _ in ids], device=dev)
+  if HOLD:
+    est = est + _OFF[on]; h0, h1 = _H[on, 0], _H[on, 1]
+    w_ = (T._wrap(cmd.phase[on] - HOLD[0]).abs() < HOLD[1]) & ~h0.isnan().any(1)
+    want = 2 * h1 - h0; _OFF[on] += torch.where(w_[:, None], want - est, 0.0); est = torch.where(w_[:, None], want, est); _H[on, 0], _H[on, 1] = h1, est
   _O0[on] = torch.where(_O0[on].isnan(), est, _O0[on])  # the odometry keeps running across games (video): from this game's first tick
   E["drift"][on] = pos - (_P0[on] + est - _O0[on])
 
@@ -158,7 +165,7 @@ def episode(on_step=None):
   """One full game for all N envs. on_step(k, M) after each step (video), returns True to end early. -> M (marks)."""
   global E
   venv.reset(); env.__dict__.pop("_ys_spot_rel", None)
-  if ODO: _P0[:] = math.nan; _O0[:] = math.nan
+  if ODO: _P0[:] = math.nan; _O0[:] = math.nan; _OFF[:] = 0.0; _H[:] = math.nan
   env._ys_off = torch.zeros(N, device=dev) if NOEAR else B.start_offset(N, dev)  # F's start error by ear (ys_trio_scn "ear")
   WS = SC.new_ws(env, N); EQI = None if NOWALK else SC.setup_walkout(env, ALL, REL, WS)
   got, gerr = torch.zeros(N, 2, dtype=torch.bool, device=dev), torch.full((N, 2), math.nan, device=dev)
@@ -231,7 +238,7 @@ def episode(on_step=None):
     m = alive & (M["start"] >= 0) & (k >= M["start"] + 50) & (k < kst); M["tq"]["L"].append(tq[m, 1]); M["tq"]["F"].append(tq[m, 2])
     if DIAG: TR.append(torch.stack([rs["touch"].float(), down.float(), *(rob.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2]).T, rob.data.root_link_lin_vel_w[:, :2].norm(dim=-1),
                                     WS["ph"].float(), env._ys_amp, rob.data.root_link_pos_w[:, 2], (J.foot_clearance(rob, cmd._sole) + J.FOOT_Z0).amin(-1),
-                                    torch.atan2(*T.rope_phase_obs(env).unbind(-1)[::-1]), T._wrap(cmd.phase - env.__dict__.get("_ys_delta", T.DELTA0))], 1))  # + rope angle - clock, leader phase
+                                    torch.atan2(*T.rope_phase_obs(env).unbind(-1)[::-1]), T._wrap(cmd.phase - env.__dict__.get("_ys_delta", T.DELTA0)), *E["drift"].T], 1))  # + rope angle - clock, leader phase, 7-15: odometry error xy (true - estimate)
     if on_step is not None and on_step(k, M): break
     if on_step is None and (~alive | ((M["call"] >= 0) & (k > M["call"] + KSTOP + int(AFTER / dt)))).all(): break
   M["k_end"] = k
