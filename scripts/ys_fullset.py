@@ -178,7 +178,7 @@ def episode(on_step=None):
   env._ys_in = torch.zeros(N, dtype=torch.bool, device=dev)  # ys_beat reads it (J's beeps once in): its spot
   M = {k: torch.full((N,), -1, dtype=torch.long, device=dev) for k in ("start", "go", "arr", "hit", "call", "dead", "jdown", "jdph")}
   M["cause"] = torch.zeros(N, dtype=torch.long, device=dev); M["spot"] = torch.full((N, 3), math.nan, device=dev); M["werr"] = torch.full((N, 2), math.nan, device=dev)
-  M["geo"] = torch.full((N, 3), math.nan, device=dev)
+  M["geo"] = torch.full((N, 3), math.nan, device=dev); M["bite"] = torch.zeros(N, dtype=torch.bool, device=dev); M["gerr"] = gerr
   M["tq"] = {k: [] for k in ("wait", "run", "jump", "L", "F")}; M["ws"] = WS; sw = torch.zeros(N, dtype=torch.bool, device=dev)
   obs = venv.get_observations()
   for k in range(NS):
@@ -199,7 +199,10 @@ def episode(on_step=None):
     cmd.amp[:] = 1.0; cmd.freq[:] = 1.25; cmd._write(); obs, *_ = venv.step(a)
     if ODO: odo_step(k, M)
     re = env.episode_length_buf == 0; M["dead"] = torch.where(re & (M["dead"] < 0), k, M["dead"]); alive = M["dead"] < 0  # a turner fell: restarted
-    if not NOWALK: SC.walkout_post(env, WS, EQI, REL, re, got, gerr)
+    if not NOWALK:
+      SC.walkout_post(env, WS, EQI, REL, re, got, gerr)
+      bf = alive & ~gerr.isnan().any(1) & ~got.all(1)  # 7-15 bug: a beak missed its handle (the rope stays on the holder): L·F's failure, as a fall
+      M["dead"][bf] = k; M["bite"] |= bf; alive &= ~bf
     prev = env.__dict__.get("_ys_spot_rel"); new = SC.spot_from_turners(env, REL)  # J lines up on the rope it sees, kept from its set-off
     if prev is not None: env._ys_spot_rel = torch.where(E["go"][:, None], prev, new)
     env._ys_center_hook = hook
@@ -245,11 +248,11 @@ def records(M):
     ks, kg, ka, kh, kc, kd = (int(g[x][n]) for x in ("start", "go", "arr", "hit", "call", "dead"))
     r = dict(y0=round(100 * float(E["y0"][n]), 1), ph=round(math.degrees(float(E["ph"][n])), 1), t_call=None if ks < 0 else round(ks * dt, 2),
              spot=None if ks < 0 else [round(float(v), 1) for v in g["spot"][n]], werr=None if kg < 0 else [round(float(v), 1) for v in g["werr"][n]],
-             geo=None if ks < 0 else [round(float(v), 1) for v in g["geo"][n]],
+             geo=None if ks < 0 else [round(float(v), 1) for v in g["geo"][n]], bite_mm=[None if math.isnan(v) else round(float(v), 1) for v in g["gerr"][n]],
              jdown=None if g["jdown"][n] < 0 else dict(t=round(int(g["jdown"][n]) * dt, 2), walk_ph=int(g["jdph"][n]), vs_call=None if ks < 0 else round((int(g["jdown"][n]) - ks) * dt, 2),
                                                         vs_go=None if kg < 0 else round((int(g["jdown"][n]) - kg) * dt, 2)))
     if kd >= 0 and (kc < 0 or kd < kc):  # L or F down (its episode restarted) before J's game was over
-      r.update(kind="lf", lf_when="walk-out" if (ks < 0 or kd < ks) else ("before set-off" if (kg < 0 or kd < kg) else "J in play"), lf_down_s=round(kd * dt, 2),
+      r.update(kind="lf", lf_when="bite" if g["bite"][n] else "walk-out" if (ks < 0 or kd < ks) else ("before set-off" if (kg < 0 or kd < kg) else "J in play"), lf_down_s=round(kd * dt, 2),
                streak_then=None if (kg < 0 or kd < kg) else (kd - kg) // WIN); out.append(r); continue
     if ks < 0 or kg < 0: r["kind"] = "nocall" if ks < 0 else "nogo"; out.append(r); continue
     hit = kh >= 0
@@ -283,7 +286,7 @@ def summary(R):
               arr_p50=float(np.median([r["arr_s"] for r in G if r["arr_s"] is not None])) if G else None, pre_hit=pc(sum(r["pre"] for r in hits), len(G)),
               first_pass=pc(sum(r["streak"] == 0 for r in hits), len(G)), early=pc(sum((not r["pre"]) and r["after_arr"] is not None and r["after_arr"] < 4 for r in hits), len(G)),
               later=pc(sum((not r["pre"]) and r["after_arr"] is not None and r["after_arr"] >= 4 for r in hits), len(G)),
-              lf=pc(sum(r["kind"] == "lf" for r in R), len(R)), lf_when={w: sum(r.get("lf_when") == w for r in R) for w in ("walk-out", "before set-off", "J in play")},
+              lf=pc(sum(r["kind"] == "lf" for r in R), len(R)), lf_when={w: sum(r.get("lf_when") == w for r in R) for w in ("bite", "walk-out", "before set-off", "J in play")},
               nocall=pc(sum(r["kind"] in ("nocall", "nogo") for r in R), len(R)),
               call_p50=float(np.median([r["t_call"] for r in R if r["t_call"] is not None])) if any(r["t_call"] is not None for r in R) else None,
               causes={c: sum(r["cause"] == c for r in hits) for c in ("touch", "lag", "down")})
@@ -350,7 +353,7 @@ def tag(dr, xy, s_, font, col):
 
 
 def result(rec):
-  if rec["kind"] == "lf": return "결과: 줄 돌리는 오리가 넘어짐 (J 판정 없음)"
+  if rec["kind"] == "lf": return "결과: " + ("L·F가 손잡이를 못 물었음" if rec["lf_when"] == "bite" else "줄 돌리는 오리가 넘어짐") + " (J 판정 없음)"
   if rec["kind"] != "game": return "결과: 시작 소리까지 못 감 (L·F 자리 서기 실패)"
   if not rec["hit"]: return f"결과: 20줄 끝까지 안 걸림 → J의 끝 소리"
   w = "자리 도착 전" if rec["pre"] else f"도착 후 {rec['after_arr']:.1f}줄째"
@@ -375,6 +378,7 @@ for gi in range(1, NG + 1):
 
   def on_step(k, M):
     ks, kg, ka, kc, kd = (int(M[x][0]) for x in ("start", "go", "arr", "call", "dead")); te = (k + 1) * dt
+    if kd >= 0: return True  # 7-15 bug: a fall restarts the env in this step: no frames of the restarted scene (the result card follows)
     view = cam_at(k, ks); img = render(view)
     if first[0]:
       for _ in range(40): put(card(img, [(LAB, (255, 255, 255)), ("풀세트: 손잡이 물기 → 자리 서기 → J 시작 소리 → 입장 → 줄넘기 → 끝 소리 → 멈춤", (220, 220, 220)),
@@ -396,8 +400,7 @@ for gi in range(1, NG + 1):
     box(dr, (12, 62), f"고르지 않은 연속 {gi + GI0}/{NTOT}판 (로봇 {gi + GI0}호) · 풀세트 (손잡이 물기부터) · 무작위 밀기 " + ("약하게 (2~4 s마다 0.1 m/s)" if PUSH == "mild" else "없음"), FS, (0, 0, 0, 160))
     box(dr, (12, 100), RATE, FS, (0, 0, 0, 160), (255, 230, 150))
     n = 0 if kg < 0 else max(0, (min(k, kc) if kc >= 0 else k) - kg) // WIN
-    if kd >= 0: s_, col = "줄 돌리는 오리가 넘어짐 (이 판은 J 판정 없음)", (190, 40, 40)
-    elif kc >= 0 and k >= kc:
+    if kc >= 0 and k >= kc:
       s_ = ("⑬ 걸림! J의 끝 소리 → L·F 멈춤, J 서기" if st["hitk"] is not None else "⑬ 20줄 → J의 끝 소리 → L·F 멈춤, J 서기"); col = (190, 40, 40) if st["hitk"] is not None else (20, 110, 40)
     elif ka >= 0: s_, col = "⑫ 자리 도착 → 줄넘기 (오른발 들 때마다 '톡')", (20, 110, 40)
     elif kg >= 0: s_, col = "⑪ J 출발: 잽싸게 들어가기", (0, 0, 0)
@@ -418,7 +421,7 @@ for gi in range(1, NG + 1):
     info = f"t {te:4.1f} s" + (f"   시작 소리 후 {(k - ks) * dt:4.1f} s" if ks >= 0 else "") + (f"   출발 후 {(k - kg) * dt:4.2f} s   자리까지 {100 * float(E['d'][0]):4.1f} cm" if kg >= 0 else "")
     box(dr, (12, H_ - 54), info, FS, (0, 0, 0, 150), (220, 235, 255))
     fr = np.asarray(Image.alpha_composite(im, ov).convert("RGB")); put(fr); st["last"] = fr
-    return (kd >= 0 and k > kd + int(2.0 / dt)) or (kc >= 0 and k > kc + KSTOP + int(AFTER / dt))
+    return (kc >= 0 and k > kc + KSTOP + int(AFTER / dt))
 
   with torch.inference_mode(): M = episode(on_step)
   rec = records(M)[0]; rec["game"] = gi; recs.append(rec); print(f"game {gi}:", json.dumps(rec), flush=True)

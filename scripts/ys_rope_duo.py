@@ -131,6 +131,9 @@ def main():
   p.add_argument("--no-connect", action="store_true", help="rope not attached: isolates the scene/wiring from rope forces")
   p.add_argument("--video", help="render env 0 (2x2 views) to this mp4")
   p.add_argument("--load", action="store_true", help="per-joint motor load table (BAM xl330 m6: kt, R)")
+  p.add_argument("--copy", action="store_true", help="partner sends the robot's own action, mirrored (forced sync, no partner feedback; 7-15: does L-F desync make the messy turns?)")
+  p.add_argument("--foff", type=float, default=0.0, help="partner's clock offset (deg), both ducks keep their feedback (7-15: how hard does the rope pull the handles back into step, and does an offset alone mess the rope up?)")
+  p.add_argument("--track", help="save every step's stem ends (robot = L in the trio, partner = F) and rope links (y, z) to this npz (7-15: does L's ball tell the rope middle?)")
   a = p.parse_args()
 
   env1, venv1 = make_env(TASK, (0.0, 0.0, 0.0), 1)  # only to build the policy (28-D duo actions would not load)
@@ -157,6 +160,7 @@ def main():
   t_duck = torch.full((n, 2), math.nan, device=env.device)  # first tilt per duck (robot, partner)
   t_blow = torch.full((n,), math.nan, device=env.device)  # rope link > 15 m/s or non-finite (rope_blew_up)
   ang, low, apex, frames, stems, trunk_z, taus, vels = [], [], [], [], [], [], [], []
+  trk = []
   writer = None
   if a.video:
     writer = imageio.get_writer(a.video, fps=round(1 / dt), codec="libx264", quality=7, macro_block_size=8)
@@ -170,11 +174,16 @@ def main():
       act_r = policy(obs)
       po = obs.clone()
       po["actor"] = mirror_obs(obs["partner"], obs["actor"])
-      act_p = mirror_act(ppolicy(po))
+      if a.foff:  # the partner's clock a.foff deg ahead: rotate (amp cos, amp sin) of the circle phase (head_pitch, head_yaw slots)
+        c_, s_ = po["actor"][:, 52].clone(), po["actor"][:, 53].clone(); d_ = math.radians(a.foff)
+        po["actor"][:, 52], po["actor"][:, 53] = c_ * math.cos(d_) - s_ * math.sin(d_), s_ * math.cos(d_) + c_ * math.sin(d_)
+      act_p = mirror_act(act_r if a.copy else ppolicy(po))
       obs, *_ = venv.step(torch.cat([act_r, act_p], dim=1))
       for i, d in enumerate(ducks):
         fell[:, i] |= d.data.projected_gravity_b[:, 2] > -0.5  # tilted > 60 deg
       t = k * dt
+      if a.track:
+        trk.append(torch.cat([robot.data.site_pos_w[:, sid_r, None, 1:], partner.data.site_pos_w[:, sid_p, None, 1:], rope.data.body_link_pos_w[..., 1:]], 1).cpu())
       t_fall = torch.where(torch.isnan(t_fall) & fell.any(1), torch.full_like(t_fall, t), t_fall)
       t_duck = torch.where(torch.isnan(t_duck) & fell, torch.full_like(t_duck, t), t_duck)
       v = rope.data.body_link_lin_vel_w.norm(dim=-1).max(1).values
@@ -201,6 +210,8 @@ def main():
   if writer:
     writer.close()
     print("saved", a.video)
+  if a.track:  # (T, n, 2 + ROPE_LINKS, yz): [L stem end, F stem end, rope links...]
+    np.savez_compressed(a.track, p=torch.stack(trk).numpy(), dt=dt, fell=fell.cpu().numpy(), freq=a.freq)
   ang = torch.stack(ang)
   turn = (ang.diff(dim=0) + math.pi) % (2 * math.pi) - math.pi
   turn = turn.sum(0) / (2 * math.pi) / (a.freq * a.window)
