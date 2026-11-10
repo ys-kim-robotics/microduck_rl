@@ -12,7 +12,9 @@ import numpy as np
 JN = ["left_hip_yaw", "left_hip_roll", "left_hip_pitch", "left_knee", "left_ankle", "neck_pitch", "head_pitch", "head_yaw", "head_roll",
       "mouth", "right_hip_yaw", "right_hip_roll", "right_hip_pitch", "right_knee", "right_ankle"]  # duck_ipc_proto::JOINT_NAMES
 COL = torch.tensor([rob.joint_names.index(n) if n != "mouth" else 0 for n in JN], device=dev); MOUTH = JN.index("mouth")
-REC = {k: [] for k in ("enc", "true", "quat", "pos", "on", "ph", "dl")}
+REC = {k: [] for k in ("enc", "true", "quat", "pos", "on", "ph", "dl", "cball", "chead", "campos", "camquat", "lball", "spotk")}
+CAM = rob.find_sites("head_camera")[0][0]; LB = env.scene["turner"].find_sites("stem_end")[0][0]
+NAN3 = torch.full((N, 3), math.nan, device=dev)
 
 
 def on_step(k, M):
@@ -23,6 +25,12 @@ def on_step(k, M):
   REC["quat"].append(rob.data.root_link_quat_w.cpu().numpy()); REC["pos"].append(rob.data.root_link_pos_w.cpu().numpy() - env.scene.env_origins.cpu().numpy())
   REC["on"].append(on.cpu().numpy())
   REC["ph"].append(cmd.phase.cpu().numpy()); REC["dl"].append(torch.as_tensor(env.__dict__.get("_ys_delta", T.DELTA0), device=dev).expand(N).cpu().numpy())
+  # 7-15 (1-3, camera position test): what J's camera trackers deliver (u, v, valid of the last frame, as the policy sees it), and
+  # the truth to score against: J's head camera pose, L's ball, J's spot (relative to the env origin)
+  for nm, key in (("cball", "_ys_cam_ball"), ("chead", "_ys_cam")): st_ = env.__dict__.get(key); REC[nm].append((NAN3 if st_ is None else st_["cur"]).cpu().numpy())
+  o = env.scene.env_origins; REC["campos"].append((rob.data.site_pos_w[:, CAM] - o).cpu().numpy()); REC["camquat"].append(rob.data.site_quat_w[:, CAM].cpu().numpy())
+  REC["lball"].append((env.scene["turner"].data.site_pos_w[:, LB] - o).cpu().numpy())
+  sp = env.__dict__.get("_ys_spot_rel"); REC["spotk"].append((NAN3 if sp is None else sp).cpu().numpy())
   return bool((~alive | ((call >= 0) & (k > call + KSTOP + int(AFTER / dt)))).all())
 
 
@@ -31,5 +39,5 @@ R = records(M)
 mk = {k: M[k].cpu().numpy() for k in ("start", "go", "arr", "call", "hit")}
 np.savez(OUT, **{k: np.stack(v) for k, v in REC.items()}, dt=dt, **{"m_" + k: v for k, v in mk.items()},
          streak=np.array([r.get("streak", -1) if r["kind"] == "game" else -1 for r in R]), kind=np.array([r["kind"] for r in R]),
-         spot=env._ys_spot_rel.cpu().numpy())
+         spot=env._ys_spot_rel.cpu().numpy(), cam_lag=env._ys_cam_clock["lag"].cpu().numpy() if "_ys_cam_clock" in env.__dict__ else np.zeros(N))
 print("DONE", OUT, "steps", len(REC["on"]), "summary", json.dumps(summary(R)), flush=True)

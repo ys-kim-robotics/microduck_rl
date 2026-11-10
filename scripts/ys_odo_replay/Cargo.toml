@@ -3,9 +3,10 @@ name = "odo_replay"
 version = "0.1.0"
 edition = "2021"
 
-# the runtime repo checked out next to microduck_rl (~/YS/personal/microduck/runtime)
+# the runtime repo next to microduck_rl. 7-15 (1-2): its local branch ys/odo-flight-hold, checked out as the git worktree
+# ~/YS/personal/microduck/runtime-ys, adds Odometry::update_with_flight; back to ../../../runtime once that is merged
 [dependencies]
-odometry = { path = "../../../runtime/odometry" }
-duck-ipc-proto = { path = "../../../runtime/duck-ipc-proto" }
+odometry = { path = "../../../runtime-ys/odometry" }
+duck-ipc-proto = { path = "../../../runtime-ys/duck-ipc-proto" }
 
 [workspace]

@@ -37,6 +37,7 @@ CLOCKOFF = os.environ.get("CLOCKOFF")  # 7-13 check 3, deg: L / F turn the rope 
 # set-off still reads its own clock (it does not know the offset)
 HOLD = [math.radians(float(v)) for v in os.environ["ODO_HOLD"].split(",")] if os.environ.get("ODO_HOLD") else None  # 7-15 (1-2): "c,w" deg: while J's
 # clock phase is within c +- w (its flight, s16/odo/clock2.py), the odometry output keeps its last velocity (runtime untouched)
+CAMFIX = os.environ.get("CAM_FIX") == "1"  # 7-15 (1-3): + J's camera fix of the odometry position (scripts/ys_camfix.py; needs ODO=1)
 ODO = os.environ.get("ODO") == "1"  # 7-14: J's position estimate = the runtime's contact odometry (scripts/ys_odo_replay, unchanged runtime
 # code) on the encoders (bias included) and the trunk quaternion, live from J's start call, from where J truly stood then; its
 # command and its arrival test use that estimate (with NOCENTER=1: no position command once it believes it has arrived)
@@ -141,6 +142,7 @@ if ODO:
   _COL = torch.tensor([rob.joint_names.index(n) if n != "mouth" else 0 for n in _JN], device=dev)
   _P0, _O0 = torch.full((N, 2), math.nan, device=dev), torch.full((N, 2), math.nan, device=dev)  # true / odometry xy at the first tick
   _OFF, _H = torch.zeros(N, 2, device=dev), torch.full((N, 2, 2), math.nan, device=dev)  # HOLD: offset on the output, last two outputs
+  if CAMFIX: import ys_camfix; _CF = ys_camfix.CamFix(N, dt)
 
 
 def odo_step(k, M):
@@ -152,13 +154,20 @@ def odo_step(k, M):
   j = rob.data.joint_pos_biased[on][:, _COL].clone(); j[:, _JN.index("mouth")] = 0.0
   x = torch.cat([j, rob.data.root_link_quat_w[on]], 1).cpu().numpy(); ids = on.cpu().numpy()
   _ODO.stdin.write("".join(f"{n} {k} " + " ".join(f"{v:.7f}" for v in r) + "\n" for n, r in zip(ids, x))); _ODO.stdin.flush()
-  est = torch.tensor([[float(v) for v in _ODO.stdout.readline().split()[2:4]] for _ in ids], device=dev)
+  est3 = torch.tensor([[float(v) for v in _ODO.stdout.readline().split()[2:5]] for _ in ids], device=dev); est = est3[:, :2]
   if HOLD:
     est = est + _OFF[on]; h0, h1 = _H[on, 0], _H[on, 1]
     w_ = (T._wrap(cmd.phase[on] - HOLD[0]).abs() < HOLD[1]) & ~h0.isnan().any(1)
     want = 2 * h1 - h0; _OFF[on] += torch.where(w_[:, None], want - est, 0.0); est = torch.where(w_[:, None], want, est); _H[on, 0], _H[on, 1] = h1, est
   _O0[on] = torch.where(_O0[on].isnan(), est, _O0[on])  # the odometry keeps running across games (video): from this game's first tick
-  E["drift"][on] = pos - (_P0[on] + est - _O0[on])
+  world = _P0[on] + est - _O0[on]
+  sp = env.__dict__.get("_ys_spot_rel"); cb = env.__dict__.get("_ys_cam_ball")
+  if CAMFIX and sp is not None and cb is not None:
+    spw = torch.cat([sp[:, :2] + env.scene.env_origins[:, :2], sp[:, 2:]], 1).cpu().numpy()
+    corr = _CF.step(k, ids, x[:, :15], x[:, 15:], torch.cat([world, est3[:, 2:]], 1).cpu().numpy(), cmd.phase[on].cpu().numpy(),
+                    cb["cur"].cpu().numpy(), env._ys_cam_clock["lag"].cpu().numpy(), spw)
+    world = world + torch.as_tensor(corr, dtype=world.dtype, device=dev)
+  E["drift"][on] = pos - world
 
 
 def episode(on_step=None):
@@ -166,6 +175,7 @@ def episode(on_step=None):
   global E
   venv.reset(); env.__dict__.pop("_ys_spot_rel", None)
   if ODO: _P0[:] = math.nan; _O0[:] = math.nan; _OFF[:] = 0.0; _H[:] = math.nan
+  if CAMFIX: _CF.reset()
   env._ys_off = torch.zeros(N, device=dev) if NOEAR else B.start_offset(N, dev)  # F's start error by ear (ys_trio_scn "ear")
   WS = SC.new_ws(env, N); EQI = None if NOWALK else SC.setup_walkout(env, ALL, REL, WS)
   got, gerr = torch.zeros(N, 2, dtype=torch.bool, device=dev), torch.full((N, 2), math.nan, device=dev)

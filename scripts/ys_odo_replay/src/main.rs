@@ -1,5 +1,6 @@
 //! odo_replay: the runtime's contact-based odometry (`odometry::Odometry::alpha()`, unchanged) over recorded sim samples.
-//! stdin: lines "env tick j0 .. j14 qw qx qy qz" (JOINT_NAMES order, mouth = 0; one env's ticks in order).
+//! stdin: lines "env tick j0 .. j14 qw qx qy qz [flight]" (JOINT_NAMES order, mouth = 0; one env's ticks in order; flight 1 =
+//! both feet up, `Odometry::update_with_flight`, 7-15).
 //! stdout: lines "env tick x y z yaw", one per input line, flushed per line (usable online through a pipe).
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -18,7 +19,7 @@ fn main() {
         joints.copy_from_slice(&v[2..2 + JOINT_NAMES.len()]);
         let q = &v[2 + JOINT_NAMES.len()..];
         let o = odo.entry(env).or_insert_with(Odometry::alpha);
-        o.update(&joints, [q[0], q[1], q[2], q[3]]);
+        o.update_with_flight(&joints, [q[0], q[1], q[2], q[3]], q.get(4).is_some_and(|f| *f != 0.0));
         let p = o.position();
         writeln!(w, "{} {} {:.6} {:.6} {:.6} {:.6}", env, tick, p[0], p[1], p[2], o.yaw()).unwrap();
         w.flush().unwrap();
