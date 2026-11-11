@@ -55,7 +55,7 @@ def turner_slots(env) -> torch.Tensor:
   ph = env.command_manager.get_term("head_pose").phase - getattr(env, "_ys_delta", DELTA0)
   out = torch.zeros(ph.shape[0], 13, device=ph.device)
   out[:, 4], out[:, 5] = TURNER_AMP * torch.cos(ph), TURNER_AMP * torch.sin(ph)
-  out[:, 3] = B.BEAT_HZ - hc.WB_FREQ_MID  # 7-17: neck slot = f - 1.25
+  out[:, 3] = env.command_manager.get_term("head_pose").freq - hc.WB_FREQ_MID  # 7-17: neck slot = f - 1.25 (the turners' tempo is J's clock's)
   return out
 
 
@@ -89,7 +89,7 @@ CAM_TAN_V = CAM_TAN_H * 9 / 16
 CAM_HZ = 30.0
 CAM_LAG = (3, 5)  # policy steps (60-100 ms): capture + ISP + tracker, unmeasured -> randomized per env
 CAM_NOISE = 0.01  # normalized image units (~6 px at 1280)
-CAM_DROP = 0.05
+CAM_DROP = float(__import__("os").environ.get("YS_CAM_FRAME_DROP", "0.05"))  # per frame; 7-18: 재학습 7 trained at 0 (the YS_CAM_DROP name clash), 재학습 9/10 at 0.05
 
 
 def _cam_vec(env, site: str, who: str = "turner"):
@@ -320,6 +320,16 @@ CLOCK_FADE_STEPS = 24 * 200  # trio6: env steps (24 per iteration) over which th
 
 
 CLOCK_IN = int(__import__("os").environ.get("YS_J_CLOCK_IN", "0"))
+TEMPO = tuple(float(v) for v in __import__("os").environ["YS_TEMPO"].split(",")) if __import__("os").environ.get("YS_TEMPO") else None
+# 7-18 (재학습 10): "lo,hi[,kg]" Hz: two tempos, told to J by sound (user 2026-11-11). J reads 0 / 1 in its (always 0) neck slot;
+# training draws the tempo from the env's rope (hi below kg: the light rope turned faster, 7-17); the eval sets it (YS_BEAT_HZ).
+
+
+def tempo_reset(env, env_ids, lo: float, hi: float, kg: float):
+  """7-18 reset event: J's clock (and with it the turners') runs at hi Hz where the env's rope is lighter than kg, else lo."""
+  bi = torch.as_tensor(env.scene["rope"].indexing.body_ids, device=env.device).long()
+  m = env.sim.model.body_mass[env_ids.long()][:, bi].sum(-1)
+  env.command_manager.get_term("head_pose").freq[env_ids] = torch.where(m < kg, hi, lo).to(env.device)
 
 
 def faded_head_command(env, command_name: str = "head_pose", fade_steps: int = CLOCK_FADE_STEPS) -> torch.Tensor:
@@ -335,6 +345,8 @@ def faded_head_command(env, command_name: str = "head_pose", fade_steps: int = C
     s_ = (env.__dict__.get("_ys_delta", DELTA0) - DELTA0) + env.__dict__.get("_ys_clock_err", 0.0)
     s_ = torch.as_tensor(s_, device=c.device).expand(c.shape[0]); c = c.clone(); p_, y_ = c[:, hc.HEAD_PITCH].clone(), c[:, hc.HEAD_YAW].clone()
     c[:, hc.HEAD_PITCH], c[:, hc.HEAD_YAW] = p_ * s_.cos() + y_ * s_.sin(), y_ * s_.cos() - p_ * s_.sin()  # amp cos / sin of (phase - s)
+  if TEMPO:  # 7-18: the tempo flag the sound carries
+    c = c.clone(); c[:, hc.NECK_PITCH] = (env.command_manager.get_term(command_name).freq - TEMPO[0]) / (TEMPO[1] - TEMPO[0])
   return a * c
 
 
@@ -1232,6 +1244,8 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
     cfg.scene.entities["robot"] = replace(e_, articulation=replace(e_.articulation, actuators=tuple(replace(a, delay_min_lag=J_DELAY[0], delay_max_lag=J_DELAY[1]) for a in e_.articulation.actuators)))
   if R.ROPE_DR:  # 7-14 (9-3): the rope's mass per env (YS_ROPE_DR="lo,hi" kg)
     cfg.events["rope_mass_dr"] = EventTermCfg(func=R.rope_mass_scale, mode="startup", params={"asset_cfg": SceneEntityCfg("rope", body_names=("rope_.*",)), "mass_range": R.ROPE_DR})
+  if TEMPO and len(TEMPO) > 2:  # 7-18 (needs YS_ROPE_DR for a per-env rope)
+    cfg.events["tempo_reset"] = EventTermCfg(func=tempo_reset, mode="reset", params={"lo": TEMPO[0], "hi": TEMPO[1], "kg": TEMPO[2]})
   if enter and DUCK:  # head down while running in
     for k, f in (("head_up", head_up_free), ("gaze", gaze_free), ("head_back", head_back_free)):
       if k in cfg.rewards: cfg.rewards[k].func = f
