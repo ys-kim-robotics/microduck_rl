@@ -22,7 +22,8 @@ import math
 
 import torch
 
-OMEGA = 2 * math.pi * 1.25  # rad/s: the rope tempo, held (both turners read it off the same "score")
+BEAT_HZ = float(__import__("os").environ.get("YS_BEAT_HZ", "1.25"))  # 7-17: the tempo; rope14 took 1.25-1.5 Hz in its neck slot (5b-4)
+OMEGA = 2 * math.pi * BEAT_HZ  # rad/s: the rope tempo, held (both turners read it off the same "score")
 BEEP_PH = math.radians(129)  # leader-clock phase of the call: the jumper's right-foot lift (G1@12700, beat_scn.py:
 # 128.6 deg, sd 9 over 128 envs; left touchdown 147, left lift 33)
 LAT_SPK, LAT_MIC = (0.02, 0.04), (0.01, 0.03)  # s, constant per duck: unmeasured, randomized per episode

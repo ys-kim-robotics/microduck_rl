@@ -248,7 +248,7 @@ def episode(on_step=None):
       te_ = env.episode_length_buf * dt; vel = vel | ((M["start"] >= 0) & ~E["go"] & (te_ < E["t"] - HANDOVER))
     if vel.any(): a[vel] = jstand(obs["actor"][vel], look(env.episode_length_buf * dt)[vel] if WAITLOOK else None)
     WAITM[:] = (M["start"] >= 0) & ~E["go"]  # CLIP=wait's mask
-    cmd.amp[:] = 1.0; cmd.freq[:] = 1.25; cmd._write(); obs, *_ = venv.step(a)
+    cmd.amp[:] = 1.0; cmd.freq[:] = B.BEAT_HZ; cmd._write(); obs, *_ = venv.step(a)
     if ODO: odo_step(k, M)
     re = env.episode_length_buf == 0; M["dead"] = torch.where(re & (M["dead"] < 0), k, M["dead"]); alive = M["dead"] < 0  # a turner fell: restarted
     if not NOWALK:

@@ -55,6 +55,7 @@ def turner_slots(env) -> torch.Tensor:
   ph = env.command_manager.get_term("head_pose").phase - getattr(env, "_ys_delta", DELTA0)
   out = torch.zeros(ph.shape[0], 13, device=ph.device)
   out[:, 4], out[:, 5] = TURNER_AMP * torch.cos(ph), TURNER_AMP * torch.sin(ph)
+  out[:, 3] = B.BEAT_HZ - hc.WB_FREQ_MID  # 7-17: neck slot = f - 1.25
   return out
 
 
