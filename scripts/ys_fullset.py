@@ -283,7 +283,8 @@ def episode(on_step=None):
     m = alive & (M["start"] >= 0) & (k >= M["start"] + 50) & (k < kst); M["tq"]["L"].append(tq[m, 1]); M["tq"]["F"].append(tq[m, 2])
     if DIAG: TR.append(torch.stack([rs["touch"].float(), down.float(), *(rob.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2]).T, rob.data.root_link_lin_vel_w[:, :2].norm(dim=-1),
                                     WS["ph"].float(), env._ys_amp, rob.data.root_link_pos_w[:, 2], (J.foot_clearance(rob, cmd._sole) + J.FOOT_Z0).amin(-1),
-                                    torch.atan2(*T.rope_phase_obs(env).unbind(-1)[::-1]), T._wrap(cmd.phase - env.__dict__.get("_ys_delta", T.DELTA0)), *E["drift"].T], 1))  # + rope angle - clock, leader phase, 7-15: odometry error xy (true - estimate)
+                                    torch.atan2(*T.rope_phase_obs(env).unbind(-1)[::-1]), T._wrap(cmd.phase - env.__dict__.get("_ys_delta", T.DELTA0)), *E["drift"].T,
+                                    *(T.rope_section(env.scene["rope"].data.body_link_pos_w, rob.data.root_link_pos_w[:, 0]) - torch.stack([rob.data.root_link_pos_w[:, 1], torch.zeros_like(rob.data.root_link_pos_w[:, 1])], 1)).T], 1))  # + rope angle - clock, leader phase, 7-15: odometry error xy (true - estimate)
     if on_step is not None and on_step(k, M): break
     if on_step is None and (~alive | ((M["call"] >= 0) & (k > M["call"] + KSTOP + int(AFTER / dt)))).all(): break
   M["k_end"] = k

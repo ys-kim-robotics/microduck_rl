@@ -674,8 +674,9 @@ SKY_W, SKY_TOL = float(_os.environ.get("YS_SKY_W", "0")), math.radians(float(_os
 # off by up to BELIEF cm / deg per entry (4-1), keeps where it arrived (stay reward), and may lose its camera (2-3)
 NOCENTER_AFTER = _os.environ.get("YS_NOCENTER_AFTER") == "1"  # vx, vy commands 0 once at the spot (heading kept: IMU)
 BELIEF = tuple(float(v) for v in _os.environ.get("YS_BELIEF", "0,0").split(","))  # "cm,deg": per entry, uniform in a disc / +-deg
+BELIEF_JIT = tuple(float(v) for v in _os.environ.get("YS_BELIEF_JIT", "0,0.3").split(","))  # "cm,s": 7-16 fast belief wobble (sd, time constant)
 STAY_ARRIVE = _os.environ.get("YS_STAY_ARRIVE") == "1"  # stay_put about the point J arrived at (it cannot know the true spot)
-CAM_DROP = float(_os.environ.get("YS_CAM_DROP", "0"))  # per episode probability of no camera tracker
+CAM_OFF_P = float(_os.environ.get("YS_CAM_DROP", "0"))  # per episode probability of no camera tracker
 J_DELAY = tuple(int(v) for v in _os.environ["YS_J_DELAY"].split(",")) if _os.environ.get("YS_J_DELAY") else None  # 7-14 (7-2): J's command delay "lo,hi" physics steps
 
 
@@ -741,6 +742,12 @@ def enter_hook(cmd):
   sr = env.__dict__.get("_ys_spot_rel") if PLACE else None  # 7-13 (다): the frame of the spot the turners make (else the origin's)
   if BELIEF[0] or BELIEF[1]:  # 7-14 (4-1): the command steers by the spot J believes in
     sr = (torch.zeros(len(t), 3, device=t.device) if sr is None else sr) + e["bel"]
+  if BELIEF_JIT[0]:  # 7-16 (재학습 9): + the camera fix's fast wobble (s16/wait W3: 0.6-0.9 cm sd, gone within 1 s), AR(1) per policy step
+    if e.get("jit_k") != env.common_step_counter:
+      e["jit_k"], a_ = env.common_step_counter, math.exp(-env.step_dt / BELIEF_JIT[1])
+      e["jit"] = a_ * e.get("jit", torch.zeros(len(t), 3, device=t.device)) + math.sqrt(1 - a_ * a_) * BELIEF_JIT[0] / 100 * torch.cat(
+        [torch.randn(len(t), 2, device=t.device), torch.zeros(len(t), 1, device=t.device)], 1)
+    sr = (torch.zeros(len(t), 3, device=t.device) if sr is None else sr) + e["jit"]
   th = torch.zeros_like(t) if sr is None else sr[:, 2]
   loc = lambda y: (0.0 if sr is None else sr[:, :2]) + torch.stack([-th.sin() * y, th.cos() * y], 1)  # (0, y) in that frame
   spot = loc(torch.where(e["go"], sy, e["y0"]))
@@ -1215,8 +1222,8 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
       cfg.rewards["sky"] = RewardTermCfg(func=sky_cost, weight=-SKY_W)
     if STAY_ARRIVE:  # 7-14: stay about the arrival point
       cfg.rewards["stay_put"].func = stay_put_arrive
-    if CAM_DROP:  # 7-14 (2-3)
-      cfg.events["cam_drop_reset"] = EventTermCfg(func=cam_drop_reset, mode="reset", params={"p": CAM_DROP})
+    if CAM_OFF_P:  # 7-14 (2-3)
+      cfg.events["cam_drop_reset"] = EventTermCfg(func=cam_drop_reset, mode="reset", params={"p": CAM_OFF_P})
   if CLOCK_ROPE is not None:  # 7-15 재학습 8: the procedure's rope-phase error per episode (kept in the eval: ys_fullset pops sample_delta only)
     cfg.events["clock_err_reset"] = EventTermCfg(func=clock_err_reset, mode="reset", params={"sd_deg": CLOCK_ROPE})
   if J_DELAY:  # 7-14 (7-2): J only (the actuator cfg objects are shared with L / F: copies, 7-13 check 7)
