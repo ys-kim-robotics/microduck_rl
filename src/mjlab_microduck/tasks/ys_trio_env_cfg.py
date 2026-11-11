@@ -683,6 +683,7 @@ PLACE_RANGE = {"sx": (-0.032, 0.009), "sy": (-0.018, 0.083), "th": (-7.0, 7.0), 
 STEM_REL = (0.1687, 0.0, 0.1045)  # m: each turner's stem end in its root frame at rest (s13/rel.py; fullset.py's REL)
 CLIP = _os.environ.get("YS_CLIP", "")  # all: every joint's PD target inside its range; head+yaw: head_roll, left_hip_yaw only
 SKY_W, SKY_TOL = float(_os.environ.get("YS_SKY_W", "0")), math.radians(float(_os.environ.get("YS_SKY_TOL", "20")))
+ROLL_W, ROLL_TOL = float(_os.environ.get("YS_ROLL_W", "0")), math.radians(float(_os.environ.get("YS_ROLL_TOL", "5")))  # 7-20: head_roll near 0 (DEPLOY 5-2)
 # 7-14 (user 2026-11-09, plan "첫째"): J holds its place without position commands after arrival (1-1), believes its spot
 # off by up to BELIEF cm / deg per entry (4-1), keeps where it arrived (stay reward), and may lose its camera (2-3)
 NOCENTER_AFTER = _os.environ.get("YS_NOCENTER_AFTER") == "1"  # vx, vy commands 0 once at the spot (heading kept: IMU)
@@ -1059,11 +1060,23 @@ def sky_cost(env, tol: float = SKY_TOL, cap: float = 0.5 * math.pi, ramp_it: int
   return min(1.0, (env.common_step_counter - k0) / (ramp_it * 24)) * (el - tol).clamp(0, cap) / math.radians(10)
 
 
+def roll_cost(env, tol: float = ROLL_TOL, ramp_it: int = 100) -> torch.Tensor:
+  """7-20 (>= 0, weight < 0) per 10 deg head_roll sits past +-tol. v3 / 재학습 7 lean it on its +25 deg stop 97% of the jumping
+  (DEPLOY 5-2: the camera image tilts with it). Ramped in like sky_cost."""
+  rob = env.scene["robot"]
+  if not hasattr(env, "_ys_roll_j"):
+    env._ys_roll_j = rob.find_joints(["head_roll"])[0][0]
+  k0 = env.__dict__.setdefault("_ys_roll_k0", env.common_step_counter)
+  return min(1.0, (env.common_step_counter - k0) / (ramp_it * 24)) * (rob.data.joint_pos[:, env._ys_roll_j].abs() - tol).clamp(min=0) / math.radians(10)
+
+
 # (3) distillation (user 2026-11-07 evening): one student (from N1c), PPO + behavior cloning, routed per frame. Settled
 # at the spot facing L (>= BC_SETTLE s after arriving): taught by E5 (its clock slots zeroed: E5 is clock-free). Waiting or
 # running in: anchored to N1c, the student's start (velstand run-3 lesson, distill.py: BC on one slice rewrites the
 # shared weights unless the rest is anchored). The first BC_SETTLE s at the spot, and B facing -y, belong to PPO alone.
 BC_SETTLE = 1.0
+BC_ROUTE = _os.environ.get("YS_BC_ROUTE", "")  # 7-20 "enter": only the waiting / running-in frames are taught (the "anchor" slot = YS_BC_ANCHOR), jumping is PPO's
+BC_MASK = [int(v) for v in _os.environ.get("YS_BC_MASK", "").split(",") if v]  # 7-20: action dims left out of the BC loss (head_roll)
 
 
 def bc_gate(env) -> torch.Tensor:
@@ -1073,7 +1086,7 @@ def bc_gate(env) -> torch.Tensor:
   if e is None:
     return torch.zeros(env.num_envs, 2, device=env.device)
   t = env.episode_length_buf * env.step_dt
-  teach = e["go"] & e["near"] & (t - e["t_near"] > BC_SETTLE) & (_yaw(env.scene["robot"]).abs() < 0.3)
+  teach = e["go"] & e["near"] & (t - e["t_near"] > BC_SETTLE) & (_yaw(env.scene["robot"]).abs() < 0.3) & (BC_ROUTE != "enter")
   return torch.stack([teach, ~e["go"] | ~e["near"]], -1).float()
 
 
@@ -1111,7 +1124,9 @@ class PpoWithJumpBc(PpoWithExpertBc):
       perm = torch.randperm(n, device=self.device)
       for st in range(0, n, mb):
         sel = perm[st:st + mb]
-        loss = (weight[sel] * (self.actor(obs_td[sel]) - target[sel]).pow(2).mean(dim=1)).mean()
+        d2 = (self.actor(obs_td[sel]) - target[sel]).pow(2)
+        if BC_MASK: d2[:, BC_MASK] = 0.0
+        loss = (weight[sel] * d2.mean(dim=1)).mean()
         self.bc_optimizer.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm); self.bc_optimizer.step()
         total += loss.item(); steps += 1
@@ -1249,6 +1264,8 @@ def make_ys_trio_jump_env_cfg(play: bool = False, delta_half: float = 0.0, rope_
       cfg.actions["joint_pos"] = LimitJointPositionActionCfg(**{k: getattr(a, k) for k in a.__dataclass_fields__}, limit_joints=".*" if CLIP == "all" else "head_roll|left_hip_yaw")
     if SKY_W:  # 7-13 ③: looking at the sky costs
       cfg.rewards["sky"] = RewardTermCfg(func=sky_cost, weight=-SKY_W)
+    if ROLL_W:  # 7-20: head_roll near 0
+      cfg.rewards["roll"] = RewardTermCfg(func=roll_cost, weight=-ROLL_W)
     if STAY_ARRIVE:  # 7-14: stay about the arrival point
       cfg.rewards["stay_put"].func = stay_put_arrive
     if CAM_OFF_P:  # 7-14 (2-3)
