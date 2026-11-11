@@ -690,7 +690,19 @@ BELIEF = tuple(float(v) for v in _os.environ.get("YS_BELIEF", "0,0").split(","))
 BELIEF_JIT = tuple(float(v) for v in _os.environ.get("YS_BELIEF_JIT", "0,0.3").split(","))  # "cm,s": 7-16 fast belief wobble (sd, time constant)
 STAY_ARRIVE = _os.environ.get("YS_STAY_ARRIVE") == "1"  # stay_put about the point J arrived at (it cannot know the true spot)
 CAM_OFF_P = float(_os.environ.get("YS_CAM_DROP", "0"))  # per episode probability of no camera tracker
-J_DELAY = tuple(int(v) for v in _os.environ["YS_J_DELAY"].split(",")) if _os.environ.get("YS_J_DELAY") else None  # 7-14 (7-2): J's command delay "lo,hi" physics steps
+J_DELAY = tuple(int(v) for v in _os.environ["YS_J_DELAY"].split(",")) if _os.environ.get("YS_J_DELAY") else None
+ERR_BANK = _os.environ.get("YS_ERR_BANK")  # 7-19 (재학습 11): npz of recorded true - estimate xy traces (s18/bank/mk.py), replayed from each set-off  # 7-14 (7-2): J's command delay "lo,hi" physics steps
+
+
+_BANK = None
+
+
+def _bank(dev):
+  global _BANK
+  if _BANK is None:
+    import numpy as _np
+    _BANK = torch.as_tensor(_np.load(ERR_BANK)["err"], device=dev)
+  return _BANK
 
 
 def _draw(e, ids, near, ymax, dev) -> None:
@@ -703,6 +715,7 @@ def _draw(e, ids, near, ymax, dev) -> None:
   e["ph"][ids] = torch.where(sd > 0, u(*ENTER_PH), u(*ENTER_PH_NEG))
   e["mode"][ids] = _mode(len(ids), dev); e["fw"][ids] = (e["mode"][ids] > 0) & ~near
   e["d_prev"][ids] = e["y0"][ids].abs()
+  if ERR_BANK: e["bank"][ids] = torch.randint(0, _bank(dev).shape[0], (len(ids),), device=dev)  # 7-19: one recorded run-in per entry
   if BELIEF[0] or BELIEF[1]:  # 7-14 (4-1): where J believes its spot is, off by <= BELIEF cm (uniform in the disc) and the axis +-deg
     r, a = BELIEF[0] / 100 * torch.rand(len(ids), device=dev).sqrt(), 2 * math.pi * torch.rand(len(ids), device=dev)
     e["bel"][ids] = torch.stack([r * a.cos(), r * a.sin(), math.radians(BELIEF[1]) * (2 * torch.rand(len(ids), device=dev) - 1)], 1)
@@ -717,7 +730,7 @@ def enter_reset(env, env_ids: torch.Tensor | None, full: bool = False) -> None:
     z = lambda: torch.zeros(n, device=dev)
     env._ys_enter = {"y0": z(), "t": z(), "ph": z(), "t_near": z(), "go": z().bool(), "near": z().bool(), "t_go": z(),
                      "d_prev": z(), "pk": z().long(), "bad": z().bool(), "t_hit": z(), "fw": z().bool(), "t_turn": z(), "ent": z().bool(), "mode": z().long(), "d": z(), "side": z(),
-                     "bel": torch.zeros(n, 3, device=dev), "axy": torch.zeros(n, 2, device=dev)}
+                     "bel": torch.zeros(n, 3, device=dev), "axy": torch.zeros(n, 2, device=dev), "bank": torch.zeros(n, device=dev).long()}
     env._ys_center_hook = enter_hook
   start = env.__dict__.setdefault("_ys_enter_start", env.common_step_counter)
   ymax = ENTER_Y if (full or ENTER_RAMP == 0) else ENTER_Y * min(1.0, max(0.1, (env.common_step_counter - start) / (ENTER_RAMP * 24)))
@@ -761,6 +774,9 @@ def enter_hook(cmd):
       e["jit"] = a_ * e.get("jit", torch.zeros(len(t), 3, device=t.device)) + math.sqrt(1 - a_ * a_) * BELIEF_JIT[0] / 100 * torch.cat(
         [torch.randn(len(t), 2, device=t.device), torch.zeros(len(t), 1, device=t.device)], 1)
     sr = (torch.zeros(len(t), 3, device=t.device) if sr is None else sr) + e["jit"]
+  if ERR_BANK:  # 7-19 (재학습 11): the command steers by the estimate the runtime would have: + (true - estimate) recorded from that set-off
+    B_ = _bank(t.device); k_ = ((t - e["t_go"]) / env.step_dt).nan_to_num(0.0, posinf=0.0, neginf=0.0).clamp(0, B_.shape[1] - 1).long()
+    sr = (torch.zeros(len(t), 3, device=t.device) if sr is None else sr) + torch.cat([B_[e["bank"], k_], torch.zeros(len(t), 1, device=t.device)], 1)
   th = torch.zeros_like(t) if sr is None else sr[:, 2]
   loc = lambda y: (0.0 if sr is None else sr[:, :2]) + torch.stack([-th.sin() * y, th.cos() * y], 1)  # (0, y) in that frame
   spot = loc(torch.where(e["go"], sy, e["y0"]))
