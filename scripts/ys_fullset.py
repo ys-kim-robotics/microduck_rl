@@ -29,11 +29,14 @@ from mjlab.utils.lab_api.math import quat_apply, quat_inv
 NOWALK = os.environ.get("NOWALK") == "1"  # control: no handle walk-out (L and F turn from their places, the rope on the stems
 # from the reset, YsTrioJumpBeat); the rest as the full game: J's start call at T_CALL0, the 1 s ramp, J standing until it
 T_CALL0, RAMP0 = float(os.environ.get("CALL0", "1.0")), os.environ.get("RAMP0", "1") == "1"  # NOWALK: the call time; RAMP0=0: full circle at once
+PLACE_FROM = os.environ.get("PLACE_FROM")  # 7-26 (with NOWALK): L / F / the rope put where recorded walk-outs left them (T.place_reset, one
+# drawn row per game); <npz> p (M, 6): spot x, y (m), rope-axis heading (deg), stem ends further apart (m), L's / F's yaw error (deg)
 JPOL0, NOEAR, KEEP_DELTA = (os.environ.get(k) == "1" for k in ("JPOL0", "NOEAR", "DELTA"))  # ablations toward the entry env: J's own policy from
 # the reset (no standing on velstand first), F's start error 0, J's clock offset drawn +-20 deg per episode as in the entry env
 NOCAM = os.environ.get("NOCAM") == "1"  # 7-13 real-robot checks: J's camera-tracker inputs (actor 61:) zeroed (no tracker process);
 NOCENTER = os.environ.get("NOCENTER") == "1"  # no position correction once J is at its spot (vx, vy 0; the turn to L kept: IMU yaw);
 DRIFT = float(os.environ.get("DRIFT", "0"))  # m/sqrt(s): random walk on J's position estimate from its set-off (odometry drift)
+ERRK = float(os.environ.get("ERRK", "1"))  # 7-26 (1-6, with ODO): an oracle, J's position-estimate error scaled by this (0 = it knows the truth, 1 = as it is)
 CLOCKOFF = os.environ.get("CLOCKOFF")  # 7-13 check 3, deg: L / F turn the rope this much behind J's clock (late start by ear); J's
 # set-off still reads its own clock (it does not know the offset)
 HOLD = [math.radians(float(v)) for v in os.environ["ODO_HOLD"].split(",")] if os.environ.get("ODO_HOLD") else None  # 7-15 (1-2): "c,w" deg: while J's
@@ -101,7 +104,8 @@ if CLIP:  # deploy-time fix (no training): J's PD targets kept inside its joint 
     _jt._processed_actions[:] = torch.where((_sel[None] & WAITM[:, None]) if CLIP == "wait" else _sel[None], c, p)
   _jt.process_actions = _clipped
 SI, SJ = tu.find_sites("stem_end")[0][0], pa.find_sites("stem_end")[0][0]
-KSTOP = int(round(STOP_DELAY / dt)); DIAG = os.environ.get("DIAG"); TR = []  # DIAG=<npz>: per-step J touch / down / xy / speed, walk phase, amp, z, sole
+KSTOP = int(round(STOP_DELAY / dt)); DIAG = os.environ.get("DIAG"); TR = []; OB = [] if os.environ.get("OBSLOG") == "1" else None  # OBSLOG=1 (with DIAG, 7-26 memory probe): + ob, J's
+# actor observation after every step (steps x N x 73, what its policy is given next). DIAG=<npz>: per-step J touch / down / xy / speed, walk phase, amp, z, sole
 torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 with torch.inference_mode():
   venv.reset()  # the stem end in each turner's own frame (ys_trio_scn's REL for the walk-out)
@@ -200,13 +204,19 @@ def odo_step(k, M):
     corr = _CF.step(k, ids, x[:, :15], x[:, 15:], torch.cat([world, est3[:, 2:]], 1).cpu().numpy(), cmd.phase[on].cpu().numpy(),
                     cur.cpu().numpy(), env._ys_cam_clock["lag"].cpu().numpy(), spw, curF, wt)
     world = world + torch.as_tensor(corr, dtype=world.dtype, device=dev)
-  E["drift"][on] = pos - world
+  E["drift"][on] = ERRK * (pos - world)
 
 
 def episode(on_step=None):
   """One full game for all N envs. on_step(k, M) after each step (video), returns True to end early. -> M (marks)."""
   global E
-  venv.reset(); env.__dict__.pop("_ys_spot_rel", None)
+  venv.reset()
+  pl_ = None
+  if PLACE_FROM:
+    p_ = np.load(PLACE_FROM)["p"]; pl_ = p_[torch.randint(len(p_), (N,)).numpy()]
+    for n, row in enumerate(pl_):
+      T.PLACE_RANGE = dict(zip(("sx", "sy", "th", "dd", "yl", "yf"), ((float(v), float(v)) for v in row))); T.place_reset(env, torch.tensor([n], device=dev))
+  env.__dict__.pop("_ys_spot_rel", None)
   if ODO: _P0[:] = math.nan; _O0[:] = math.nan; _OFF[:] = 0.0; _H[:] = math.nan
   if CAMFIX: _CF.reset()
   env._ys_off = torch.zeros(N, device=dev) if NOEAR else B.start_offset(N, dev)  # F's start error by ear (ys_trio_scn "ear")
@@ -230,6 +240,7 @@ def episode(on_step=None):
   M["cause"] = torch.zeros(N, dtype=torch.long, device=dev); M["spot"] = torch.full((N, 3), math.nan, device=dev); M["werr"] = torch.full((N, 2), math.nan, device=dev)
   M["geo"] = torch.full((N, 3), math.nan, device=dev); M["bite"] = torch.zeros(N, dtype=torch.bool, device=dev); M["gerr"] = gerr
   M["tq"] = {k: [] for k in ("wait", "run", "jump", "L", "F")}; M["ws"] = WS; sw = torch.zeros(N, dtype=torch.bool, device=dev)
+  if pl_ is not None: M["place"] = torch.as_tensor(pl_)  # each game's drawn row, into its record
   obs = venv.get_observations()
   for k in range(NS):
     if NOWALK:  # the start call at T_CALL0, the circle's 1 s ramp (as walkout_pre's after the call)
@@ -285,11 +296,12 @@ def episode(on_step=None):
                                     WS["ph"].float(), env._ys_amp, rob.data.root_link_pos_w[:, 2], (J.foot_clearance(rob, cmd._sole) + J.FOOT_Z0).amin(-1),
                                     torch.atan2(*T.rope_phase_obs(env).unbind(-1)[::-1]), T._wrap(cmd.phase - env.__dict__.get("_ys_delta", T.DELTA0)), *E["drift"].T,
                                     *(T.rope_section(env.scene["rope"].data.body_link_pos_w, rob.data.root_link_pos_w[:, 0]) - torch.stack([rob.data.root_link_pos_w[:, 1], torch.zeros_like(rob.data.root_link_pos_w[:, 1])], 1)).T], 1))  # + rope angle - clock, leader phase, 7-15: odometry error xy (true - estimate)
+    if DIAG and OB is not None: OB.append(obs["actor"].cpu().numpy())
     if on_step is not None and on_step(k, M): break
     if on_step is None and (~alive | ((M["call"] >= 0) & (k > M["call"] + KSTOP + int(AFTER / dt)))).all(): break
   M["k_end"] = k
   if DIAG: np.savez(DIAG, tr=torch.stack(TR).cpu().numpy(), jdown=M["jdown"].cpu().numpy(), start=M["start"].cpu().numpy(), go=M["go"].cpu().numpy(), y0=E["y0"].cpu().numpy(),
-                   arr=M["arr"].cpu().numpy(), call=M["call"].cpu().numpy(), spot=env._ys_spot_rel.cpu().numpy())  # 7-14: + arrival, end call, the spot (m, rad)
+                   arr=M["arr"].cpu().numpy(), call=M["call"].cpu().numpy(), spot=env._ys_spot_rel.cpu().numpy(), **({"ob": np.stack(OB)} if OB else {}))  # 7-14: + arrival, end call, the spot (m, rad)
   return M
 
 
@@ -301,7 +313,7 @@ def records(M):
     ks, kg, ka, kh, kc, kd = (int(g[x][n]) for x in ("start", "go", "arr", "hit", "call", "dead"))
     r = dict(y0=round(100 * float(E["y0"][n]), 1), ph=round(math.degrees(float(E["ph"][n])), 1), t_call=None if ks < 0 else round(ks * dt, 2),
              spot=None if ks < 0 else [round(float(v), 1) for v in g["spot"][n]], werr=None if kg < 0 else [round(float(v), 1) for v in g["werr"][n]],
-             geo=None if ks < 0 else [round(float(v), 1) for v in g["geo"][n]], bite_mm=[None if math.isnan(v) else round(float(v), 1) for v in g["gerr"][n]],
+             geo=None if ks < 0 else [round(float(v), 1) for v in g["geo"][n]], place=[round(float(v), 4) for v in g["place"][n]] if "place" in g else None, bite_mm=[None if math.isnan(v) else round(float(v), 1) for v in g["gerr"][n]],
              jdown=None if g["jdown"][n] < 0 else dict(t=round(int(g["jdown"][n]) * dt, 2), walk_ph=int(g["jdph"][n]), vs_call=None if ks < 0 else round((int(g["jdown"][n]) - ks) * dt, 2),
                                                         vs_go=None if kg < 0 else round((int(g["jdown"][n]) - kg) * dt, 2)))
     if kd >= 0 and (kc < 0 or kd < kc):  # L or F down (its episode restarted) before J's game was over

@@ -9,7 +9,7 @@
 - `LEARNING-ys.md`: 개념을 설명하는 방식과 용어집입니다. 새 핵심 용어가 나오면 용어집에 한 줄 추가합니다.
 - `STAGES-ys.md`: 실험 기록입니다. 바꾼 것 → 예측 → 결과 → 해석 순서로 쓰고 커밋 해시를 남깁니다. 지금 기준(baseline)도 여기에 있습니다.
 - `DEPLOY-ys.md`: 실물 투입 전 고려사항입니다. 항목별 상태와 개선 기록을 담습니다.
-- `docs/ys/history_v3.png`: baseline v3까지의 히스토리 그래프입니다. 새 baseline이 나오면 `docs/ys/history_v3.py`로 갱신합니다.
+- `docs/ys/history_v4.png`: 지금까지의 히스토리 그래프입니다(위쪽 절반은 baseline v3까지의 `history_v3.png` 그대로). `docs/ys/baseline_lineage.png`: 베이스라인 계보도입니다. 새 baseline이 나오면 `docs/ys/history_v4.py`로 둘 다 갱신합니다.
 
 ## 1. 말하기
 - 한국어로 답합니다. 전문 용어는 영어 원어를 먼저 씁니다(예: `drift(드리프트)`).
