@@ -361,6 +361,7 @@ import mujoco, imageio, imageio_ffmpeg, subprocess
 from collections import deque
 from PIL import Image, ImageDraw, ImageFont
 STEM, LAB, RATE, P = sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]); NG = int(sys.argv[7]) if len(sys.argv) > 7 else 5
+FACE = os.environ.get("FACE") == "1"
 GI0, NTOT, NOSUM = int(os.environ.get("GI0", "0")), int(os.environ.get("NTOT", str(NG))), os.environ.get("NOSUMMARY") == "1"  # one game per process
 # (a new robot each: the startup DR - foot friction, encoder bias, COM, mass - is drawn once per process), numbered GI0 + 1 of NTOT
 W_, H_, FPS = 1280, 720, 50
@@ -433,6 +434,10 @@ for gi in range(1, NG + 1):
     ks, kg, ka, kc, kd = (int(M[x][0]) for x in ("start", "go", "arr", "call", "dead")); te = (k + 1) * dt
     if kd >= 0: return True  # 7-15 bug: a fall restarts the env in this step: no frames of the restarted scene (the result card follows)
     view = cam_at(k, ks); img = render(view)
+    if FACE:  # 7-24: J's face from the front, inset bottom-right (head_roll lean visible)
+      hp = env.scene["robot"].data.site_pos_w[0, HEADS["robot"]].cpu().numpy()
+      fc = Image.fromarray(render((hp - o + np.array([0, 0, -0.03]), math.degrees(float(T._yaw(rob)[0])) + 180.0, -15.0, 0.38))).resize((576, 324))
+      ImageDraw.Draw(fc).text((12, 8), "J 얼굴 정면", font=FB, fill=(255, 255, 255)); img[H_ - 324 - 70: H_ - 70, W_ - 576 - 12: W_ - 12] = np.asarray(fc)
     if first[0]:
       for _ in range(40): put(card(img, [(LAB, (255, 255, 255)), ("풀세트: 손잡이 물기 → 자리 서기 → J 시작 소리 → 입장 → 줄넘기 → 끝 소리 → 멈춤", (220, 220, 220)),
                                          (f"로봇 {gi + GI0}호 (판마다 다른 로봇: 마찰·엔코더 오차·무게중심·질량 무작위)", (200, 200, 200))], f"{gi + GI0} / {NTOT}판"))
