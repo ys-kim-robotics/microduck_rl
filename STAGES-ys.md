@@ -1570,7 +1570,7 @@ J/F/L baseline에서 **J만 G1@12700 → E5@13199** (`ys_trio_jump/2026-11-07_01
   - 추가 확인은 두 시드(256판씩). 순서 2의 신경망을 실물 카메라 범위의 기록으로 다시 맞추면 나아지는지는 해 보지 않음(승인 필요).
 - **영상**: 새로 만들지 않음. 그림 `docs/ys/summary_7-29_yardstick.png`, `docs/ys/summary_7-29_stop.png`, `docs/ys/summary_7-29_checks.png`.
 - **문서**: `WORKFLOW-ys.md`(표준 잣대 묶음에 `IMU_SCALE=0.3333`), `DEPLOY-ys.md`(새 잣대의 숫자, 4-9의 첫 시험, IMU 항목의 결정, 1-3 / 2-2 / 4-3에서 `RUNTIME-ys.md`로 가는 줄), `RUNTIME-ys.md`(새 문서, 초안. 4절의 카메라 칸 규칙, 9절의 새로 찾은 것, 10절의 정해 주실 것), `DEPLOY-ys.md`의 "새로 찾은 것"에 시뮬 카메라 항목(번호 없음), 용어집의 privileged information 줄 정정("J의 정책 입력 73칸에는 없음"은 틀렸음). 용어집에 privileged information, low-pass filter, replay test, colour-marker tracking, field of view.
-- **커밋**: (아래 커밋. push하지 않음)
+- **커밋**: `e44e513` (push하지 않음)
 - **다음 (사용자 결정 대기, 실행하지 않음)**: 순서 2를 baseline v5로 올릴지(**지금은 권하지 않음**: 실물 카메라가 볼 수 있는 범위에서 baseline v4만 쓴 것보다 낮음). `RUNTIME-ys.md`의 "정해 주실 것"(확인 뒤에 런타임 코드 시작). 실물 카메라의 방향을 로봇에서 확인하고 그 범위를 시뮬 잣대에 넣을지. 순서 2의 신경망을 실물 카메라 범위의 기록으로 다시 맞출지(정책 학습 없음). 시뮬 카메라 항목을 `DEPLOY-ys.md`에 번호를 붙여 넣을지. 4-9의 다음 방법(5.2 cm는 채택하지 않기를 권함).
 
 
