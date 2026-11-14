@@ -37,6 +37,14 @@ NOCAM = os.environ.get("NOCAM") == "1"  # 7-13 real-robot checks: J's camera-tra
 NOCENTER = os.environ.get("NOCENTER") == "1"  # no position correction once J is at its spot (vx, vy 0; the turn to L kept: IMU yaw);
 DRIFT = float(os.environ.get("DRIFT", "0"))  # m/sqrt(s): random walk on J's position estimate from its set-off (odometry drift)
 ERRK = float(os.environ.get("ERRK", "1"))  # 7-26 (1-6, with ODO): an oracle, J's position-estimate error scaled by this (0 = it knows the truth, 1 = as it is)
+CORR, EXPL, CORR_TAU = os.environ.get("CORR"), float(os.environ.get("CORR_EXPLORE", "0")), float(os.environ.get("CORR_TAU", "0.2"))  # 7-27 (DEPLOY 1-8, with ODO):
+# CORR=<model.pt> (ys_memprobe.py FIT): a small net reads J's last 50 observations + the correction in use and says what is left of its position-estimate
+# error; the correction (added to the estimate) integrates that over CORR_TAU s, from 0.5 s after J's arrival to its end call. The policy is untouched.
+# CORR_EXPLORE=<cm>: no net; the correction wanders (redrawn every 2 s, sd cm around EXPL_MU) to record what a correction does to what J sees (the fit's data)
+EXPL_MU = (-1.2, -0.9)  # cm: the mean error of the estimate as it is (7-26)
+CORR_GO = os.environ.get("CORR_FROM") == "go"  # the correction starts at J's set-off instead (the error grows as J walks in and is largest, 3 cm, in the first
+# second after its arrival, when a third of the games are lost). A CORR model brings its own (FIT with CORR_FROM=go); the knob is for CORR_EXPLORE
+# measured (7-27, realistic condition, 10+): as it is 52%; from arrival, CORR_TAU 0.4: 57%; from set-off, 0.4 / 0.2 / 0.1: 59 / 68 (4 seeds) / 70%
 CLOCKOFF = os.environ.get("CLOCKOFF")  # 7-13 check 3, deg: L / F turn the rope this much behind J's clock (late start by ear); J's
 # set-off still reads its own clock (it does not know the offset)
 HOLD = [math.radians(float(v)) for v in os.environ["ODO_HOLD"].split(",")] if os.environ.get("ODO_HOLD") else None  # 7-15 (1-2): "c,w" deg: while J's
@@ -174,6 +182,9 @@ if ODO:
   _P0, _O0 = torch.full((N, 2), math.nan, device=dev), torch.full((N, 2), math.nan, device=dev)  # true / odometry xy at the first tick
   _OFF, _H = torch.zeros(N, 2, device=dev), torch.full((N, 2, 2), math.nan, device=dev)  # HOLD: offset on the output, last two outputs
   if CAMFIX: import ys_camfix; _CF = ys_camfix.CamFix(N, dt)
+  if CORR:
+    import ys_memprobe; _cm = torch.load(CORR, weights_only=False); _CN = ys_memprobe.make_net(len(_cm["mu"]) + 2).to(dev); _CN.load_state_dict(_cm["net"])
+    _CMU, _CSD, _CYM = (torch.as_tensor(_cm[k_], dtype=torch.float32, device=dev) for k_ in ("mu", "sd", "ym")); CORR_GO = _cm.get("frm") == "go"
 
 
 def odo_step(k, M):
@@ -204,7 +215,14 @@ def odo_step(k, M):
     corr = _CF.step(k, ids, x[:, :15], x[:, 15:], torch.cat([world, est3[:, 2:]], 1).cpu().numpy(), cmd.phase[on].cpu().numpy(),
                     cur.cpu().numpy(), env._ys_cam_clock["lag"].cpu().numpy(), spw, curF, wt)
     world = world + torch.as_tensor(corr, dtype=world.dtype, device=dev)
-  E["drift"][on] = ERRK * (pos - world)
+  if CORR or EXPL:  # c0: the correction the latest observation was made with
+    c0 = E["corr"][on]; ref = (M["go"] if CORR_GO else M["arr"])[on]; act = ((ref >= 0) & (k >= ref + (0 if CORR_GO else 25)) & (M["call"][on] < 0))[:, None]
+    if CORR: left = (_CN(torch.cat([((E["hb"][on].flatten(1) - _CMU) / _CSD).clamp(-5, 5), 100 * c0], 1)) + _CYM) / 100
+    else:
+      if k % 100 == 0 or "xt" not in E: E["xt"] = (torch.tensor(EXPL_MU, device=dev) + EXPL * torch.randn(N, 2, device=dev)) / 100
+      left = E["xt"][on] - c0
+    E["corr"][on] = torch.where(act, (c0 + dt / CORR_TAU * left).clamp(-0.06, 0.06), c0)
+  E["drift"][on] = ERRK * (pos - world - E["corr"][on])
 
 
 def episode(on_step=None):
@@ -224,7 +242,7 @@ def episode(on_step=None):
   got, gerr = torch.zeros(N, 2, dtype=torch.bool, device=dev), torch.full((N, 2), math.nan, device=dev)
   z = lambda: torch.zeros(N, device=dev)
   E = {"y0": z(), "ph": z(), "side": z(), "d_prev": z(), "d": z(), "mode": z().long(), "fw": z().bool(), "go": z().bool(), "near": z().bool(), "t": torch.full((N,), math.inf, device=dev),
-       "drift": torch.zeros(N, 2, device=dev), "belief": torch.zeros(N, 3, device=dev)}
+       "drift": torch.zeros(N, 2, device=dev), "belief": torch.zeros(N, 3, device=dev), "corr": torch.zeros(N, 2, device=dev), "hb": torch.zeros(N, 50, 73, device=dev)}
   if BELIEF[0] or BELIEF[1]:  # check 4: a fixed belief error per game (position: random direction; heading: random sign)
     a_ = torch.rand(N, device=dev) * 2 * math.pi; sg = torch.where(torch.rand(N, device=dev) < 0.5, -1.0, 1.0)
     E["belief"] = torch.stack([BELIEF[0] / 100 * a_.cos(), BELIEF[0] / 100 * a_.sin(), sg * math.radians(BELIEF[1])], 1)
@@ -260,6 +278,7 @@ def episode(on_step=None):
     if vel.any(): a[vel] = jstand(obs["actor"][vel], look(env.episode_length_buf * dt)[vel] if WAITLOOK else None)
     WAITM[:] = (M["start"] >= 0) & ~E["go"]  # CLIP=wait's mask
     cmd.amp[:] = 1.0; cmd.freq[:] = B.BEAT_HZ; cmd._write(); obs, *_ = venv.step(a)
+    if CORR or EXPL: E["hb"] = torch.roll(E["hb"], -1, 1); E["hb"][:, -1] = obs["actor"]  # J's last 50 observations
     if ODO: odo_step(k, M)
     re = env.episode_length_buf == 0; M["dead"] = torch.where(re & (M["dead"] < 0), k, M["dead"]); alive = M["dead"] < 0  # a turner fell: restarted
     if not NOWALK:
@@ -295,7 +314,7 @@ def episode(on_step=None):
     if DIAG: TR.append(torch.stack([rs["touch"].float(), down.float(), *(rob.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2]).T, rob.data.root_link_lin_vel_w[:, :2].norm(dim=-1),
                                     WS["ph"].float(), env._ys_amp, rob.data.root_link_pos_w[:, 2], (J.foot_clearance(rob, cmd._sole) + J.FOOT_Z0).amin(-1),
                                     torch.atan2(*T.rope_phase_obs(env).unbind(-1)[::-1]), T._wrap(cmd.phase - env.__dict__.get("_ys_delta", T.DELTA0)), *E["drift"].T,
-                                    *(T.rope_section(env.scene["rope"].data.body_link_pos_w, rob.data.root_link_pos_w[:, 0]) - torch.stack([rob.data.root_link_pos_w[:, 1], torch.zeros_like(rob.data.root_link_pos_w[:, 1])], 1)).T], 1))  # + rope angle - clock, leader phase, 7-15: odometry error xy (true - estimate)
+                                    *(T.rope_section(env.scene["rope"].data.body_link_pos_w, rob.data.root_link_pos_w[:, 0]) - torch.stack([rob.data.root_link_pos_w[:, 1], torch.zeros_like(rob.data.root_link_pos_w[:, 1])], 1)).T, *E["corr"].T], 1))  # + rope angle - clock, leader phase, 7-15: odometry error xy (true - estimate), 7-27: the correction in use (cols 15:17)
     if DIAG and OB is not None: OB.append(obs["actor"].cpu().numpy())
     if on_step is not None and on_step(k, M): break
     if on_step is None and (~alive | ((M["call"] >= 0) & (k > M["call"] + KSTOP + int(AFTER / dt)))).all(): break
@@ -476,7 +495,7 @@ for gi in range(1, NG + 1):
     elif kg >= 0: s_, col = "⑪ J 출발: 잽싸게 들어가기", (0, 0, 0)
     elif ks >= 0 and k < ks + 50: s_, col = "⑨ J의 시작 소리 → L·F가 같은 시계로 줄 돌리기 시작", (120, 80, 0)
     elif ks >= 0: s_, col = f"⑩ J 대기: 줄 옆 {100 * float(E['y0'][0]):.0f} cm, 출발 위상 {math.degrees(float(E['ph'][0])):.0f}° (시작 소리 4 s 뒤부터)", (0, 0, 0)
-    else: s_, col = WSTEP[min(int(M["ws"]["ph"][0]), 7)] + " · J는 옆에서 서서 대기", (0, 0, 0)
+    else: s_, col = ("⑦-2 멈춘 뒤 다시 마주 보게 고쳐 서기 (새 단계)" if int(M["ws"]["ph"][0]) == 10 else WSTEP[min(int(M["ws"]["ph"][0]), 7)]) + " · J는 옆에서 서서 대기", (0, 0, 0)
     box(dr, (12, 146), s_, FM, (*col, 190))
     if kg >= 0:
       dr.rounded_rectangle((W_ - 250, 10, W_ - 12, 128), 14, fill=(20, 110, 40, 220) if n >= 10 else (0, 0, 0, 170))

@@ -58,9 +58,11 @@ JW_PH0 = os.environ.get("BEAT_JW_PH0") == "1"
 JW_HEAD = os.environ.get("BEAT_JW_HEAD") == "1"  # J walks in looking at L as G1 does while jumping
 W_RAMP = float(os.environ.get("BEAT_W_RAMP", "1.0"))  # s: the turners' circle 0 -> full after the start call
 JW_D, JW_STILL, JW_SETTLE = float(os.environ.get("BEAT_JW_D", "0.45")), 1.0, float(os.environ.get("BEAT_JW_SETTLE", "1.0"))  # m, s still, s G1 before the call
+W_FACE, W_FACE_TOL = os.environ.get("BEAT_W_FACE") == "1", math.radians(float(os.environ.get("BEAT_W_FACE_TOL", "5")))  # 7-27 (DEPLOY 4-7): once F has
+# stopped, both turn back to face each other again (phase 10: F's camera walk leaves it turned, median 8 deg between the two); deg: done within this
 W_CAM = os.environ.get("BEAT_WALKOUT_CAM") == "1"  # user 2026-11-06: stop on the other duck's ball size in the head camera
-CAM_F, CAM_HZ, CAM_LAG, CAM_SR, CAM_SU, W_COAST = 640 / math.tan(math.radians(31)), 30.0, 4, 0.2, 1.0, 0.04
-# px focal length (1280 px wide, 62 deg), frames/s, steps of latency, px radius / centre noise, m it coasts after stop  # diagnostic (not physical): at the start call the rope is laid as a fresh V
+CAM_F, CAM_HZ, CAM_LAG, CAM_SR, CAM_SU, W_COAST = 640 / math.tan(math.radians(31)), 30.0, 4, 0.2, 1.0, float(os.environ.get("BEAT_W_COAST", "0.04"))
+# px focal length (1280 px wide, 62 deg), frames/s, steps of latency, px radius / centre noise, m it coasts after stop (7-27 knob: as it is the two end 11 mm too far apart, sd 14: the frames' latency is not in it)  # diagnostic (not physical): at the start call the rope is laid as a fresh V
 if PICK: T_ENTER = float(os.environ.get("BEAT_T_ENTER", "12.0" if WALKOUT else "9.0"))
 
 
@@ -176,18 +178,19 @@ def _yaw(e):
   w, x, y, z = e.data.root_link_quat_w.unbind(-1); return torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
 
 
-def turn_cmd(env, who, yaw_t, go):
+def turn_cmd(env, who, yaw_t, go, tol=W_TURN_TOL):
   """(N, 13) turn in place to yaw_t (fixed rate past velstand's dead band), (N,) done."""
   e = torch.atan2(torch.sin(yaw_t - _yaw(env.scene[who])), torch.cos(yaw_t - _yaw(env.scene[who])))
-  cmd = torch.zeros(len(e), 13, device=e.device); cmd[:, 2] = torch.where(e.abs() > W_TURN_TOL, W_WZ * e.sign(), 0.0); cmd[~go] = 0.0
-  return cmd, e.abs() <= W_TURN_TOL
+  cmd = torch.zeros(len(e), 13, device=e.device); cmd[:, 2] = torch.where(e.abs() > tol, W_WZ * e.sign(), 0.0); cmd[~go] = 0.0
+  return cmd, e.abs() <= tol
 
 
 def walkout_pre(env, WS):
   """Before a step (user 2026-11-06). Phases (WS["ph"]): 0 bite at the holder (out of the work area), 1 both back off
   W_BACK0, 2 both turn to face +y, 3 both walk forward to the work line, 4 both turn back to face each other, 5 L backs
   out to its place (odometry: the true distance here), 6 F backs out until L's ball looks as at the places (W_CAM) / to its
-  place, 7 both stand still (J's start call once both have been still W_STILL s and >= W_MIN_WAIT), 8 turning."""
+  place, 7 both stand still (J's start call once both have been still W_STILL s and >= W_MIN_WAIT), 8 turning. W_FACE: 10 between 6 and 7,
+  both turn back to face each other once more."""
   te, dt, ph, wh = env.episode_length_buf * env.step_dt, env.step_dt, WS["ph"], ("turner", "partner")
   side_yaw = torch.full_like(te, math.pi / 2)  # facing +y: toward the work line
   ph[(ph == 0) & (te >= W_BITE + 0.2)] = 1
@@ -215,7 +218,11 @@ def walkout_pre(env, WS):
   goF = (ph == 6) & (te >= WS["t_mark"] + W_GAP_T)  # 6: F sets the distance on L's ball
   cF, nF = cam_walk_cmd(env, WS, "partner", "turner", goF) if W_CAM else walk_cmd(env, "partner", WS["spot"]["partner"], WS["yaw0"]["partner"], goF)
   C["partner"] = torch.where((ph == 6)[:, None], cF, C["partner"])
-  m = goF & nF; WS["arr"]["partner"] |= m; WS["t_arr"]["partner"][m] = te[m]; WS["t_mark"][m] = te[m]; ph[m] = 7
+  m = goF & nF; WS["arr"]["partner"] |= m; WS["t_arr"]["partner"][m] = te[m]; WS["t_mark"][m] = te[m]; ph[m] = 10 if W_FACE else 7
+  goT = (ph == 10) & (te >= WS["t_mark"] + W_GAP_T)  # 10 (W_FACE): both face each other again, then stand still as before
+  for w in wh:
+    c, ok[w] = turn_cmd(env, w, WS["yaw0"][w], goT, W_FACE_TOL); C[w] = torch.where((ph == 10)[:, None], c, C[w])
+  m = goT & ok["turner"] & ok["partner"]; WS["t_mark"][m] = te[m]; ph[m] = 7
   if W_CAM: cam_walk_cmd(env, WS, "turner", "partner", torch.zeros_like(goF))  # keep L's camera buffer fed (unused)
   v = torch.stack([env.scene[w].data.root_link_lin_vel_w[:, :2].norm(dim=-1) for w in wh], 1).amax(1)
   wz = torch.stack([env.scene[w].data.root_link_ang_vel_w[:, 2].abs() for w in wh], 1).amax(1)
