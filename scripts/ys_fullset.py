@@ -57,6 +57,8 @@ CAMFIX = os.environ.get("CAM_FIX") == "1"  # 7-15 (1-3): + J's camera fix of the
 ODO = os.environ.get("ODO") == "1"  # 7-14: J's position estimate = the runtime's contact odometry (scripts/ys_odo_replay, unchanged runtime
 # code) on the encoders (bias included) and the trunk quaternion, live from J's start call, from where J truly stood then; its
 # command and its arrival test use that estimate (with NOCENTER=1: no position command once it believes it has arrived)
+P0ERR = float(os.environ.get("P0ERR", "0"))  # 7-29 (RUNTIME-ys.md, with ODO): J's position estimate starts this many cm off where J stands (one
+# direction per env), as a floor mark would leave it; the camera fix can take it out once J sees L
 BELIEF = [float(v) for v in os.environ.get("BELIEF", "0,0").split(",")]  # 7-13 check 4: "cm,deg": J believes its spot is cm off (random
 # direction) and the rope axis deg off (random sign), from the start: placed by hand; its command uses that belief
 TASK, MODE, CK = ("Mjlab-YsTrioJumpBeat-Flat-MicroDuck" if NOWALK else "Mjlab-YsTrioJumpBeatPick-Flat-MicroDuck"), sys.argv[1], sys.argv[2]
@@ -118,7 +120,7 @@ torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 with torch.inference_mode():
   venv.reset()  # the stem end in each turner's own frame (ys_trio_scn's REL for the walk-out)
   REL = {w: quat_apply(quat_inv(env.scene[w].data.root_link_quat_w), env.scene[w].data.site_pos_w[:, env.scene[w].find_sites("stem_end")[0][0]] - env.scene[w].data.root_link_pos_w).median(0).values for w in ("turner", "partner")}
-  if "IMU_SCALE" in os.environ:  # 7-28 (oracle): the IMU mounting tilt each env's three ducks read gravity and turn rate through (mdp's draw: up to 6 deg
+  if "IMU_SCALE" in os.environ:  # 7-28; the realistic bundle sets 0.3333 (0~2 deg) since 7-29 (user, WORKFLOW-ys.md): the IMU mounting tilt each env's three ducks read gravity and turn rate through (mdp's draw: up to 6 deg
     # about a random axis, one per env, shared by L, F and J) scaled; 0 = levelled, as after a level calibration on the real ducks. Seed 3's first env
     # draws 5.6 deg, an upright duck there reads -5 deg of pitch: L stands leaning forward and steps as it bites (video game 3). Of L·F's 41 failures in
     # 768 games, 35 are in the 17% of games where an upright duck reads >= +2 or < -4 deg of pitch
@@ -186,6 +188,8 @@ if ODO:
          "mouth", "right_hip_yaw", "right_hip_roll", "right_hip_pitch", "right_knee", "right_ankle"]  # duck_ipc_proto::JOINT_NAMES
   _COL = torch.tensor([rob.joint_names.index(n) if n != "mouth" else 0 for n in _JN], device=dev)
   _P0, _O0 = torch.full((N, 2), math.nan, device=dev), torch.full((N, 2), math.nan, device=dev)  # true / odometry xy at the first tick
+  _a = torch.tensor(np.random.default_rng(7).uniform(0, 2 * math.pi, N), dtype=torch.float32, device=dev)  # its own stream: the games stay the reference run's
+  _P0E = P0ERR / 100 * torch.stack([_a.cos(), _a.sin()], 1)
   _OFF, _H = torch.zeros(N, 2, device=dev), torch.full((N, 2, 2), math.nan, device=dev)  # HOLD: offset on the output, last two outputs
   if CAMFIX: import ys_camfix; _CF = ys_camfix.CamFix(N, dt)
   if CORR:
@@ -198,7 +202,7 @@ def odo_step(k, M):
   on = ((M["dead"] < 0) & (M["start"] >= 0)).nonzero().flatten()
   if len(on) == 0: return
   pos = rob.data.root_link_pos_w[on, :2]
-  _P0[on] = torch.where(_P0[on].isnan(), pos, _P0[on])
+  _P0[on] = torch.where(_P0[on].isnan(), pos + _P0E[on], _P0[on])
   j = rob.data.joint_pos_biased[on][:, _COL].clone(); j[:, _JN.index("mouth")] = 0.0
   x = torch.cat([j, rob.data.root_link_quat_w[on]], 1).cpu().numpy(); ids = on.cpu().numpy()
   _ODO.stdin.write("".join(f"{n} {k} " + " ".join(f"{v:.7f}" for v in r) + "\n" for n, r in zip(ids, x))); _ODO.stdin.flush()

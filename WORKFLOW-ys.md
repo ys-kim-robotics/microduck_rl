@@ -127,7 +127,7 @@
   - 판정은 사용자 규칙(`YS_HIT_RULE=caught`)이고, 10줄 이상을 성공으로 봅니다. 128판 × 시드 2개로 잽니다.
   - 밀기 없음이 기본이고, 약한 밀기는 따로 잽니다.
   - 관절 토크와 전류도 함께 봅니다(`scripts/ys_torq.py`).
-- **표준 잣대 묶음: 모델(J 또는 L·F)이 바뀔 때마다 아래를 모두 잽니다** (2026-11-11 사용자 결정으로 바꿈, 7-16). **baseline은 실물 조건 성적으로만 정합니다.** 위치 정답은 같은 정책이 얼마나 더 갈 수 있는지 보는 참고 상한일 뿐입니다. 비교할 정책은 모두 같은 도구로 새로 잽니다(이전 측정을 기준으로 쓰지 않음). 시드 2개(전류는 1개). 공통 설정은 `CLIP=head+yaw YS_HIT_RULE=caught YS_ENTER_SIDE=+ YS_J_CLOCK_IN=1 YS_ENTER_MODE=turn YS_ENTER_PH=20,60 PUSH=none`이고, 실물 조건(아래 "실")은 `ODO=1 ODO_HOLD=-174.9,8 CAM_FIX=1 CAMFIX_TAU=0.15 CAMFIX_NMIN=4 JAFTER=6.2 CAMFIX_WWAIT=2.0 WAITLOOK=stand`입니다(위치 추정 + 카메라 보정 + 새 순서 + 서서 기다리기, 카메라 프레임 놓침 5%).
+- **표준 잣대 묶음: 모델(J 또는 L·F)이 바뀔 때마다 아래를 모두 잽니다** (2026-11-11 사용자 결정으로 바꿈, 7-16). **baseline은 실물 조건 성적으로만 정합니다.** 위치 정답은 같은 정책이 얼마나 더 갈 수 있는지 보는 참고 상한일 뿐입니다. 비교할 정책은 모두 같은 도구로 새로 잽니다(이전 측정을 기준으로 쓰지 않음). 시드 2개(전류는 1개). 공통 설정은 `CLIP=head+yaw YS_HIT_RULE=caught YS_ENTER_SIDE=+ YS_J_CLOCK_IN=1 YS_ENTER_MODE=turn YS_ENTER_PH=20,60 PUSH=none`이고, 실물 조건(아래 "실")은 `ODO=1 ODO_HOLD=-174.9,8 CAM_FIX=1 CAMFIX_TAU=0.15 CAMFIX_NMIN=4 JAFTER=6.2 CAMFIX_WWAIT=2.0 WAITLOOK=stand IMU_SCALE=0.3333`입니다(위치 추정 + 카메라 보정 + 새 순서 + 서서 기다리기, 카메라 프레임 놓침 5%, 몸통 기울기 센서(IMU)의 장착 기울기 0~2도). 장착 기울기 범위는 2026-11-14 사용자 결정으로 0~6도에서 0~2도로 줄였습니다(7-29). 그 전 측정(7-28까지)은 0~6도라서 새 숫자와 바로 비교하지 않습니다. 위치 정답에도 `IMU_SCALE=0.3333`을 붙입니다.
 
   | 번호 | 잣대 | 실물의 무엇을 대신하나 | 옵션 |
   |---|---|---|---|

@@ -90,6 +90,15 @@ CAM_HZ = 30.0
 CAM_LAG = (3, 5)  # policy steps (60-100 ms): capture + ISP + tracker, unmeasured -> randomized per env
 CAM_NOISE = 0.01  # normalized image units (~6 px at 1280)
 CAM_DROP = float(__import__("os").environ.get("YS_CAM_FRAME_DROP", "0.05"))  # per frame; 7-18: 재학습 7 trained at 0 (the YS_CAM_DROP name clash), 재학습 9/10 at 0.05
+# 7-29 (RUNTIME-ys.md): what a real tracker could not deliver to J (its two markers only; F's camera is left as it was), each off unless set.
+# YS_CAM_UMAX: the frame's half-width in u (the alpha board's camera sits a quarter turn off: +-18.7 deg wide = 0.5625). YS_CAM_NOHEAD=1: no marker
+# on L's head (those 6 slots = never seen). YS_CAM_HOLD=1: a frame without the marker in it carries the last delivered u, v (as a dropped frame
+# does), not the true ones. YS_CAM_VMAX: the real frame's half-height in v (that camera is +-31 deg tall = 1.778): a marker above or below the
+# twin's frame but inside the real one is not held; J gets it as the twin gives it (v at the edge, valid 0), which a real tracker can reproduce.
+CAM_UMAX = float(__import__("os").environ.get("YS_CAM_UMAX", "1"))
+CAM_NOHEAD = __import__("os").environ.get("YS_CAM_NOHEAD") == "1"
+CAM_HOLD = __import__("os").environ.get("YS_CAM_HOLD") == "1"
+CAM_VMAX = float(__import__("os").environ.get("YS_CAM_VMAX", "1"))
 
 
 def _cam_vec(env, site: str, who: str = "turner"):
@@ -112,6 +121,7 @@ def _cam_true(env, site: str = "head_imu", occlude: bool = False, who: str = "tu
   x = d[:, 0].clamp(min=1e-3)
   u, v = -d[:, 1] / x / CAM_TAN_H, d[:, 2] / x / CAM_TAN_V
   ok = (d[:, 0] > 0.02) & (u.abs() <= 1) & (v.abs() <= 1)
+  tall = (d[:, 0] > 0.02) & (u.abs() <= 1) & (v.abs() > 1) & (v.abs() <= CAM_VMAX)  # 7-29: in the real, taller frame only (valid 0.5 until _cam_track)
   if occlude:  # a rope link across the line of sight hides the ball. ponytail: the turner's own head/body never does
     seg = p1 - p0
     L = env.scene["rope"].data.body_link_pos_w  # link origins are ~7 cm apart: test 4 points per link
@@ -119,8 +129,9 @@ def _cam_true(env, site: str = "head_imu", occlude: bool = False, who: str = "tu
     q = (L[:, :-1, None] + w[None, None, :, None] * (L[:, 1:, None] - L[:, :-1, None])).flatten(1, 2) - p0[:, None]
     t = ((q * seg[:, None]).sum(-1) / seg.square().sum(-1, keepdim=True)).clamp(0, 1)
     dist = (q - t[..., None] * seg[:, None]).norm(dim=-1)
-    ok &= ~((dist < ROPE_RADIUS + 0.5 * BALL_R) & (t > 0.05) & (t < 0.9)).any(-1)
-  return torch.stack([u.clamp(-1, 1), v.clamp(-1, 1), ok.float()], -1)
+    hid = ((dist < ROPE_RADIUS + 0.5 * BALL_R) & (t > 0.05) & (t < 0.9)).any(-1)
+    ok &= ~hid; tall &= ~hid
+  return torch.stack([u.clamp(-1, 1), v.clamp(-1, 1), ok.float() + 0.5 * tall.float()], -1)
 
 
 def _cam_track(env, key: str, site: str, occlude: bool, true_fn=None) -> torch.Tensor:
@@ -144,8 +155,11 @@ def _cam_track(env, key: str, site: str, occlude: bool, true_fn=None) -> torch.T
     t = env.episode_length_buf * env.step_dt * CAM_HZ + clk["ph"]
     new = (t.floor() != (t - env.step_dt * CAM_HZ).floor()) | (env.episode_length_buf <= 1)
     m = st["ring"][torch.arange(n, device=dev), clk["lag"]].clone()
+    if key in ("_ys_cam", "_ys_cam_ball"): m[:, 2] *= m[:, 0].abs() <= CAM_UMAX
     m[:, :2] += CAM_NOISE * torch.randn_like(m[:, :2])
     drop = torch.rand(n, device=dev) < CAM_DROP
+    if CAM_HOLD and key in ("_ys_cam", "_ys_cam_ball"): drop |= m[:, 2] <= 0
+    m[:, 2] = (m[:, 2] == 1).float()  # 0.5 (YS_CAM_VMAX) is delivered as the twin's own out-of-frame sample
     m[drop, :2], m[drop, 2] = st["cur"][drop, :2], 0.0
     st["prev"] = torch.where(new[:, None], st["cur"], st["prev"])
     st["cur"] = torch.where(new[:, None], m, st["cur"])
@@ -157,7 +171,7 @@ def _cam_track(env, key: str, site: str, occlude: bool, true_fn=None) -> torch.T
 
 def cam_tip_obs(env) -> torch.Tensor:
   """trio4+: the leader's head through the jumper's tracker (6)."""
-  return _cam_drop(env, _cam_track(env, "_ys_cam", "head_imu", False))
+  return _cam_drop(env, _cam_track(env, "_ys_cam", "head_imu", False)) * (not CAM_NOHEAD)
 
 
 def cam_ball_obs(env) -> torch.Tensor:
