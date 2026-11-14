@@ -197,6 +197,33 @@ if ODO:
     _CMU, _CSD, _CYM = (torch.as_tensor(_cm[k_], dtype=torch.float32, device=dev) for k_ in ("mu", "sd", "ym")); CORR_GO = _cm.get("frm") == "go"
 
 
+LFODO = os.environ.get("LFODO") == "1"  # 4-10 (2026-11-15): L / F walk out on the runtime odometry from the holder, not their true xy
+if LFODO:
+  assert ODO, "LFODO goes with ODO=1"
+  _LO = subprocess.Popen(_ODO.args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)  # its own odometry per duck: L = n, F = N + n
+  _LW = ("turner", "partner")
+  _LC = {w: torch.tensor([env.scene[w].joint_names.index(n) if n != "mouth" else 0 for n in _JN], device=dev) for w in _LW}
+  _LS = {k_: {w: torch.full((N, 2), math.nan, device=dev) for w in _LW} for k_ in ("p0", "o0", "xy")}
+  SC.XY = lambda env_, w: torch.where(_LS["xy"][w].isnan(), env_.scene[w].data.root_link_pos_w[:, :2], _LS["xy"][w])
+
+
+def lf_odo(k, WS):
+  """LFODO: one tick of L's and F's odometry while they walk out (before the turning starts); the estimate is anchored at the holder."""
+  on = (WS["ph"] < 8).nonzero().flatten()
+  if len(on) == 0: return
+  ln = []
+  for i, w in enumerate(_LW):
+    e = env.scene[w]; j = e.data.joint_pos_biased[on][:, _LC[w]].clone(); j[:, _JN.index("mouth")] = 0.0
+    x = torch.cat([j, e.data.root_link_quat_w[on]], 1).cpu().numpy()
+    ln += [f"{n + i * N} {k} " + " ".join(f"{v:.7f}" for v in r) + "\n" for n, r in zip(on.tolist(), x)]
+  _LO.stdin.write("".join(ln)); _LO.stdin.flush()
+  est = torch.tensor([[float(v) for v in _LO.stdout.readline().split()[2:4]] for _ in ln], device=dev)
+  for i, w in enumerate(_LW):
+    es, pos, S_ = est[i * len(on):(i + 1) * len(on)], env.scene[w].data.root_link_pos_w[on, :2], _LS
+    S_["p0"][w][on] = torch.where(S_["p0"][w][on].isnan(), pos, S_["p0"][w][on]); S_["o0"][w][on] = torch.where(S_["o0"][w][on].isnan(), es, S_["o0"][w][on])
+    S_["xy"][w][on] = S_["p0"][w][on] + es - S_["o0"][w][on]
+
+
 def odo_step(k, M):
   """ODO: one 20 ms tick of the runtime odometry for every J past its start call; E["drift"] = true - estimate."""
   on = ((M["dead"] < 0) & (M["start"] >= 0)).nonzero().flatten()
@@ -246,6 +273,7 @@ def episode(on_step=None):
       T.PLACE_RANGE = dict(zip(("sx", "sy", "th", "dd", "yl", "yf"), ((float(v), float(v)) for v in row))); T.place_reset(env, torch.tensor([n], device=dev))
   env.__dict__.pop("_ys_spot_rel", None)
   if ODO: _P0[:] = math.nan; _O0[:] = math.nan; _OFF[:] = 0.0; _H[:] = math.nan
+  if LFODO: [t_.fill_(math.nan) for d_ in _LS.values() for t_ in d_.values()]
   if CAMFIX: _CF.reset()
   env._ys_off = torch.zeros(N, device=dev) if NOEAR else B.start_offset(N, dev)  # F's start error by ear (ys_trio_scn "ear")
   WS = SC.new_ws(env, N); EQI = None if NOWALK else SC.setup_walkout(env, ALL, REL, WS)
@@ -290,6 +318,7 @@ def episode(on_step=None):
     cmd.amp[:] = 1.0; cmd.freq[:] = B.BEAT_HZ; cmd._write(); obs, *_ = venv.step(a)
     if CORR or EXPL: E["hb"] = torch.roll(E["hb"], -1, 1); E["hb"][:, -1] = obs["actor"]  # J's last 50 observations
     if ODO: odo_step(k, M)
+    if LFODO and not NOWALK: lf_odo(k, WS)
     re = env.episode_length_buf == 0; M["dead"] = torch.where(re & (M["dead"] < 0), k, M["dead"]); alive = M["dead"] < 0  # a turner fell: restarted
     if not NOWALK:
       SC.walkout_post(env, WS, EQI, REL, re, got, gerr)

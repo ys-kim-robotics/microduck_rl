@@ -45,6 +45,8 @@ W_STILL, W_STILL_V, W_STILL_W, W_MIN_WAIT, J_AFTER = float(os.environ.get("BEAT_
 # coasts 39 mm after the command stops (16 envs, flat); sideways 0.5 -> 0.081 m/s (0.3: 0.034), coast 11 mm.
 # So: a fixed command until the coast distance, then stop.
 W_VX, W_VY, W_STOP_F, W_STOP_L = 0.4, 0.5, 0.04, 0.03
+XY = None  # 4-10 (2026-11-15): fn(env, who) -> (N, 2) L's / F's own xy estimate (ys_fullset LFODO=1, odometry from the holder); None = true xy
+def _xy(env, who): return env.scene[who].data.root_link_pos_w[:, :2] if XY is None else XY(env, who)
 W_WZ, W_TURN_TOL, W_BACK0, W_STOP_FWD = float(os.environ.get("BEAT_W_WZ", "1.0")), math.radians(5), 0.10, 0.025  # rad/s told (90 deg in 1.56 s, err 2-4 deg, 16 envs),
 # rad done, m backed off the holder first, m it coasts walking forward (0.4 -> 0.42 m in 423 +- 12 mm)  # m/s told, m left when it stops (forward, sideways)
 W_STAY = os.environ.get("BEAT_WALKOUT_STAY") == "1"  # control run: start at the places (bite, then the start call)
@@ -203,7 +205,7 @@ def walkout_pre(env, WS):
     c, ok[w] = turn_cmd(env, w, side_yaw, ph == 2); C[w] = torch.where((ph == 2)[:, None], c, C[w])
   m = (ph == 2) & ok["turner"] & ok["partner"]; ph[m] = 3
   for w in wh:  # 3: forward to the work line, keeping x
-    cur = env.scene[w].data.root_link_pos_w[:, :2]; tgt = torch.stack([cur[:, 0], WS["spot"][w][:, 1]], 1)
+    cur = _xy(env, w); tgt = torch.stack([cur[:, 0], WS["spot"][w][:, 1]], 1)
     c, nr = walk_cmd(env, w, tgt, side_yaw, ph == 3)
     ok[w] = (WS["spot"][w][:, 1] - cur[:, 1]) <= W_STOP_F + 0.005; c[:, 0] = torch.where(ok[w], 0.0, c[:, 0]); C[w] = torch.where((ph == 3)[:, None], c, C[w])
   m = (ph == 3) & ok["turner"] & ok["partner"]; ph[m] = 4
@@ -211,7 +213,7 @@ def walkout_pre(env, WS):
     c, ok[w] = turn_cmd(env, w, WS["yaw0"][w], ph == 4); C[w] = torch.where((ph == 4)[:, None], c, C[w])
   m = (ph == 4) & ok["turner"] & ok["partner"]; WS["t_mark"][m] = te[m]; ph[m] = 5
   goL = (ph == 5) & (te >= WS["t_mark"] + W_GAP_T)  # 5: L to its place along its facing only (odometry)
-  curL = env.scene["turner"].data.root_link_pos_w[:, :2]; fL = torch.stack([WS["yaw0"]["turner"].cos(), WS["yaw0"]["turner"].sin()], 1)
+  curL = _xy(env, "turner"); fL = torch.stack([WS["yaw0"]["turner"].cos(), WS["yaw0"]["turner"].sin()], 1)
   tgtL = curL + ((WS["spot"]["turner"] - curL) * fL).sum(-1, keepdim=True) * fL
   cL, nL = walk_cmd(env, "turner", tgtL, WS["yaw0"]["turner"], goL); C["turner"] = torch.where((ph == 5)[:, None], cL, C["turner"])
   m = goL & nL; WS["arr"]["turner"] |= m; WS["t_arr"]["turner"][m] = te[m]; WS["t_mark"][m] = te[m]; ph[m] = 6
@@ -289,7 +291,7 @@ def walkout_post(env, WS, EQI, REL, re, got, gerr):
 
 def walk_cmd(env, who, spot, yaw0, go):
   """(N, 13) standing-ONNX command block that walks `who` to spot (N, 2) facing yaw0 (N,), only where go; (N,) arrived."""
-  e = env.scene[who]; p = e.data.root_link_pos_w[:, :2]; w, x, y, z = e.data.root_link_quat_w.unbind(-1)
+  e = env.scene[who]; p = _xy(env, who); w, x, y, z = e.data.root_link_quat_w.unbind(-1)
   yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)); c, s_ = yaw.cos(), yaw.sin()
   err = spot - p; ef, el = err[:, 0] * c + err[:, 1] * s_, -err[:, 0] * s_ + err[:, 1] * c
   cmd = torch.zeros(len(p), 13, device=p.device)
