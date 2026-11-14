@@ -118,6 +118,12 @@ torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 with torch.inference_mode():
   venv.reset()  # the stem end in each turner's own frame (ys_trio_scn's REL for the walk-out)
   REL = {w: quat_apply(quat_inv(env.scene[w].data.root_link_quat_w), env.scene[w].data.site_pos_w[:, env.scene[w].find_sites("stem_end")[0][0]] - env.scene[w].data.root_link_pos_w).median(0).values for w in ("turner", "partner")}
+  if "IMU_SCALE" in os.environ:  # 7-28 (oracle): the IMU mounting tilt each env's three ducks read gravity and turn rate through (mdp's draw: up to 6 deg
+    # about a random axis, one per env, shared by L, F and J) scaled; 0 = levelled, as after a level calibration on the real ducks. Seed 3's first env
+    # draws 5.6 deg, an upright duck there reads -5 deg of pitch: L stands leaning forward and steps as it bites (video game 3). Of L·F's 41 failures in
+    # 768 games, 35 are in the 17% of games where an upright duck reads >= +2 or < -4 deg of pitch
+    _q = env._imu_misalign_quat; _h = float(os.environ["IMU_SCALE"]) * torch.acos(_q[:, :1].clamp(-1, 1))
+    env._imu_misalign_quat = torch.cat([_h.cos(), torch.nn.functional.normalize(_q[:, 1:], dim=1) * _h.sin()], 1)
 
 
 def jstand(x, head=None):  # J obs -> velstand actions (61-D, command block 0: stand still; head: (n, 4) its head command), one env
