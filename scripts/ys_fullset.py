@@ -68,6 +68,14 @@ cfg = ys_eval.load_env_cfg(TASK, play=True); push = cfg.events["push_robot"]
 for k_ in (("sample_offset",) if KEEP_DELTA else ("sample_delta", "sample_offset")): cfg.events.pop(k_)  # one clock for all three (v2); F's start error by ear below
 ys_eval.fix_command(cfg, (0.0, 0.0, 0.0))  # also drops the random push and the curricula
 if PUSH == "mild": push.interval_range_s = (2.0, 4.0); push.params["velocity_range"] = {"x": (-0.1, 0.1), "y": (-0.1, 0.1)}; cfg.events["push_robot"] = push
+if PUSH == "medium": push.interval_range_s = (2.0, 4.0); push.params["velocity_range"] = {"x": (-0.3, 0.3), "y": (-0.3, 0.3)}; cfg.events["push_robot"] = push  # full check: mild's timing, the walking recipe's size
+# full check (2026-11-15): J's body at one end of its trained randomization, J only (L / F keep theirs): VINJ volts (BAM vin_range 6.5-8.2),
+# JFRIC foot friction (0.7-1.3), JMASS mass and inertia scale (0.95-1.05)
+if os.environ.get("VINJ"):
+  from dataclasses import replace as _rp; _e = cfg.scene.entities["robot"]
+  cfg.scene.entities["robot"] = _rp(_e, articulation=_rp(_e.articulation, actuators=tuple(_rp(a_, vin_range=(float(os.environ["VINJ"]),) * 2) for a_ in _e.articulation.actuators)))
+if os.environ.get("JFRIC"): cfg.events["foot_friction"].params["ranges"] = (float(os.environ["JFRIC"]),) * 2
+if os.environ.get("JMASS"): cfg.events["randomize_mass_inertia"].params["alpha_range"] = (math.log(float(os.environ["JMASS"])) / 2,) * 2
 cfg.scene.num_envs, cfg.seed = N, SEED
 if os.environ.get("VIN"):  # battery voltage for all three (BAM vin_range, drawn once per env; the load drop stays): VIN=6.5 ~ a flat 2S pack
   for w_ in ("robot", "turner", "partner"):
@@ -80,6 +88,7 @@ if os.environ.get("DELAY"):  # 7-13 check 7: J's command delay, physics steps of
 if VIDEO: cfg.viewer.height, cfg.viewer.width = 720, 1280
 env = ys_eval.ManagerBasedRlEnv(cfg=cfg, device="cuda:0", render_mode="rgb_array" if VIDEO else None)
 if os.environ.get("DELAY"): print("DELAY max lag J", env.scene["robot"].actuators[0].cfg.delay_max_lag, "L", env.scene["turner"].actuators[0].cfg.delay_max_lag, flush=True)
+if os.environ.get("VINJ"): print("VINJ J", env.scene["robot"].actuators[0].cfg.vin_range, "L", env.scene["turner"].actuators[0].cfg.vin_range, flush=True)
 if os.environ.get("IMAX"):  # 7-13 check 7: J's firmware current limit (A; 1.75 trained) on its BAM motor model
   for a_ in env.scene["robot"].actuators: a_._bam_model.actuator.max_current = float(os.environ["IMAX"])
   print("IMAX", os.environ["IMAX"], "J motor model shared with L:", env.scene["robot"].actuators[0]._bam_model is env.scene["turner"].actuators[0]._bam_model,

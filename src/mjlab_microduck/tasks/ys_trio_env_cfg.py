@@ -87,7 +87,7 @@ def rope_phase_obs(env) -> torch.Tensor:
 CAM_TAN_H = math.tan(math.radians(31.0))
 CAM_TAN_V = CAM_TAN_H * 9 / 16
 CAM_HZ = 30.0
-CAM_LAG = (3, 5)  # policy steps (60-100 ms): capture + ISP + tracker, unmeasured -> randomized per env
+CAM_LAG = tuple(int(v) for v in __import__("os").environ.get("YS_CAM_LAG", "3,5").split(","))  # policy steps (60-100 ms): capture + ISP + tracker, unmeasured -> randomized per env; YS_CAM_LAG="lo,hi" (full check 2026-11-15)
 CAM_NOISE = 0.01  # normalized image units (~6 px at 1280)
 CAM_DROP = float(__import__("os").environ.get("YS_CAM_FRAME_DROP", "0.05"))  # per frame; 7-18: 재학습 7 trained at 0 (the YS_CAM_DROP name clash), 재학습 9/10 at 0.05
 # 7-29 (RUNTIME-ys.md): what a real tracker could not deliver to J (its two markers only; F's camera is left as it was), each off unless set.
