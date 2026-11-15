@@ -47,6 +47,8 @@ W_STILL, W_STILL_V, W_STILL_W, W_MIN_WAIT, J_AFTER = float(os.environ.get("BEAT_
 W_VX, W_VY, W_STOP_F, W_STOP_L = 0.4, 0.5, 0.04, 0.03
 XY = None  # 4-10 (2026-11-15): fn(env, who) -> (N, 2) L's / F's own xy estimate (ys_fullset LFODO=1, odometry from the holder); None = true xy
 def _xy(env, who): return env.scene[who].data.root_link_pos_w[:, :2] if XY is None else XY(env, who)
+YAW = None  # full check part 4 (2026-11-15): fn(env, who) -> (N,) rad added to `who`'s true yaw: its gyro-heading error (ys_fullset LFYAW); None = true yaw
+def _yawo(env, who): return _yaw(env.scene[who]) if YAW is None else _yaw(env.scene[who]) + YAW(env, who)
 W_WZ, W_TURN_TOL, W_BACK0, W_STOP_FWD = float(os.environ.get("BEAT_W_WZ", "1.0")), math.radians(5), 0.10, 0.025  # rad/s told (90 deg in 1.56 s, err 2-4 deg, 16 envs),
 # rad done, m backed off the holder first, m it coasts walking forward (0.4 -> 0.42 m in 423 +- 12 mm)  # m/s told, m left when it stops (forward, sideways)
 W_STAY = os.environ.get("BEAT_WALKOUT_STAY") == "1"  # control run: start at the places (bite, then the start call)
@@ -182,7 +184,7 @@ def _yaw(e):
 
 def turn_cmd(env, who, yaw_t, go, tol=W_TURN_TOL):
   """(N, 13) turn in place to yaw_t (fixed rate past velstand's dead band), (N,) done."""
-  e = torch.atan2(torch.sin(yaw_t - _yaw(env.scene[who])), torch.cos(yaw_t - _yaw(env.scene[who])))
+  y_ = _yawo(env, who); e = torch.atan2(torch.sin(yaw_t - y_), torch.cos(yaw_t - y_))
   cmd = torch.zeros(len(e), 13, device=e.device); cmd[:, 2] = torch.where(e.abs() > tol, W_WZ * e.sign(), 0.0); cmd[~go] = 0.0
   return cmd, e.abs() <= tol
 
@@ -291,8 +293,7 @@ def walkout_post(env, WS, EQI, REL, re, got, gerr):
 
 def walk_cmd(env, who, spot, yaw0, go):
   """(N, 13) standing-ONNX command block that walks `who` to spot (N, 2) facing yaw0 (N,), only where go; (N,) arrived."""
-  e = env.scene[who]; p = _xy(env, who); w, x, y, z = e.data.root_link_quat_w.unbind(-1)
-  yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)); c, s_ = yaw.cos(), yaw.sin()
+  p = _xy(env, who); yaw = _yawo(env, who); c, s_ = yaw.cos(), yaw.sin()
   err = spot - p; ef, el = err[:, 0] * c + err[:, 1] * s_, -err[:, 0] * s_ + err[:, 1] * c
   cmd = torch.zeros(len(p), 13, device=p.device)
   cmd[:, 0] = torch.where(ef.abs() > W_STOP_F, W_VX * ef.sign(), 0.0); cmd[:, 1] = torch.where(el.abs() > W_STOP_L, W_VY * el.sign(), 0.0)

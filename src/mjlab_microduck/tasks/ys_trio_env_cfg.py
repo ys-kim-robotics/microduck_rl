@@ -99,6 +99,7 @@ CAM_UMAX = float(__import__("os").environ.get("YS_CAM_UMAX", "1"))
 CAM_NOHEAD = __import__("os").environ.get("YS_CAM_NOHEAD") == "1"
 CAM_HOLD = __import__("os").environ.get("YS_CAM_HOLD") == "1"
 CAM_VMAX = float(__import__("os").environ.get("YS_CAM_VMAX", "1"))
+CAM_HEADOCC = __import__("os").environ.get("YS_CAM_HEADOCC") == "1"  # full check part 4 (eval): rope links hide L's head marker too, as they hide its ball
 
 
 def _cam_vec(env, site: str, who: str = "turner"):
@@ -171,7 +172,7 @@ def _cam_track(env, key: str, site: str, occlude: bool, true_fn=None) -> torch.T
 
 def cam_tip_obs(env) -> torch.Tensor:
   """trio4+: the leader's head through the jumper's tracker (6)."""
-  return _cam_drop(env, _cam_track(env, "_ys_cam", "head_imu", False)) * (not CAM_NOHEAD)
+  return _cam_drop(env, _cam_track(env, "_ys_cam", "head_imu", CAM_HEADOCC)) * (not CAM_NOHEAD)
 
 
 def cam_ball_obs(env) -> torch.Tensor:

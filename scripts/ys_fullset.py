@@ -61,6 +61,14 @@ P0ERR = float(os.environ.get("P0ERR", "0"))  # 7-29 (RUNTIME-ys.md, with ODO): J
 # direction per env), as a floor mark would leave it; the camera fix can take it out once J sees L
 BELIEF = [float(v) for v in os.environ.get("BELIEF", "0,0").split(",")]  # 7-13 check 4: "cm,deg": J believes its spot is cm off (random
 # direction) and the rope axis deg off (random sign), from the start: placed by hand; its command uses that belief
+JYAW = [math.radians(float(v)) for v in os.environ["JYAW"].split(",")] if os.environ.get("JYAW") else None  # full check part 4 (2026-11-15): "e0,b" (deg, deg/s):
+# J's heading as its procedure knows it (gyro yaw) = true + e0 (placed by hand) + b x the time since its start call (gyro drift), each with a random
+# sign per game; its odometry and camera fix get the trunk quaternion turned by that, its turn command and its body-frame position command use it
+LFYAW = math.radians(float(os.environ.get("LFYAW", "0")))  # deg/s: L's and F's gyro-heading drift (random sign each) from the reset: their walk-out turns and walks (and LFODO)
+CAMLAG = os.environ.get("CAMFIX_LAG")  # policy steps: the camera fix takes every frame as this old (a set latency) instead of the frame's true lag
+LEAR = os.environ.get("LEAR") == "1"  # L starts its clock on J's start sound with its own error by ear (ys_beat CAL_SD + JIT, one duck); J does not know
+SPOTNOM = os.environ.get("SPOTNOM") == "1"  # J's spot and rope axis = where the turners were meant to stand (their walk-out targets), not where they stand
+_G4 = np.random.default_rng(11)  # part 4's draws on their own stream (the games stay the reference run's)
 TASK, MODE, CK = ("Mjlab-YsTrioJumpBeat-Flat-MicroDuck" if NOWALK else "Mjlab-YsTrioJumpBeatPick-Flat-MicroDuck"), sys.argv[1], sys.argv[2]
 VIDEO = MODE == "video"; N = 1 if VIDEO else int(sys.argv[3]); SEED = int(os.environ.get("SEED", 1)); PUSH = os.environ.get("PUSH", "none")
 J_AFTER, STOP_DELAY, STOP_RAMP, AFTER, WIN, MAXP = float(os.environ.get("JAFTER", "4.0")), 0.1, 0.4, 3.0, 40, 20  # s call -> earliest set-off (7-8), s, s, s shown after the stop, steps/pass, passes
@@ -173,18 +181,22 @@ def hook(c):
   the last 12 cm) in the frame of the spot the turners make (ys_trio_scn.spot_from_turners: xy, heading F->L)."""
   e, t = E, env.episode_length_buf * dt
   sr = env.__dict__.get("_ys_spot_rel"); sr = torch.zeros(N, 3, device=dev) if sr is None else sr
+  if SPOTNOM: sr = e["spotnom"]
   sr = sr + e["belief"]  # BELIEF: the spot J thinks the turners make (0 unless set)
   th = sr[:, 2]; cs, sn = th.cos(), th.sin()
-  dl = T.DELTA0 if CLOCKOFF else env.__dict__.get("_ys_delta", T.DELTA0)  # CLOCKOFF: J sets off on its own clock
+  dl = T.DELTA0 if (CLOCKOFF or LEAR) else env.__dict__.get("_ys_delta", T.DELTA0)  # CLOCKOFF / LEAR: J sets off on its own clock
   e["go"] |= (t >= e["t"]) & (torch.remainder(c.phase - dl - e["ph"], 2 * math.pi) < 2 * math.pi * c.freq.abs() * dt)
   y = torch.where(e["go"], 0.0, e["y0"])
   d = (sr[:, :2] - (rob.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2] - (e["drift"] if ODO else 0.0))).norm(dim=-1); e["d"] = d
   e["near"] |= e["go"] & (d < T.ENTER_NEAR); walk = e["go"] & ~e["near"]
   g = T.ENTER_DASH / d.clamp(min=T.ENTER_NEAR) if T.ENTER_DASH else T.ENTER_GAIN
   fwA, h = e["fw"] & (e["mode"] == 1), -0.5 * math.pi * e["side"]
-  dy = T._wrap(th + torch.where(fwA & ~e["near"], h * ((d - T.ENTER_NEAR) / T.ENTER_TURN_D).clamp(0, 1), 0.0) - T._yaw(rob))
+  dy = T._wrap(th + torch.where(fwA & ~e["near"], h * ((d - T.ENTER_NEAR) / T.ENTER_TURN_D).clamp(0, 1), 0.0) - T._yaw(rob) - e["yerr"])
   wz = torch.where(e["fw"] & e["go"], (T.TURN_GAIN * dy).clamp(-T.TURN_WMAX, T.TURN_WMAX), (J.CENTER_GAIN * dy).clamp(-0.5, 0.5))
   tgt = sr[:, :2] + torch.stack([-sn * y, cs * y], 1) + e["drift"]  # DRIFT: the command steers by a drifting position estimate
+  if JYAW:  # the env turns (tgt - true xy) into J's body frame by its true yaw; J's own procedure turns it by its estimated yaw: pre-turn by -yerr
+    p_ = rob.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2]; d_ = tgt - p_; c_, s_ = e["yerr"].cos(), e["yerr"].sin()
+    tgt = p_ + torch.stack([c_ * d_[:, 0] + s_ * d_[:, 1], -s_ * d_[:, 0] + c_ * d_[:, 1]], 1)
   gc = torch.where(e["near"] & torch.tensor(NOCENTER, device=dev), 0.0, J.CENTER_GAIN)
   return tgt, torch.where(walk, g, gc), torch.where(walk, max(T.ENTER_VMAX, T.ENTER_DASH), 0.3), wz
 
@@ -216,6 +228,18 @@ if LFODO:
   SC.XY = lambda env_, w: torch.where(_LS["xy"][w].isnan(), env_.scene[w].data.root_link_pos_w[:, :2], _LS["xy"][w])
 
 
+def turnq(q, a):
+  """quaternions (n, 4) wxyz turned about the world z by a (n,) rad: yaw + a."""
+  c, s = (a / 2).cos(), (a / 2).sin(); w, x, y, z = q.unbind(-1)
+  return torch.stack([c * w - s * z, c * x - s * y, c * y + s * x, c * z + s * w], -1)
+
+
+if LFYAW:  # part 4: L's and F's heading error grows from the reset (they bite at the holder) at LFYAW, one random sign per duck and game
+  _LYS = {w: torch.as_tensor(_G4.choice([-1.0, 1.0], N), dtype=torch.float32, device=dev) for w in ("turner", "partner")}
+  SC.YAW = lambda env_, w: _LYS[w] * LFYAW * env_.episode_length_buf * dt if w in _LYS else torch.zeros(N, device=dev)
+if JYAW: _JYS = [torch.as_tensor(_G4.choice([-1.0, 1.0], N), dtype=torch.float32, device=dev) for _ in range(2)]  # signs of e0, b
+
+
 def lf_odo(k, WS):
   """LFODO: one tick of L's and F's odometry while they walk out (before the turning starts); the estimate is anchored at the holder."""
   on = (WS["ph"] < 8).nonzero().flatten()
@@ -223,7 +247,8 @@ def lf_odo(k, WS):
   ln = []
   for i, w in enumerate(_LW):
     e = env.scene[w]; j = e.data.joint_pos_biased[on][:, _LC[w]].clone(); j[:, _JN.index("mouth")] = 0.0
-    x = torch.cat([j, e.data.root_link_quat_w[on]], 1).cpu().numpy()
+    qq = e.data.root_link_quat_w[on]; qq = turnq(qq, SC.YAW(env, w)[on]) if LFYAW else qq
+    x = torch.cat([j, qq], 1).cpu().numpy()
     ln += [f"{n + i * N} {k} " + " ".join(f"{v:.7f}" for v in r) + "\n" for n, r in zip(on.tolist(), x)]
   _LO.stdin.write("".join(ln)); _LO.stdin.flush()
   est = torch.tensor([[float(v) for v in _LO.stdout.readline().split()[2:4]] for _ in ln], device=dev)
@@ -240,7 +265,8 @@ def odo_step(k, M):
   pos = rob.data.root_link_pos_w[on, :2]
   _P0[on] = torch.where(_P0[on].isnan(), pos + _P0E[on], _P0[on])
   j = rob.data.joint_pos_biased[on][:, _COL].clone(); j[:, _JN.index("mouth")] = 0.0
-  x = torch.cat([j, rob.data.root_link_quat_w[on]], 1).cpu().numpy(); ids = on.cpu().numpy()
+  qq = rob.data.root_link_quat_w[on]; qq = turnq(qq, E["yerr"][on]) if JYAW else qq  # part 4 JYAW: the gyro yaw
+  x = torch.cat([j, qq], 1).cpu().numpy(); ids = on.cpu().numpy()
   _ODO.stdin.write("".join(f"{n} {k} " + " ".join(f"{v:.7f}" for v in r) + "\n" for n, r in zip(ids, x))); _ODO.stdin.flush()
   est3 = torch.tensor([[float(v) for v in _ODO.stdout.readline().split()[2:5]] for _ in ids], device=dev); est = est3[:, :2]
   if HOLD:
@@ -249,7 +275,7 @@ def odo_step(k, M):
     want = 2 * h1 - h0; _OFF[on] += torch.where(w_[:, None], want - est, 0.0); est = torch.where(w_[:, None], want, est); _H[on, 0], _H[on, 1] = h1, est
   _O0[on] = torch.where(_O0[on].isnan(), est, _O0[on])  # the odometry keeps running across games (video): from this game's first tick
   world = _P0[on] + est - _O0[on]
-  sp = env.__dict__.get("_ys_spot_rel"); cb = env.__dict__.get("_ys_cam_ball")
+  sp = E["spotnom"] if SPOTNOM else env.__dict__.get("_ys_spot_rel"); cb = env.__dict__.get("_ys_cam_ball")
   if CAMFIX and sp is not None and cb is not None:
     spw = torch.cat([sp[:, :2] + env.scene.env_origins[:, :2], sp[:, 2:]], 1).cpu().numpy(); cur, curF, wt = cb["cur"], None, None
     if WAITLOOK:  # frames only once the circle is full (it ramps up over 1 s after the call); F's ball tracked too (LF)
@@ -259,7 +285,7 @@ def odo_step(k, M):
         curF = torch.where(ramp, torch.zeros_like(curF), curF).cpu().numpy()
       wt = (~E["go"][on]).cpu().numpy()
     corr = _CF.step(k, ids, x[:, :15], x[:, 15:], torch.cat([world, est3[:, 2:]], 1).cpu().numpy(), cmd.phase[on].cpu().numpy(),
-                    cur.cpu().numpy(), env._ys_cam_clock["lag"].cpu().numpy(), spw, curF, wt)
+                    cur.cpu().numpy(), np.full(N, int(CAMLAG)) if CAMLAG else env._ys_cam_clock["lag"].cpu().numpy(), spw, curF, wt)
     world = world + torch.as_tensor(corr, dtype=world.dtype, device=dev)
   if CORR or EXPL:  # c0: the correction the latest observation was made with
     c0 = E["corr"][on]; ref = (M["go"] if CORR_GO else M["arr"])[on]; act = ((ref >= 0) & (k >= ref + (0 if CORR_GO else 25)) & (M["call"][on] < 0))[:, None]
@@ -289,11 +315,17 @@ def episode(on_step=None):
   got, gerr = torch.zeros(N, 2, dtype=torch.bool, device=dev), torch.full((N, 2), math.nan, device=dev)
   z = lambda: torch.zeros(N, device=dev)
   E = {"y0": z(), "ph": z(), "side": z(), "d_prev": z(), "d": z(), "mode": z().long(), "fw": z().bool(), "go": z().bool(), "near": z().bool(), "t": torch.full((N,), math.inf, device=dev),
-       "drift": torch.zeros(N, 2, device=dev), "belief": torch.zeros(N, 3, device=dev), "corr": torch.zeros(N, 2, device=dev), "hb": torch.zeros(N, 50, 73, device=dev)}
+       "drift": torch.zeros(N, 2, device=dev), "belief": torch.zeros(N, 3, device=dev), "yerr": torch.zeros(N, device=dev), "corr": torch.zeros(N, 2, device=dev), "hb": torch.zeros(N, 50, 73, device=dev)}
   if BELIEF[0] or BELIEF[1]:  # check 4: a fixed belief error per game (position: random direction; heading: random sign)
     a_ = torch.rand(N, device=dev) * 2 * math.pi; sg = torch.where(torch.rand(N, device=dev) < 0.5, -1.0, 1.0)
     E["belief"] = torch.stack([BELIEF[0] / 100 * a_.cos(), BELIEF[0] / 100 * a_.sin(), sg * math.radians(BELIEF[1])], 1)
   if CLOCKOFF: env._ys_delta = torch.full((N,), T.DELTA0 + math.radians(float(CLOCKOFF)), device=dev)  # check 3: the rope runs late
+  if LEAR: env._ys_delta = T.DELTA0 + torch.as_tensor(B.OMEGA * math.hypot(B.CAL_SD, B.JIT) * _G4.standard_normal(N), dtype=torch.float32, device=dev)
+  if SPOTNOM:  # spot_from_turners on L's and F's walk-out targets (WS spot, yaw0): where the floor plan puts J's spot
+    ctr = {w: WS["spot"][w] + torch.stack([WS["yaw0"][w].cos() * REL[w][0] - WS["yaw0"][w].sin() * REL[w][1],
+                                           WS["yaw0"][w].sin() * REL[w][0] + WS["yaw0"][w].cos() * REL[w][1]], 1) for w in ("turner", "partner")}
+    ax_ = ctr["turner"] - ctr["partner"]; ax_ = ax_ / ax_.norm(dim=-1, keepdim=True).clamp(min=1e-6); nr_ = torch.stack([-ax_[:, 1], ax_[:, 0]], 1)
+    E["spotnom"] = torch.cat([(ctr["turner"] + ctr["partner"]) / 2 + T.JUMPER_Y * nr_ - env.scene.env_origins[:, :2], torch.atan2(ax_[:, 1], ax_[:, 0])[:, None]], 1)
   T._draw(E, ALL, torch.zeros(N, dtype=torch.bool, device=dev), T.ENTER_Y, dev)  # y0 12-20 cm (+y), the window, the scenario
   pr = env.event_manager.get_term_cfg("reset_base").params["pose_range"]  # as enter_reset: the default root (z 0) + reset_base's x / y / z draw
   st = rob.data.default_root_state.clone(); st[:, 7:] = 0.0; st[:, 1] += E["y0"]
@@ -316,6 +348,7 @@ def episode(on_step=None):
     kstop = torch.where(M["call"] >= 0, M["call"] + KSTOP, 10 ** 9)  # the turners hear J's end call
     env._ys_amp = torch.minimum(env._ys_amp, (1 - (k - kstop).float() * dt / STOP_RAMP).clamp(0, 1))
     if NOCAM: obs = {k_: v_.clone() for k_, v_ in obs.items()}; obs["actor"][:, 61:] = 0.0  # tracker never sees anything
+    if JYAW: E["yerr"] = torch.where(M["start"] >= 0, _JYS[0] * JYAW[0] + _JYS[1] * JYAW[1] * (k - M["start"]).float() * dt, 0.0)
     if DRIFT: E["drift"] += DRIFT * math.sqrt(dt) * torch.randn(N, 2, device=dev) * E["go"][:, None]
     a = pol(obs)
     if pol2 is not None: a = torch.where(sw[:, None], pol2(noclock(obs)), a)
@@ -391,6 +424,11 @@ def records(M):
     r.update(kind="game", t_go=round(kg * dt, 2), wait_s=round((kg - ks) * dt, 2), arr_s=None if ka < 0 else round((ka - kg) * dt, 2), hit=hit, cause=C[int(g["cause"][n])] if hit else None,
              streak=min((kh - kg) // WIN, MAXP) if hit else MAXP, pre=bool(hit and (ka < 0 or kh < ka)), after_arr=None if (not hit or ka < 0 or kh < ka) else round((kh - ka) * dt / 0.8, 2),
              lf_down_after_end=bool(kd >= 0))
+    if JYAW: r["yerr_deg"] = round(math.degrees(float(E["yerr"][n])), 2)  # part 4 checks: what each knob drew / did in this game
+    if LEAR: r["lear_deg"] = round(math.degrees(float(env._ys_delta[n] - T.DELTA0)), 2)
+    if LFYAW: r["lfyaw_deg"] = [round(math.degrees(float(SC.YAW(env, w)[n])), 2) for w in ("turner", "partner")]
+    if SPOTNOM and ks >= 0: r["spotnom"] = [round(float(g["spot"][n][0] - 1000 * E["spotnom"][n, 0]), 1), round(float(g["spot"][n][1] - 1000 * E["spotnom"][n, 1]), 1),
+                                            round(float(T._wrap(torch.deg2rad(torch.tensor(float(g["spot"][n][2]))) - E["spotnom"][n, 2].cpu()) * 180 / math.pi), 2)]  # true - nominal: mm, mm, deg
     out.append(r)
   return out
 
