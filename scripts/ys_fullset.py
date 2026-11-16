@@ -68,6 +68,15 @@ LFYAW = math.radians(float(os.environ.get("LFYAW", "0")))  # deg/s: L's and F's 
 CAMLAG = os.environ.get("CAMFIX_LAG")  # policy steps: the camera fix takes every frame as this old (a set latency) instead of the frame's true lag
 LEAR = os.environ.get("LEAR") == "1"  # L starts its clock on J's start sound with its own error by ear (ys_beat CAL_SD + JIT, one duck); J does not know
 SPOTNOM = os.environ.get("SPOTNOM") == "1"  # J's spot and rope axis = where the turners were meant to stand (their walk-out targets), not where they stand
+SPOTLF = os.environ.get("SPOTLF") == "1"  # DEPLOY 4-12 (STAGES 7-40): J's spot and rope axis from L's and F's own position / heading estimates (LFODO, LFYAW),
+# as if they radio them to J; without LFODO their xy is the true one
+GYROKF = [math.radians(float(v)) for v in os.environ["GYROKF"].split(",")] if os.environ.get("GYROKF") else None  # 4-a(i) (2026-11-16, STAGES 7-39):
+# "sb,sz" deg/s: J's gyro-bias Kalman filter (gyro_kf; prior sd sb of the bias, per-tick sd sz of the standing sway's yaw rate). Needs JYAW
+SPOTBIAS = [float(v) for v in os.environ["SPOTBIAS"].split(",")] if os.environ.get("SPOTBIAS") else None  # 4-c (2026-11-16, STAGES 7-39): with SPOTNOM, add the
+# walk-out's mean true-minus-nominal spot offset "dx,dy,dth" (mm, mm, deg; dx along the nominal rope axis F->L, dy across it), calibrated on seeds the eval does not use
+assert not SPOTBIAS or SPOTNOM, "SPOTBIAS corrects SPOTNOM's floor-plan spot"
+assert not (SPOTLF and SPOTNOM), "one source for J's spot"
+assert not GYROKF or JYAW, "GYROKF filters the JYAW gyro"
 _G4 = np.random.default_rng(11)  # part 4's draws on their own stream (the games stay the reference run's)
 TASK, MODE, CK = ("Mjlab-YsTrioJumpBeat-Flat-MicroDuck" if NOWALK else "Mjlab-YsTrioJumpBeatPick-Flat-MicroDuck"), sys.argv[1], sys.argv[2]
 VIDEO = MODE == "video"; N = 1 if VIDEO else int(sys.argv[3]); SEED = int(os.environ.get("SEED", 1)); PUSH = os.environ.get("PUSH", "none")
@@ -258,6 +267,20 @@ def lf_odo(k, WS):
     S_["xy"][w][on] = S_["p0"][w][on] + es - S_["o0"][w][on]
 
 
+def gyro_kf(k, M):
+  """GYROKF (4-a(i), 7-39): J's yaw-rate bias from its gyro while it stands still (on velstand, before its handover): a scalar Kalman
+  filter on the measured yaw rate (true rate ~0 standing + the bias). The yaw the procedure uses (odometry, camera fix, commands) is the
+  gyro's minus the estimated bias integrated from the start call (where the sim's JYAW drift starts). The start error e0 stays."""
+  psi = T._yaw(rob) + E["yerr"]  # what J's gyro reports: the true yaw + the JYAW drift
+  te_ = env.episode_length_buf * dt
+  # not across the start call (k == start): the sim switches JYAW's start error e0 on there, a step no real gyro reports (7-40: it read
+  # as 2 deg / 20 ms = 100 deg/s and the filter ended near twice the drift)
+  still = (M["start"] >= 0) & (k > M["start"]) & ~E["go"] & (te_ < E["t"] - HANDOVER) & ~E["kp"].isnan()
+  z = T._wrap(psi - E["kp"]) / dt; g = E["kP"] / (E["kP"] + GYROKF[1] ** 2)
+  E["kb"] = torch.where(still, E["kb"] + g * (z - E["kb"]), E["kb"]); E["kP"] = torch.where(still, (1 - g) * E["kP"], E["kP"]); E["kp"] = psi
+  E["yerr"] = E["yerr"] - torch.where(M["start"] >= 0, E["kb"] * (k - M["start"]).float() * dt, 0.0)
+
+
 def odo_step(k, M):
   """ODO: one 20 ms tick of the runtime odometry for every J past its start call; E["drift"] = true - estimate."""
   on = ((M["dead"] < 0) & (M["start"] >= 0)).nonzero().flatten()
@@ -316,6 +339,7 @@ def episode(on_step=None):
   z = lambda: torch.zeros(N, device=dev)
   E = {"y0": z(), "ph": z(), "side": z(), "d_prev": z(), "d": z(), "mode": z().long(), "fw": z().bool(), "go": z().bool(), "near": z().bool(), "t": torch.full((N,), math.inf, device=dev),
        "drift": torch.zeros(N, 2, device=dev), "belief": torch.zeros(N, 3, device=dev), "yerr": torch.zeros(N, device=dev), "corr": torch.zeros(N, 2, device=dev), "hb": torch.zeros(N, 50, 73, device=dev)}
+  if GYROKF: E.update(kb=torch.zeros(N, device=dev), kP=torch.full((N,), GYROKF[0] ** 2, device=dev), kp=torch.full((N,), math.nan, device=dev))
   if BELIEF[0] or BELIEF[1]:  # check 4: a fixed belief error per game (position: random direction; heading: random sign)
     a_ = torch.rand(N, device=dev) * 2 * math.pi; sg = torch.where(torch.rand(N, device=dev) < 0.5, -1.0, 1.0)
     E["belief"] = torch.stack([BELIEF[0] / 100 * a_.cos(), BELIEF[0] / 100 * a_.sin(), sg * math.radians(BELIEF[1])], 1)
@@ -326,6 +350,9 @@ def episode(on_step=None):
                                            WS["yaw0"][w].sin() * REL[w][0] + WS["yaw0"][w].cos() * REL[w][1]], 1) for w in ("turner", "partner")}
     ax_ = ctr["turner"] - ctr["partner"]; ax_ = ax_ / ax_.norm(dim=-1, keepdim=True).clamp(min=1e-6); nr_ = torch.stack([-ax_[:, 1], ax_[:, 0]], 1)
     E["spotnom"] = torch.cat([(ctr["turner"] + ctr["partner"]) / 2 + T.JUMPER_Y * nr_ - env.scene.env_origins[:, :2], torch.atan2(ax_[:, 1], ax_[:, 0])[:, None]], 1)
+    if SPOTBIAS:  # 4-c: the floor plan's spot + the calibrated walk-out offset, turned into the nominal spot's frame
+      th_ = E["spotnom"][:, 2]; bx_, by_ = SPOTBIAS[0] / 1000, SPOTBIAS[1] / 1000
+      E["spotnom"] = E["spotnom"] + torch.stack([th_.cos() * bx_ - th_.sin() * by_, th_.sin() * bx_ + th_.cos() * by_, torch.full_like(th_, math.radians(SPOTBIAS[2]))], 1)
   T._draw(E, ALL, torch.zeros(N, dtype=torch.bool, device=dev), T.ENTER_Y, dev)  # y0 12-20 cm (+y), the window, the scenario
   pr = env.event_manager.get_term_cfg("reset_base").params["pose_range"]  # as enter_reset: the default root (z 0) + reset_base's x / y / z draw
   st = rob.data.default_root_state.clone(); st[:, 7:] = 0.0; st[:, 1] += E["y0"]
@@ -335,6 +362,7 @@ def episode(on_step=None):
   env._ys_in = torch.zeros(N, dtype=torch.bool, device=dev)  # ys_beat reads it (J's beeps once in): its spot
   M = {k: torch.full((N,), -1, dtype=torch.long, device=dev) for k in ("start", "go", "arr", "hit", "call", "dead", "jdown", "jdph")}
   M["cause"] = torch.zeros(N, dtype=torch.long, device=dev); M["spot"] = torch.full((N, 3), math.nan, device=dev); M["werr"] = torch.full((N, 2), math.nan, device=dev)
+  if SPOTLF: M["spottru"] = torch.full((N, 3), math.nan, device=dev)
   M["geo"] = torch.full((N, 3), math.nan, device=dev); M["bite"] = torch.zeros(N, dtype=torch.bool, device=dev); M["gerr"] = gerr
   M["tq"] = {k: [] for k in ("wait", "run", "jump", "L", "F")}; M["ws"] = WS; sw = torch.zeros(N, dtype=torch.bool, device=dev)
   if pl_ is not None: M["place"] = torch.as_tensor(pl_)  # each game's drawn row, into its record
@@ -349,6 +377,7 @@ def episode(on_step=None):
     env._ys_amp = torch.minimum(env._ys_amp, (1 - (k - kstop).float() * dt / STOP_RAMP).clamp(0, 1))
     if NOCAM: obs = {k_: v_.clone() for k_, v_ in obs.items()}; obs["actor"][:, 61:] = 0.0  # tracker never sees anything
     if JYAW: E["yerr"] = torch.where(M["start"] >= 0, _JYS[0] * JYAW[0] + _JYS[1] * JYAW[1] * (k - M["start"]).float() * dt, 0.0)
+    if GYROKF: gyro_kf(k, M)  # E["yerr"]: what is left after the filter's drift estimate
     if DRIFT: E["drift"] += DRIFT * math.sqrt(dt) * torch.randn(N, 2, device=dev) * E["go"][:, None]
     a = pol(obs)
     if pol2 is not None: a = torch.where(sw[:, None], pol2(noclock(obs)), a)
@@ -366,11 +395,13 @@ def episode(on_step=None):
       SC.walkout_post(env, WS, EQI, REL, re, got, gerr)
       bf = alive & ~gerr.isnan().any(1) & ~got.all(1)  # 7-15 bug: a beak missed its handle (the rope stays on the holder): L·F's failure, as a fall
       M["dead"][bf] = k; M["bite"] |= bf; alive &= ~bf
-    prev = env.__dict__.get("_ys_spot_rel"); new = SC.spot_from_turners(env, REL)  # J lines up on the rope it sees, kept from its set-off
+    prev = env.__dict__.get("_ys_spot_rel"); tru = SC.spot_from_turners(env, REL)  # J lines up on the rope it sees, kept from its set-off
+    new = SC.spot_from_turners(env, REL, est=True) if SPOTLF else tru  # SPOTLF: from L's and F's own estimates
     if prev is not None: env._ys_spot_rel = torch.where(E["go"][:, None], prev, new)
     env._ys_center_hook = hook
     sr = env._ys_spot_rel
     m = alive & (M["start"] == k); M["spot"] = torch.where(m[:, None], torch.stack([1000 * sr[:, 0], 1000 * sr[:, 1], torch.rad2deg(sr[:, 2])], 1), M["spot"])
+    if SPOTLF: M["spottru"] = torch.where(m[:, None], torch.stack([1000 * tru[:, 0], 1000 * tru[:, 1], torch.rad2deg(tru[:, 2])], 1), M["spottru"])
     if m.any():  # the turners at the call: stem ends apart minus rope14's 0.60 m (mm), L's and F's yaw vs facing each other along F->L (deg)
       ax_ = sr[:, 2]; yl = torch.rad2deg(T._wrap(T._yaw(tu) - ax_ - math.pi)); yf = torch.rad2deg(T._wrap(T._yaw(pa) - ax_))
       M["geo"] = torch.where(m[:, None], torch.stack([1000 * ((tu.data.site_pos_w[:, SI] - pa.data.site_pos_w[:, SJ]).norm(dim=-1) - 0.60), yl, yf], 1), M["geo"])
@@ -424,11 +455,16 @@ def records(M):
     r.update(kind="game", t_go=round(kg * dt, 2), wait_s=round((kg - ks) * dt, 2), arr_s=None if ka < 0 else round((ka - kg) * dt, 2), hit=hit, cause=C[int(g["cause"][n])] if hit else None,
              streak=min((kh - kg) // WIN, MAXP) if hit else MAXP, pre=bool(hit and (ka < 0 or kh < ka)), after_arr=None if (not hit or ka < 0 or kh < ka) else round((kh - ka) * dt / 0.8, 2),
              lf_down_after_end=bool(kd >= 0))
-    if JYAW: r["yerr_deg"] = round(math.degrees(float(E["yerr"][n])), 2)  # part 4 checks: what each knob drew / did in this game
+    if JYAW: r["yerr_deg"] = round(math.degrees(float(E["yerr"][n])), 2)
+    if GYROKF: r["kb_dps"] = round(math.degrees(float(E["kb"][n])), 3)  # 4-a(i): the filter's bias estimate
+    if CAMFIX and WAITLOOK == "LF": r["fseen"] = [None if _CF.AF[n] is None else [round(1000 * float(v), 1) for v in _CF.AF[n]],
+                                                 None if _CF.AL[n] is None else [round(1000 * float(v), 1) for v in _CF.AL[n]]]  # F's / L's centre fixed while J waited (mm)  # part 4 checks: what each knob drew / did in this game
     if LEAR: r["lear_deg"] = round(math.degrees(float(env._ys_delta[n] - T.DELTA0)), 2)
     if LFYAW: r["lfyaw_deg"] = [round(math.degrees(float(SC.YAW(env, w)[n])), 2) for w in ("turner", "partner")]
     if SPOTNOM and ks >= 0: r["spotnom"] = [round(float(g["spot"][n][0] - 1000 * E["spotnom"][n, 0]), 1), round(float(g["spot"][n][1] - 1000 * E["spotnom"][n, 1]), 1),
                                             round(float(T._wrap(torch.deg2rad(torch.tensor(float(g["spot"][n][2]))) - E["spotnom"][n, 2].cpu()) * 180 / math.pi), 2)]  # true - nominal: mm, mm, deg
+    if SPOTLF and ks >= 0: r["spotlf"] = [round(float(g["spottru"][n][0] - g["spot"][n][0]), 1), round(float(g["spottru"][n][1] - g["spot"][n][1]), 1),
+                                          round(float((g["spottru"][n][2] - g["spot"][n][2] + 180) % 360 - 180), 2)]  # true - from L's and F's estimates: mm, mm, deg
     out.append(r)
   return out
 

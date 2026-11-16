@@ -253,6 +253,8 @@ class TurnerAction(JointPositionAction):
     if stop is not None:  # rope14 saw circle-off commands 10% of the time in training: zero_command_prob 0.1)
       sl[:, 4:6] *= stop[:, None]
     x[:, 48:61] = sl
+    if R.LF_MASS_IN:  # 3-a (7-39): an LF3 turner reads the rope's mass in its twist vx slot
+      x[:, R.MASS_IN_SLOT] = R.rope_mass_enc(self._env)
     walk = self._env.__dict__.get("_ys_walk", {}).get(self.cfg.obs_group)  # 7-10: (N, 13) command block for the standing ONNX
     # while it takes the handle and walks to its place (NaN rows: rope14 turns); commands in the duck's own body frame
     lock = self._beat.f.lock if self.cfg.beat else None

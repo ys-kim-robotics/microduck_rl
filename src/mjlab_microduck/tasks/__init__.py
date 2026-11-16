@@ -469,6 +469,22 @@ register_mjlab_task(  # 7-38 LF2: rope14 + keep its 20 g stem-to-stem distance o
     runner_cls=YsSelfPlayRunner,
 )
 
+register_mjlab_task(  # 7-39 LF3 (3-a): LF2 + the rope's mass in the L·F input (twist vx slot, 20 g = 0); train with YS_ROPE_DR
+    task_id="Mjlab-YsRopeLF3-Flat-MicroDuck",
+    env_cfg=make_ys_rope_duo_env_cfg(span=0.60, sep_w=2.0, trio_frac=0.5, mass_in=True),
+    play_env_cfg=make_ys_rope_duo_env_cfg(play=True, span=0.60, sep_w=2.0, trio_frac=0.5, mass_in=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=YsSelfPlayRunner,
+)
+
+register_mjlab_task(  # 7-40 LF4: LF3's mass input, the rope's timing paid directly (rope_timing) instead of handle_sep; train with YS_ROPE_DR
+    task_id="Mjlab-YsRopeLF4-Flat-MicroDuck",
+    env_cfg=make_ys_rope_duo_env_cfg(span=0.60, time_w=2.0, trio_frac=0.5, mass_in=True),
+    play_env_cfg=make_ys_rope_duo_env_cfg(play=True, span=0.60, time_w=2.0, trio_frac=0.5, mass_in=True),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=YsSelfPlayRunner,
+)
+
 from .ys_jump_env_cfg import YsJumpRlCfg, make_ys_jump_env_cfg
 
 register_mjlab_task(

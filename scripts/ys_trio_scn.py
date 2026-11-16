@@ -163,13 +163,21 @@ def cam_walk_cmd(env, WS, who, other, go):
   return cmd, stop
 
 
-def spot_from_turners(env, rel):
+def spot_from_turners(env, rel, est=False):
   """(N, 3) J's spot as the turners make it: the line between their handle circles' centres (each duck's standing stem
   end, rel in its root frame: the stem itself circles ~10 cm while turning), J_Y to the left of F->L at the middle (as in
-  the trio layout: J at the origin, the turners at y -0.08), heading along F->L. Also J's centering target."""
+  the trio layout: J at the origin, the turners at y -0.08), heading along F->L. Also J's centering target.
+  est (DEPLOY 4-12, STAGES 7-40): from what L and F believe of themselves (_xy, _yawo: their odometry / gyro errors when set), the
+  spot J gets if L and F send it their own positions."""
   import mjlab_microduck.tasks.ys_trio_env_cfg as T
   from mjlab.utils.lab_api.math import quat_apply
-  ctr = {w: (env.scene[w].data.root_link_pos_w + quat_apply(env.scene[w].data.root_link_quat_w, rel[w].expand(env.num_envs, 3)))[:, :2] for w in ("turner", "partner")}
+  if est:
+    def c_(w):
+      y_ = _yawo(env, w); r_ = rel[w][:2]
+      return _xy(env, w) + torch.stack([y_.cos() * r_[0] - y_.sin() * r_[1], y_.sin() * r_[0] + y_.cos() * r_[1]], 1)
+    ctr = {w: c_(w) for w in ("turner", "partner")}
+  else:
+    ctr = {w: (env.scene[w].data.root_link_pos_w + quat_apply(env.scene[w].data.root_link_quat_w, rel[w].expand(env.num_envs, 3)))[:, :2] for w in ("turner", "partner")}
   a, b = ctr["turner"], ctr["partner"]
   ax = (a - b) / (a - b).norm(dim=-1, keepdim=True).clamp(min=1e-6); nrm = torch.stack([-ax[:, 1], ax[:, 0]], 1)
   spot = (a + b) / 2 + T.JUMPER_Y * nrm - env.scene.env_origins[:, :2]

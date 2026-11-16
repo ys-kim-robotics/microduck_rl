@@ -72,6 +72,38 @@ def rope_mass_scale(env, env_ids, asset_cfg, mass_range=(0.01, 0.04)):
   env.sim.model.body_inertia[g] = i0[None] * s[:, None, None]
 
 
+# 3-a (LF3, STAGES 7-39): the rope's mass in the L·F input, in the twist vx slot (48). rope14 reads 0 there while it turns (L·F walk out
+# on the standing ONNX), and vx mirrors to itself (the self-play partner reads the same). 20 g -> 0, so LF3 starts as rope14 at 20 g;
+# +-5 g -> +-0.087 = rope14's normalizer std in that slot (left from its walking ancestors, ~frozen after 9e8 samples): about +-1 normalized.
+LF_MASS_IN = os.environ.get("YS_LF_MASS_IN") == "1"  # trio / eval scripts: feed the turners the rope's mass (an LF3 checkpoint)
+MASS_IN_REF, MASS_IN_GAIN, MASS_IN_SLOT = 0.020, 0.087 / 0.005, 48
+
+
+def rope_mass_enc(env):
+  """(N,) the env's rope mass as the L·F input value (0 at 20 g)."""
+  import torch
+  bi = env.__dict__.get("_ys_rope_bi")
+  if bi is None:
+    bi = env._ys_rope_bi = torch.as_tensor(env.scene["rope"].indexing.body_ids, device=env.device).long()
+  m = env.sim.model.body_mass[..., bi].sum(-1)  # (N,) with a per-env mass draw, else (1,) or ()
+  return (m - MASS_IN_REF) * MASS_IN_GAIN * torch.ones(env.num_envs, device=env.device)
+
+
+def twist_with_rope_mass(env, command_name: str = "twist"):
+  """Observation term: the twist command block, its vx slot replaced by rope_mass_enc."""
+  c = env.command_manager.get_command(command_name).clone()
+  c[:, 0] = rope_mass_enc(env)
+  return c
+
+
+def add_mass_input(cfg) -> None:
+  """3-a: every obs group with the twist command term (actor, critic, the duo's partner) reads the rope's mass in its vx slot."""
+  for g in cfg.observations.values():
+    t = g.terms.get("command")
+    if t is not None and (t.params or {}).get("command_name") == "twist":
+      t.func = twist_with_rope_mass
+
+
 def demo():
   spec = mujoco.MjSpec()
   spec.worldbody.add_geom(type=mujoco.mjtGeom.mjGEOM_PLANE, size=[1, 1, 0.1])

@@ -107,23 +107,64 @@ def handle_sep(env, std: float = 0.025):
   std m), on the trio's circle only (0 elsewhere). At the top the rope is taut, and its pull, proportional to its mass, sets this
   distance: rope14 sits 28 mm wider at 15 g and 19 mm narrower at 25 g there (this env; 20 g +5 mm), and the rope's timing shifts by
   +21 / -14 deg (7-37). rope14 scores 0.56 / 0.73 / 0.69 at 15 / 20 / 25 g."""
-  cmd = env.command_manager.get_term("head_pose")
-  p = hc.tip_feet(cmd._robot, cmd._sid, cmd._feet)[0]
-  th = torch.atan2(p[:, 1] - cmd.center[:, 0], -(p[:, 2] - cmd.center[:, 1]))
+  cmd, th, on = _trio(env)
   ref = torch.full_like(th, SEP_REF[0])
   for k, (a, b) in enumerate(SEP_REF[1], start=1):
     ref += a * torch.cos(k * th) + b * torch.sin(k * th)
   partner = env.scene["partner"]
   sid = env.__dict__.setdefault("_ys_partner_stem", partner.find_sites("stem_end")[0][0])
   sep = (cmd._robot.data.site_pos_w[:, cmd._sid] - partner.data.site_pos_w[:, sid]).norm(dim=-1)
-  on = ((cmd.amp * hc.TIP_M_PER_RAD - TRIO_R).abs() < 1e-4) & ((cmd.freq - TRIO_HZ).abs() < 1e-4)
   return torch.where(on, torch.exp(-((sep - ref) / std).square()), 0.0)
 
 
+def _trio(env):
+  """the robot's own stem angle th (rad, 0 = bottom, as the command) and the mask of envs on the trio's circle."""
+  cmd = env.command_manager.get_term("head_pose")
+  p = hc.tip_feet(cmd._robot, cmd._sid, cmd._feet)[0]
+  th = torch.atan2(p[:, 1] - cmd.center[:, 0], -(p[:, 2] - cmd.center[:, 1]))
+  on = ((cmd.amp * hc.TIP_M_PER_RAD - TRIO_R).abs() < 1e-4) & ((cmd.freq - TRIO_HZ).abs() < 1e-4)
+  return cmd, th, on
+
+
+ROPE_MID = R.ROPE_LINKS // 2  # link 6 of 12: the rope's middle as s35 duo_x / xana read it
+LAG_REF = -0.302  # LF4 (7-40): rope14@19200 (lf3_init) at 20 g in this env: rope_timing's running mean -17.3 deg (ys_lf2_check, 1024 envs
+# x 18 s, 326k paying env-steps; the per-step circular mean -18.8 deg; s35 duo_x's eval scene reads -12.5 deg)
+LAG_TAU, LAG_WAIT = 1.6, 2.0  # s: rope_timing's running mean (two turns at 1.25 Hz), and how long on the trio's circle before it pays
+
+
+def rope_lag(env):
+  """(N,) rad, (N,) mask: the rope middle's phase about the line between the two stem ends minus the robot's own stem phase, per step
+  (s35 xana's lag, which takes the mean over 10 s); the trio's-circle mask."""
+  cmd, th, on = _trio(env)
+  partner = env.scene["partner"]
+  sid = env.__dict__.setdefault("_ys_partner_stem", partner.find_sites("stem_end")[0][0])
+  m = env.scene["rope"].data.body_link_pos_w[:, ROPE_MID] - 0.5 * (cmd._robot.data.site_pos_w[:, cmd._sid] + partner.data.site_pos_w[:, sid])
+  d = torch.atan2(m[:, 1], -m[:, 2]) - th
+  return torch.atan2(d.sin(), d.cos()), on
+
+
+def rope_timing(env, std: float = 0.26):
+  """LF4 (7-40): 1 when the rope's timing is rope14's at 20 g (Gaussian on the angle, std rad ~15 deg), on the trio's circle only.
+  The per-step rope_lag swings through the turn (rope14: concentration 0.3-0.5 over a game), so the term pays on its running mean
+  (unit vectors, time constant LAG_TAU s), from LAG_WAIT s on the trio's circle. Stateful: call once per step (the reward manager does,
+  once the weight is > 0). LF2 / LF3 paid the stem-end distance (handle_sep) and the rope came 7-25 deg late at every mass."""
+  d, on = rope_lag(env)
+  S = env.__dict__.get("_ys_lag")
+  if S is None:
+    S = env._ys_lag = {"z": torch.zeros(env.num_envs, 2, device=env.device), "t": torch.zeros(env.num_envs, device=env.device)}
+  fresh = ~on | (env.episode_length_buf <= 1)
+  a = env.step_dt / LAG_TAU
+  S["z"] = torch.where(fresh[:, None], 0.0, (1 - a) * S["z"] + a * torch.stack([d.cos(), d.sin()], 1))
+  S["t"] = torch.where(fresh, 0.0, S["t"] + env.step_dt)
+  e = torch.atan2(S["z"][:, 1], S["z"][:, 0]) - LAG_REF
+  return torch.where(S["t"] >= LAG_WAIT, torch.exp(-(torch.atan2(e.sin(), e.cos()) / std).square()), 0.0)
+
+
 def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: float = 1.0, span: float = SPAN, axis_z: float | None = None,
-                             sep_w: float = 0.0, trio_frac: float = 0.0):
+                             sep_w: float = 0.0, trio_frac: float = 0.0, mass_in: bool = False, time_w: float = 0.0):
   """rope10+: resume from rope5, rope5's rewards (stay_put 2.0), real partner duck. LF2 (7-38): sep_w > 0 adds handle_sep, ramped in
-  from 0, and trio_frac of the commands become the trio's circle (where handle_sep pays)."""
+  from 0, and trio_frac of the commands become the trio's circle (where handle_sep pays). LF3 (3-a, 7-39): mass_in puts the rope's mass
+  in every group's twist vx slot (ys_rope.add_mass_input), the partner's included. LF4 (7-40): time_w > 0 adds rope_timing the same way."""
   cfg = make_ys_rope_bob_env_cfg(play, stay=True)
   cfg.curriculum.pop("stay_put_ramp")
   cfg.rewards["stay_put"].weight = 2.0
@@ -148,6 +189,8 @@ def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: 
 
   act = cfg.actions["joint_pos"]
   cfg.actions["partner_joint_pos"] = PartnerActionCfg(**{k: getattr(act, k) for k in act.__dataclass_fields__ if k != "entity_name"}, entity_name="partner", stochastic=stochastic)
+  if mass_in:  # before the partner group is copied from the actor's
+    R.add_mass_input(cfg)
   actor = cfg.observations["actor"]
   part = copy.deepcopy(actor)
   for t in part.terms.values():
@@ -164,6 +207,10 @@ def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: 
     cfg.commands["head_pose"].trio_frac = trio_frac
     cfg.rewards["handle_sep"] = RewardTermCfg(func=handle_sep, weight=0.0)
     cfg.curriculum["handle_sep_ramp"] = CurriculumTermCfg(func=ramp_weight, params={"reward_name": "handle_sep", "stages": [(10, sep_w / 2), (30, sep_w)]})
+  if time_w > 0:
+    cfg.commands["head_pose"].trio_frac = trio_frac
+    cfg.rewards["rope_timing"] = RewardTermCfg(func=rope_timing, weight=0.0)
+    cfg.curriculum["rope_timing_ramp"] = CurriculumTermCfg(func=ramp_weight, params={"reward_name": "rope_timing", "stages": [(10, time_w / 2), (30, time_w)]})
   # partner down: end the episode as a timeout (bootstrapped, no fall penalty for the robot)
   fell = copy.deepcopy(cfg.terminations["fell_over"])
   fell.params = {**fell.params, "asset_cfg": SceneEntityCfg("partner")}
