@@ -37,6 +37,7 @@ SPAN = 0.70  # m between the two handle centres (rope 0.8 m: rests ~3 cm above t
 STEM_END_NOM = (0.0838 + STEM_LEN, 0.0, 0.116 + 0.0888)
 FAR_NOM = (STEM_END_NOM[0] + SPAN, 0.0, STEM_END_NOM[2])
 MIRROR_TAU = 1.0  # s; running-mean centre of the stem end that the far handle copies around
+TRIO_R, TRIO_HZ = 0.12, 1.25  # m, Hz: the turners' circle in the trio (ys_trio_env_cfg.TURNER_AMP, ys_beat.BEAT_HZ)
 NECK_ACTS = ("neck_pitch", "head_pitch", "head_yaw", "head_roll")
 
 
@@ -164,6 +165,13 @@ class RopeCircleCommand(hc.HeadCircleCommand):
     self._dx_wander[ids] = 0.0
     return super().reset(env_ids)
 
+  def _resample_command(self, env_ids: torch.Tensor) -> None:
+    super()._resample_command(env_ids)
+    if self.cfg.trio_frac > 0 and len(env_ids):  # LF2 (7-38): the trio's circle on a share of the draws
+      t = env_ids[torch.rand(len(env_ids), device=self.device) < self.cfg.trio_frac]
+      self.amp[t], self.freq[t] = TRIO_R / hc.TIP_M_PER_RAD, TRIO_HZ
+      self._write()
+
   def _update_command(self) -> None:
     super()._update_command()
     stem = self._robot.data.site_pos_w[:, self._sid]
@@ -195,6 +203,7 @@ class RopeCircleCommandCfg(hc.HeadCircleCommandCfg):
   partner_wander: float = 0.0  # std (m) of the far circle centre's slow drift
   partner_x_range: tuple[float, float] = (0.0, 0.0)  # far handle x offset (m) per episode, U; < 0 = toward the duck (slack)
   partner_x_wander: float = 0.0  # std (m) of its drift along x (OU, tau 1 s)
+  trio_frac: float = 0.0  # LF2 (7-38): this share of resampled commands = the trio's circle (TRIO_R, TRIO_HZ, never zero)
 
   def build(self, env):
     return RopeCircleCommand(self, env)

@@ -16,12 +16,13 @@ import mujoco
 import torch
 from tensordict import TensorDict
 from mjlab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
-from mjlab.managers import EventTermCfg, RewardTermCfg, SceneEntityCfg
+from mjlab.managers import CurriculumTermCfg, EventTermCfg, RewardTermCfg, SceneEntityCfg
+import mjlab_microduck.tasks.ys_head_circle_env_cfg as hc
 import mjlab_microduck.tasks.ys_rope as R
 
 from mjlab_microduck.tasks import MicroduckOnPolicyRunner  # defined before this module is imported
 from mjlab_microduck.tasks.symmetry import _get_tensors
-from mjlab_microduck.tasks.ys_rope_env_cfg import SPAN, STEM_END_NOM, make_ys_rope_bob_env_cfg, set_span
+from mjlab_microduck.tasks.ys_rope_env_cfg import SPAN, STEM_END_NOM, TRIO_HZ, TRIO_R, make_ys_rope_bob_env_cfg, ramp_weight, set_span
 
 PARTNER_CKPT = "logs/rsl_rl/ys_rope/2026-11-03_17-36-17_rope5_stay/model_18794.pt"
 CMD = slice(51, 55)  # head-circle command slots: the partner gets the robot's (forward) command
@@ -95,8 +96,34 @@ def axis_low(env, z_target: float, std: float = 0.04):  # 0.02 paid 0.003 at the
   return torch.exp(-((z - z_target).clamp(min=0) / std).square())
 
 
-def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: float = 1.0, span: float = SPAN, axis_z: float | None = None):
-  """rope10+: resume from rope5, rope5's rewards (stay_put 2.0), real partner duck."""
+# LF2 (7-38): rope14@19200's stem-to-stem distance (m) at 20 g on the trio's circle, as a function of the robot's own stem angle th
+# (0 = bottom, as the command): c0 + sum_k (a_k cos k th + b_k sin k th). Fitted in this env itself (play cfg, rope14 as both ducks,
+# 256 envs x 20 s, trio's-circle envs only, residual sd 28.8 mm): ys_rope_duo.py's eval scene reads 3 mm wider overall, 9 mm at the top.
+SEP_REF = (0.7750, ((-0.0702, -0.0213), (-0.0072, -0.0081), (-0.0030, 0.0007), (-0.0014, 0.0014)))
+
+
+def handle_sep(env, std: float = 0.025):
+  """LF2 (7-38): 1 when the two stem ends are as far apart as rope14's at 20 g at this point of the robot's own circle (Gaussian,
+  std m), on the trio's circle only (0 elsewhere). At the top the rope is taut, and its pull, proportional to its mass, sets this
+  distance: rope14 sits 28 mm wider at 15 g and 19 mm narrower at 25 g there (this env; 20 g +5 mm), and the rope's timing shifts by
+  +21 / -14 deg (7-37). rope14 scores 0.56 / 0.73 / 0.69 at 15 / 20 / 25 g."""
+  cmd = env.command_manager.get_term("head_pose")
+  p = hc.tip_feet(cmd._robot, cmd._sid, cmd._feet)[0]
+  th = torch.atan2(p[:, 1] - cmd.center[:, 0], -(p[:, 2] - cmd.center[:, 1]))
+  ref = torch.full_like(th, SEP_REF[0])
+  for k, (a, b) in enumerate(SEP_REF[1], start=1):
+    ref += a * torch.cos(k * th) + b * torch.sin(k * th)
+  partner = env.scene["partner"]
+  sid = env.__dict__.setdefault("_ys_partner_stem", partner.find_sites("stem_end")[0][0])
+  sep = (cmd._robot.data.site_pos_w[:, cmd._sid] - partner.data.site_pos_w[:, sid]).norm(dim=-1)
+  on = ((cmd.amp * hc.TIP_M_PER_RAD - TRIO_R).abs() < 1e-4) & ((cmd.freq - TRIO_HZ).abs() < 1e-4)
+  return torch.where(on, torch.exp(-((sep - ref) / std).square()), 0.0)
+
+
+def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: float = 1.0, span: float = SPAN, axis_z: float | None = None,
+                             sep_w: float = 0.0, trio_frac: float = 0.0):
+  """rope10+: resume from rope5, rope5's rewards (stay_put 2.0), real partner duck. LF2 (7-38): sep_w > 0 adds handle_sep, ramped in
+  from 0, and trio_frac of the commands become the trio's circle (where handle_sep pays)."""
   cfg = make_ys_rope_bob_env_cfg(play, stay=True)
   cfg.curriculum.pop("stay_put_ramp")
   cfg.rewards["stay_put"].weight = 2.0
@@ -133,6 +160,10 @@ def make_ys_rope_duo_env_cfg(play: bool = False, stochastic: bool = False, bob: 
 
   if axis_z is not None:
     cfg.rewards["axis_low"] = RewardTermCfg(func=axis_low, weight=2.0, params={"z_target": axis_z})
+  if sep_w > 0:  # new term: ramp in from 0, the critic has never seen it (as make_ys_rope_env_cfg's)
+    cfg.commands["head_pose"].trio_frac = trio_frac
+    cfg.rewards["handle_sep"] = RewardTermCfg(func=handle_sep, weight=0.0)
+    cfg.curriculum["handle_sep_ramp"] = CurriculumTermCfg(func=ramp_weight, params={"reward_name": "handle_sep", "stages": [(10, sep_w / 2), (30, sep_w)]})
   # partner down: end the episode as a timeout (bootstrapped, no fall penalty for the robot)
   fell = copy.deepcopy(cfg.terminations["fell_over"])
   fell.params = {**fell.params, "asset_cfg": SceneEntityCfg("partner")}

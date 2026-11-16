@@ -461,6 +461,14 @@ register_mjlab_task(  # 7.2 rope16: rope14 + handle-circle centre 5 cm lower (21
     runner_cls=YsSelfPlayRunner,
 )
 
+register_mjlab_task(  # 7-38 LF2: rope14 + keep its 20 g stem-to-stem distance on the trio's circle (half the draws); train with YS_ROPE_DR
+    task_id="Mjlab-YsRopeLF2-Flat-MicroDuck",
+    env_cfg=make_ys_rope_duo_env_cfg(span=0.60, sep_w=2.0, trio_frac=0.5),
+    play_env_cfg=make_ys_rope_duo_env_cfg(play=True, span=0.60, sep_w=2.0, trio_frac=0.5),
+    rl_cfg=YsRopeRlCfg,
+    runner_cls=YsSelfPlayRunner,
+)
+
 from .ys_jump_env_cfg import YsJumpRlCfg, make_ys_jump_env_cfg
 
 register_mjlab_task(
