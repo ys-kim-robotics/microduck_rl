@@ -1,8 +1,9 @@
-"""history_v5.py -> history_v5.png, baseline_lineage_v5.png: the model history up to 2026-11-17 and the baseline v5 family tree.
-history_v5.png = history_v4.png (kept as is: up to 2026-11-13) stacked on a new part for 11-13 .. 11-17: how baseline v5-1 and v5-2 were
+"""history_v6.py -> history_v6.png, baseline_lineage_v6.png: the model history up to 2026-11-17 and the baseline v5 / v6 family tree.
+history_v6.png = history_v4.png (kept as is: up to 2026-11-13) stacked on a new part for 11-13 .. 11-17: how baseline v5-1 and v5-2 were
 found, the L·F retrainings tried (LF2 / LF3 / LF4, all dropped), the yardstick / procedure turns, and the policies on one yardstick (realistic
-conditions and the truth-free yardstick, seeds 21-24 pooled). baseline_lineage_v5.png = baseline v3 / v4 and the two v5s they lead to.
-Numbers come from STAGES-ys.md 7-29 .. 7-41. Drawing helpers from history_v4.py. Run: uv run python docs/ys/history_v5.py"""
+conditions and the truth-free yardstick, seeds 21-24 pooled). baseline_lineage_v6.png = baseline v3 / v4, the two v5s they lead to and the two
+v6s (same J weights + two procedures). Numbers come from STAGES-ys.md 7-29 .. 7-42. Drawing helpers from history_v4.py.
+Run: uv run python docs/ys/history_v6.py (history_v5.py, which drew the v5 figures, is this file before 7-42)"""
 import io, os, sys
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 from PIL import Image
@@ -46,6 +47,8 @@ def part3():
   path(ax, [(v3["r"], Y3), (p1["l"], Y3)], J2, lw=1.8); path(ax, [(p1["r"], Y3), (p6["l"], Y3)], J2, lw=1.8)
   rep = N(75.0, YL, "재학습 1의 방법 다시 (11/16)", ["v3에서 재현됨", "!v4·v5-1에 적용하면 55~62%를 못 넘음"], 12.6, J2, dead="버림")
   path(ax, [(p6["r"], Y3), (75.0, Y3), (75.0, rep["b"])], J2, lw=1.4)
+  ax.text(94.0, 3.2, "@사용자 (11/17): v5-1·v5-2에\n이 절차 둘(그림 아래 6·7)을 더해\nbaseline v6-1·v6-2", ha="center", va="center",
+          fontsize=10, color=USER, linespacing=1.4)
   ax.text(57.5, (YM + Y3) / 2 + 0.25, "@사용자: 둘 다 baseline으로 두고\n실물 명령 지연을 재서 고른다\n(20 ms 이하면 v5-2, 길면 v5-1)", ha="center", va="center",
           fontsize=10, color=USER, linespacing=1.4)
   for n_ in (pick, p6): ax.annotate("", xy=(50.5, (YM + Y3) / 2 + 0.25), xytext=(n_["r"], n_["y"]), arrowprops=dict(arrowstyle="-", color=USER, lw=1, ls=(0, (3, 2))))
@@ -64,15 +67,15 @@ def part3():
       ax.text(px, py, str(i + 1), ha="center", va="center", fontsize=10 if ms == 17 else 9.5, fontweight="bold", color="#444", zorder=4)
     ax.text(cx + 0.9, cy + 0.09, t, ha="left", va="center", fontsize=10, fontweight="bold", color="#444")
     ax.text(cx + 0.9, cy - 0.12, d, ha="left", va="center", fontsize=9, color="#555")
-  fig.text(0.5, 1 - 0.3 / FH, "baseline v4 이후의 히스토리 (2026-11-13 ~ 11-17): baseline v5-1·v5-2와 그 뒤에 해 본 것", ha="center", va="center", fontsize=18, fontweight="bold")
+  fig.text(0.5, 1 - 0.3 / FH, "baseline v4 이후의 히스토리 (2026-11-13 ~ 11-17): baseline v5-1·v5-2, v6-1·v6-2와 그 사이에 해 본 것", ha="center", va="center", fontsize=18, fontweight="bold")
   fig.text(0.5, 1 - 0.62 / FH, "상자 = 체크포인트(점선 상자 = 버림), 가지 = 이어서 학습. 청록 = baseline v4에서, 초록 = baseline v3에서, 파랑 = L·F. 보라 글씨 = 사용자 결정. "
            "실물 = 실물 조건(7-30 잣대), 참값 없는 잣대 = J가 참값을 하나도 모르는 조건(7-36).", ha="center", va="center", fontsize=10.5, color="#444")
   # bottom: one yardstick, seeds 21-24
-  bx = fig.add_axes([0.055, 0.85 / FH, 0.925, 3.1 / FH]); G = [("실물 조건", 2), ("참값 없는 잣대", 3), ("참값 없는 잣대\n+ L·F가 보낸 위치 + 칼만 필터", 4)]
+  bx = fig.add_axes([0.055, 0.85 / FH, 0.925, 3.1 / FH]); G = [("실물 조건", 2), ("참값 없는 잣대", 3), ("참값 없는 잣대: baseline v6\n(+ L·F가 보낸 위치 + 칼만 필터)", 4)]
   xt, xl = [], []
   for gi, (gl, col_i) in enumerate(G):
     for bi, b in enumerate(BARS):
-      x = gi * 4.2 + bi; k_n = b[col_i]; xt.append(x); xl.append(b[0])
+      x = gi * 4.2 + bi; k_n = b[col_i]; xt.append(x); xl.append(b[0].replace("v5-", "v6-") if gi == 2 else b[0])
       if not isinstance(k_n, tuple): bx.text(x, 3, k_n or "재는 중", ha="center", fontsize=9, color="#999"); continue
       p, lo, hi = wilson(*k_n); bx.bar(x, p, 0.7, color=b[1], alpha=1.0 if gi == 0 else 0.75, hatch=None if gi < 2 else "///", ec=b[1], zorder=2)
       bx.plot([x, x], [lo, hi], color="k", lw=1.1, zorder=3); bx.text(x, hi + 1.5, f"{p:.0f}", ha="center", fontsize=10.5, fontweight="bold", zorder=3)
@@ -81,12 +84,12 @@ def part3():
   bx.set_ylabel("10줄 이상 (%)\n선 = 95% 범위", fontsize=10.5); bx.spines[["top", "right"]].set_visible(False)
   bx.text(-0.65, 94, "같은 잣대로 잰 정책들 (풀세트, 줄 20 g, 시드 21~24 합침, 약 510판씩)", fontsize=12, color="#333", fontweight="bold")
   fig.text(0.055, 0.2 / FH, "참값 없는 잣대의 J 자리: 둘째 묶음 = L·F에게 준 걷기 목표의 가운데(지금 방식), 셋째 묶음 = L·F가 발로 센 자기 위치를 J에게 보냄(로봇 사이 통신 필요). "
-           "숫자 출처: STAGES-ys.md 7-29 ~ 7-41. 그림 코드: docs/ys/history_v5.py", fontsize=10, color="#555")
+           "숫자 출처: STAGES-ys.md 7-29 ~ 7-42. 그림 코드: docs/ys/history_v6.py", fontsize=10, color="#555")
   buf = io.BytesIO(); fig.savefig(buf, dpi=100); plt.close(fig); buf.seek(0); return Image.open(buf).convert("RGB")
 
 
 def lineage():
-  fig = plt.figure(figsize=(20, 7.4)); ax = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, 100); ax.set_ylim(11, 48); ax.axis("off")
+  fig = plt.figure(figsize=(20, 12.4)); ax = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, 100); ax.set_ylim(-14, 52); ax.axis("off")
   TOP = 40
   v3 = card(ax, 12.5, TOP, "baseline v3", "2026-11-09 · 사용자 승인", J2,
             [("b", "J = D1Asky@5994"), ("n", "입장부터 줄넘기까지 한 정책"), ("g", "실물 조건 (7-30 잣대, 시드 1·2)"), ("b", "41%"),
@@ -96,26 +99,41 @@ def lineage():
              ("r", "한계: 줄 무게, 참값 없이 10%")], nrow=6)
   w1 = card(ax, 64.0, TOP, "baseline v5-1", "2026-11-16 · 사용자 결정", J4,
             [("b", "J = R14 @6950 = v4 + 457 it"), ("n", "이어 학습, 머리 기울임 벌점 없음"), ("g", "실물 조건 / 참값 없는 잣대 (시드 21~24)"),
-             ("b", "55.7% / 19.8%"), ("n", "+ L·F 위치 보내기 + 칼만 필터: 42.5%"), ("u", "실물 명령 지연이 20 ms보다 길면 이것"),
-             ("r", "한계: 줄 15 g 3%, 25 g 21%")], w=23, nrow=8)
+             ("b", "55.7% / 19.8%"), ("r", "한계: 줄 15 g 3%, 25 g 21%")], w=23, nrow=6)
   w2 = card(ax, 88.5, TOP, "baseline v5-2", "2026-11-16 · 사용자 결정", J2,
             [("b", "J = 재학습 1 @6100 = v3 + 106 it"), ("n", "위치를 3~10 cm 틀리게 알고 학습"), ("g", "실물 조건 / 참값 없는 잣대 (시드 21~24)"),
-             ("b", "62.3% / 22.6%"), ("n", "+ L·F 위치 보내기 + 칼만 필터: 43.4%"), ("u", "실물 명령 지연 20 ms 이하면 이것"),
-             ("r", "한계: 지연 30·35 ms에서 v4보다 낮음")], w=21, nrow=8)
+             ("b", "62.3% / 22.6%"), ("r", "한계: 지연 30·35 ms에서 v4보다 낮음")], w=21, nrow=6)
+  V6 = [("n", "+ J 자리 = L·F가 발로 센 자기 위치 (4-12)"), ("n", "+ 서 있는 동안 자이로 칼만 필터 (4-11)"), ("g", "참값 없는 잣대 (시드 21~24)")]
+  x1 = card(ax, 64.0, 17, "baseline v6-1", "2026-11-17 · 사용자 결정", J4,
+            [("b", "J = v5-1과 같은 가중치")] + V6 + [("b", "19.8 → 42.5%"), ("g", "실물 조건: v5-1과 같음 (55.7%)"),
+             ("u", "실물 명령 지연이 20 ms보다 길면 이것"), ("r", "실물에 필요: L·F → J 통신")], w=23, nrow=8)
+  x2 = card(ax, 88.5, 17, "baseline v6-2", "2026-11-17 · 사용자 결정", J2,
+            [("b", "J = v5-2와 같은 가중치")] + V6 + [("b", "22.6 → 43.4%"), ("g", "실물 조건: v5-2와 같음 (62.3%)"),
+             ("u", "실물 명령 지연 20 ms 이하면 이것"), ("r", "실물에 필요: L·F → J 통신")], w=21, nrow=8)
+  for a, b in ((w1, x1), (w2, x2)):
+    path(ax, [(a["x"], a["b"]), (a["x"], b["t"])], USER, ls=(0, (4, 2)), lw=2)
+    ax.text(a["x"] + 0.6, (a["b"] + b["t"]) / 2, "학습 없음: 절차 2개", ha="left", va="center", fontsize=9.5, color=USER)
+  ax.text(26.0, 6.0, "baseline v6 = v5의 J 가중치 그대로 + 절차 2개 (학습 없음)\n\n"
+          "1. J가 설 자리: L·F에게 준 걷기 목표의 가운데 대신,\n    L·F가 발로 센 자기 위치·방향을 J에게 보낸다 (로봇 사이 통신)\n"
+          "2. J가 서서 기다리는 동안 자이로 치우침을 칼만 필터로 추정해 뺀다\n\n"
+          "실물 조건(7-30 잣대)에서는 v5와 같다: L·F가 참값을 알아 보낸 자리가\n참값 자리와 0.7 mm 차이이고, 자이로 틀어짐이 없어 필터가 할 일이 없다.\n"
+          "참값을 하나도 주지 않는 잣대에서만 차이가 난다 (v5-1 +22.8%p, v5-2 +20.8%p).",
+          ha="center", va="center", fontsize=10.5, color="#333", linespacing=1.45,
+          bbox=dict(boxstyle="round,pad=0.8", fc="#f7f3fa", ec=USER, lw=1.2))
   path(ax, [(v3["r"], 31), (v4["l"], 31)], J2, lw=2.2); ax.text((v3["r"] + v4["l"]) / 2, 31.9, "+500 it", ha="center", va="bottom", fontsize=9, color=J2)
   path(ax, [(v4["r"], 31), (w1["l"], 31)], J4, lw=2.2); ax.text((v4["r"] + w1["l"]) / 2, 31.9, "+457 it", ha="center", va="bottom", fontsize=9, color=J4)
-  path(ax, [(v3["x"], v3["b"]), (v3["x"], 21.5), (w2["x"], 21.5), (w2["x"], w2["b"])], J2, lw=1.8)
-  ax.text(50, 22.1, "baseline v3 + 106 it (재학습 1, 11/10 학습, 11/15 저장본 훑기에서 찾음)", ha="center", va="bottom", fontsize=9.5, color=J2)
-  ax.text(50, 17.0, "네 baseline 모두 L(앞, 빨간 공)·F(뒤) = rope14@19200 그대로. 줄 무게용 L·F 학습 LF2·LF3·LF4는 모두 버림(20 g 박자가 늦어짐).", ha="center", va="center",
+  path(ax, [(v3["x"], v3["t"]), (v3["x"], 44.0), (w2["x"], 44.0), (w2["x"], w2["t"])], J2, lw=1.8)
+  ax.text(50, 44.6, "baseline v3 + 106 it (재학습 1, 11/10 학습, 11/15 저장본 훑기에서 찾음)", ha="center", va="bottom", fontsize=9.5, color=J2)
+  ax.text(50, -9.0, "여섯 baseline 모두 L(앞, 빨간 공)·F(뒤) = rope14@19200 그대로. 줄 무게용 L·F 학습 LF2·LF3·LF4는 모두 버림(20 g 박자가 늦어짐).", ha="center", va="center",
           fontsize=11, fontweight="bold", color=LF)
-  fig.text(0.5, 0.955, "베이스라인 계보도 (2026-11-17 현재): baseline v3 → v4 → v5-1, v3 → v5-2", ha="center", va="center", fontsize=18, fontweight="bold")
-  fig.text(0.5, 0.91, "실선 = 가중치를 이어받아 계속 학습. 보라 글씨 = 사용자 결정. v1·v2와 그 앞은 baseline_lineage.png.", ha="center", va="center", fontsize=11, color="#444")
-  fig.text(0.03, 0.035, "숫자 출처: STAGES-ys.md 7-30 ~ 7-41. 그림 코드: docs/ys/history_v5.py", fontsize=10, color="#555")
-  fig.savefig(os.path.join(HERE, "baseline_lineage_v5.png"), dpi=100); plt.close(fig)
+  fig.text(0.5, 0.97, "베이스라인 계보도 (2026-11-17 현재): baseline v3 → v4 → v5-1 → v6-1, v3 → v5-2 → v6-2", ha="center", va="center", fontsize=18, fontweight="bold")
+  fig.text(0.5, 0.94, "실선 = 가중치를 이어받아 계속 학습, 보라 점선 = 같은 가중치에 절차만 더함. 보라 글씨 = 사용자 결정. v1·v2와 그 앞은 baseline_lineage.png.", ha="center", va="center", fontsize=11, color="#444")
+  fig.text(0.03, 0.025, "숫자 출처: STAGES-ys.md 7-30 ~ 7-42. 그림 코드: docs/ys/history_v6.py", fontsize=10, color="#555")
+  fig.savefig(os.path.join(HERE, "baseline_lineage_v6.png"), dpi=100); plt.close(fig)
 
 
 if __name__ == "__main__":
   top, bot = Image.open(os.path.join(HERE, "history_v4.png")).convert("RGB"), part3(); assert top.width == bot.width, (top.size, bot.size)
   out = Image.new("RGB", (top.width, top.height + bot.height), "white"); out.paste(top, (0, 0)); out.paste(bot, (0, top.height))
-  out.save(os.path.join(HERE, "history_v5.png")); bot.save("/tmp/claude-1000/-home-roai22/aae78e4a-6740-4769-a2da-c932e7ef790d/scratchpad/s38/h5_part3.png")
-  lineage(); print("saved", HERE + "/history_v5.png", out.size, HERE + "/baseline_lineage_v5.png")
+  out.save(os.path.join(HERE, "history_v6.png")); bot.save("/tmp/claude-1000/-home-roai22/aae78e4a-6740-4769-a2da-c932e7ef790d/scratchpad/s39/h6_part3.png")
+  lineage(); print("saved", HERE + "/history_v6.png", out.size, HERE + "/baseline_lineage_v6.png")
